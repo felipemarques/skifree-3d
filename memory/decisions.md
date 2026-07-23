@@ -23,6 +23,13 @@
 - Tightening types should be incremental and focused around stable boundaries first: settings, socket payloads, rankings, room state, player state, and obstacle records.
 - TypeScript, `tsx`, and `@types/*` packages are development dependencies only; no new runtime dependency was added for the migration.
 
+## React UI Migration
+
+- React owns presentation state only; Three.js gameplay, physics, rendering, audio, and socket payload behavior remain imperative and unchanged.
+- The UI bridge is `ReactUiAdapter`, preserving the existing game-facing UI method contract while replacing direct DOM mutation with React state updates.
+- The client uses Shadcn-style local primitives plus Tailwind utilities instead of importing a heavy UI runtime layer. Radix is only used where needed for Shadcn-compatible primitives.
+- Keep the arcade glass visual identity rather than adopting a generic dashboard look.
+
 ## Gameplay Boundaries
 
 - Do not change room protocol or multiplayer event shapes during this pass.

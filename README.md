@@ -1,6 +1,6 @@
 # SkiFree 3D Multiplayer
 
-A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript, Three.js, and real-time multiplayer via Socket.io.
+A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript, React, Shadcn-style components, Three.js, and real-time multiplayer via Socket.io.
 
 ## Features
 
@@ -13,6 +13,7 @@ A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript
 - **Ranking** - best-run screen persisted by the server in SQLite, grouped by player identity, with recent-run history per player and browser cache fallback.
 - **Server API docs** - Swagger UI is available at `http://localhost:3000/docs` when the server is running.
 - **Graphics quality** - `high` uses shader terrain, layered snow, mountains, and bloom; `low` keeps the lighter terrain path.
+- **React UI** - menus, lobby, settings, ranking, pause, game over, HUD, and overlays are organized as React components with a Shadcn/Tailwind-style arcade glass theme.
 
 ## Controls
 
@@ -61,9 +62,20 @@ npm start
 ```text
 skyfree-3d/
 |-- client/
+|   |-- components.json
 |   |-- tsconfig.json
 |   |-- src/
-|   |   |-- main.ts
+|   |   |-- main.tsx
+|   |   |-- index.css
+|   |   |-- app/
+|   |   |   |-- App.tsx
+|   |   |   |-- GameShell.tsx
+|   |   |   |-- ReactUiAdapter.ts
+|   |   |   `-- gameController.ts
+|   |   |-- components/
+|   |   |   |-- screens/
+|   |   |   |-- hud/
+|   |   |   `-- ui/
 |   |   |-- game/
 |   |   |   |-- Game.ts
 |   |   |   |-- Player.ts
@@ -78,9 +90,9 @@ skyfree-3d/
 |   |   |   |-- Snow.ts
 |   |   |   |-- SkiTrail.ts
 |   |   |   |-- Camera.ts
-|   |   |   |-- Input.ts
-|   |   |   `-- UI.ts
+|   |   |   `-- Input.ts
 |   |   |-- net/
+|   |   |-- types/
 |   |   `-- utils/
 |   `-- index.html
 `-- server/
@@ -96,6 +108,7 @@ skyfree-3d/
 - Rooms share a deterministic seed, so terrain and obstacles are generated locally without per-obstacle network sync.
 - Player physics and collisions are client-side for this MVP.
 - Socket payloads are unchanged by the graphics and obstacle polish pass.
+- React owns presentation state; `ReactUiAdapter` exposes the same UI methods the Three.js game loop calls.
 
 ## Server API
 

@@ -14,10 +14,11 @@ Operational memory files live in:
 
 ## 2. Architecture
 
-- Client: Vite + Three.js + TypeScript, entrypoint in `client/src/main.ts`.
+- Client: Vite + React + Shadcn-style components + Tailwind + Three.js + TypeScript, entrypoint in `client/src/main.tsx`.
 - Server: Express + Socket.io + TypeScript, entrypoint in `server/index.ts`, built to `server/dist`.
 - Persistence: SQLite ranking database at `server/data/rankings.sqlite`, accessed through `server/RankingRepository.ts`.
 - Main loop: `Game` owns scene setup, terrain/chunk updates, player, obstacles, camera, snow, trail, yeti, HUD, and network updates.
+- UI loop: React owns menus, settings, lobby, ranking, pause, game over, HUD, and overlays. `GameController` owns app orchestration and `ReactUiAdapter` translates existing imperative game UI calls into React state updates.
 - HTTP API: `/health`, `/api/rankings`, `/openapi.json`, and Swagger UI under `/docs`.
 - Multiplayer: the client opens a socket only when creating or joining a room. The server owns per-room lobbies, relays room state and player updates, and clients simulate local physics from a shared deterministic seed.
 - Multiplayer rooms own shared gameplay rules: `gameMode`, `difficulty`, `yetiStartMode`, and `obstacleVolume`. The room host can edit these rules in the lobby before start; other players receive them read-only and use them when the run begins.
@@ -85,6 +86,7 @@ Operational memory files live in:
 - `yetiStartMode` accepts `distance` or `immediate`; `immediate` starts the Yeti chase at the beginning of a run while preserving the selected difficulty tuning.
 - Fog and snowfall are local presentation settings. Obstacle volume is local in solo, but is synchronized as a room rule in multiplayer.
 - The menu/HUD use a compact glass-style shell, speed bar, quality badge, jump state badge, multiplayer shield countdown, hit flash, landing feedback, and a persistent controls panel during runs.
+- The menu/HUD are React components organized under `client/src/components/screens`, `client/src/components/hud`, and `client/src/components/ui`; Shadcn-style primitives provide buttons, inputs, selects, sliders, cards, badges, and related controls.
 - The controls panel lists steering, brake, boost, jump, mouse control, and pause commands; in Sky Mario it also shows throw commands for keyboard and mouse.
 - Ranking persists best runs through the server SQLite API and keeps localStorage as a browser cache/fallback when the API is unavailable.
 - Ranking stores the played mode as `classic`, `multiplayer`, `sky_mario`, or `multiplayer_sky_mario` so mode-specific runs remain visible in history.
@@ -101,7 +103,7 @@ Operational memory files live in:
 
 - Do not run `npm run dev` in automated work; the developer runs the local dev server.
 - Use TypeScript builds and `npm run build` for automated validation.
-- Avoid new runtime dependencies for this polish pass. TypeScript, `tsx`, and type packages are development-only.
+- React, React DOM, Tailwind, Lucide, and Shadcn-style helper dependencies are part of the client UI layer; gameplay and socket protocol remain unchanged.
 - Keep core gameplay and multiplayer protocol stable unless a future design explicitly changes them.
 
 ## 7. Next Milestones

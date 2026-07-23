@@ -14,8 +14,10 @@ Last updated: 2026-07-23
 - Added TypeScript configs for both workspaces. Client uses `tsc --noEmit && vite build`; server compiles CommonJS output into `server/dist`.
 - Server development now uses `tsx watch index.ts`; root/client dev scripts remain network-host enabled.
 - The first TypeScript pass is permissive with `// @ts-nocheck` on migrated runtime files so behavior stays stable while types are added incrementally.
-- Restored `client/src/main.ts` bootstrap after missing globals caused `inputRoom is not defined`.
-- Rebuilt `client/src/game/UI.ts` after corrupted/duplicated code caused runtime errors.
+- Migrated the client presentation layer to React with Shadcn/Tailwind-style components. `client/src/main.tsx` mounts `App`, `GameShell` owns the Three.js renderer, `GameController` owns orchestration, and `ReactUiAdapter` bridges existing game UI calls into React state.
+- Removed the old static `index.html` UI and the imperative `client/src/game/UI.ts`; screens and HUD now live under `client/src/components/screens` and `client/src/components/hud`.
+- Restored the previous client bootstrap after missing globals caused `inputRoom is not defined`; that bootstrap has since been replaced by the React entrypoint.
+- Rebuilt the previous imperative UI after corrupted/duplicated code caused runtime errors; that DOM UI has since been replaced by React screens and HUD components.
 - Added missing `#controls-hint` markup and made optional UI display updates null-safe.
 - Fixed `Game.ts` constants/listeners/class closing issues so the full client bundle builds.
 - Spacebar triggers a manual player jump; airborne players pass over normal ground obstacles.
