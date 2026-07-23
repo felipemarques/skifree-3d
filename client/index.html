@@ -1,0 +1,1217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SkiFree 3D</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4f9ff;
+      --muted: #aab9cf;
+      --panel: rgba(8, 18, 32, 0.72);
+      --panel-strong: rgba(9, 20, 36, 0.9);
+      --line: rgba(213, 235, 255, 0.18);
+      --blue: #2d7fff;
+      --blue-2: #65b8ff;
+      --cyan: #79e7ff;
+      --red: #ff5d64;
+      --green: #8be28b;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #07111e;
+      font-family: Inter, "Segoe UI", Arial, sans-serif;
+      color: var(--ink);
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(180deg, rgba(5, 12, 22, 0.12), rgba(5, 12, 22, 0.0) 34%, rgba(4, 9, 15, 0.18)),
+        linear-gradient(90deg, rgba(4, 9, 15, 0.28), rgba(4, 9, 15, 0.0) 22%, rgba(4, 9, 15, 0.0) 78%, rgba(4, 9, 15, 0.28));
+      z-index: 5;
+    }
+
+    .screen {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 28px;
+      color: var(--ink);
+      background:
+        linear-gradient(180deg, rgba(5, 13, 25, 0.44), rgba(5, 13, 25, 0.08) 46%, rgba(5, 13, 25, 0.5)),
+        linear-gradient(0deg, rgba(89, 160, 220, 0.12), rgba(89, 160, 220, 0.0) 44%);
+      backdrop-filter: blur(1px);
+    }
+
+    .menu-panel,
+    .dialog-panel {
+      width: min(430px, calc(100vw - 36px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, rgba(12, 28, 48, 0.88), rgba(8, 18, 32, 0.78));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      padding: 28px;
+    }
+
+    .menu-panel {
+      display: grid;
+      gap: 18px;
+    }
+
+    .dialog-panel {
+      text-align: center;
+    }
+
+    .brand {
+      display: grid;
+      gap: 6px;
+      text-align: center;
+    }
+
+    .eyebrow {
+      color: var(--cyan);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .logo {
+      font-size: clamp(38px, 9vw, 64px);
+      line-height: 0.95;
+      font-weight: 950;
+      letter-spacing: 0.04em;
+      color: #e9f7ff;
+      text-shadow: 0 2px 0 rgba(57, 133, 199, 0.45), 0 12px 34px rgba(86, 173, 255, 0.24);
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .section {
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .section-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-align: center;
+      text-transform: uppercase;
+    }
+
+    .field,
+    .input-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .field {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .name-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .name-row .btn {
+      padding: 0 14px;
+      white-space: nowrap;
+    }
+
+    .settings-grid {
+      display: grid;
+      gap: 14px;
+      text-align: left;
+    }
+
+    .setting-row {
+      display: grid;
+      gap: 8px;
+    }
+
+    .setting-row label,
+    .setting-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #dbeaff;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .value-chip {
+      min-width: 42px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--cyan);
+      background: rgba(255, 255, 255, 0.06);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    input[type="text"],
+    select {
+      width: 100%;
+      min-height: 46px;
+      border: 1px solid rgba(218, 238, 255, 0.22);
+      border-radius: 8px;
+      outline: none;
+      background: rgba(255, 255, 255, 0.075);
+      color: var(--ink);
+      padding: 0 14px;
+      font-size: 15px;
+      font-weight: 700;
+      transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    input[type="text"]::placeholder {
+      color: rgba(230, 240, 255, 0.42);
+      font-weight: 600;
+    }
+
+    input[type="text"]:focus,
+    select:focus {
+      border-color: rgba(121, 231, 255, 0.8);
+      background: rgba(255, 255, 255, 0.1);
+      box-shadow: 0 0 0 3px rgba(121, 231, 255, 0.12);
+    }
+
+    select option {
+      color: #111827;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--blue-2);
+    }
+
+    input[type="checkbox"] {
+      width: 20px;
+      height: 20px;
+      accent-color: var(--blue);
+    }
+
+    .btn {
+      min-height: 46px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 0 22px;
+      color: var(--ink);
+      font-size: 15px;
+      font-weight: 850;
+      cursor: pointer;
+      transition: transform 0.12s ease, background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+    }
+
+    .btn:active {
+      transform: translateY(1px);
+    }
+
+    .btn-primary {
+      background: linear-gradient(180deg, #338cff, #1f6fff);
+      box-shadow: 0 10px 28px rgba(45, 127, 255, 0.28);
+    }
+
+    .btn-primary:hover {
+      box-shadow: 0 14px 36px rgba(45, 127, 255, 0.36);
+    }
+
+    .btn-secondary {
+      border-color: rgba(218, 238, 255, 0.22);
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .actions.single {
+      grid-template-columns: 1fr;
+    }
+
+    .room-code {
+      margin: 12px 0 4px;
+      color: var(--cyan);
+      font-size: clamp(34px, 10vw, 56px);
+      font-weight: 950;
+      letter-spacing: 0.2em;
+      text-shadow: 0 12px 36px rgba(121, 231, 255, 0.28);
+    }
+
+    .big-number {
+      margin: 6px 0 10px;
+      color: #ff6b77;
+      font-size: clamp(48px, 12vw, 78px);
+      font-weight: 950;
+      text-shadow: 0 12px 40px rgba(45, 127, 255, 0.28);
+    }
+
+    .label,
+    .small,
+    .error-msg {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .small {
+      text-align: center;
+    }
+
+    .error-msg {
+      min-height: 20px;
+      color: #ff9aa0;
+      text-align: center;
+    }
+
+    #input-room {
+      width: 140px;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      text-align: center;
+    }
+
+    #waiting-players,
+    #leaderboard,
+    #ranking-empty {
+      margin: 18px 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .room-countdown {
+      display: none;
+      margin: 18px auto 0;
+      width: min(210px, 100%);
+      border: 1px solid rgba(116, 234, 255, 0.36);
+      border-radius: 8px;
+      background: rgba(21, 119, 255, 0.16);
+      box-shadow: 0 0 24px rgba(39, 132, 255, 0.22);
+      color: #e9fbff;
+      padding: 12px 14px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: 950;
+      letter-spacing: 0.02em;
+    }
+
+    .room-settings {
+      margin: 16px 0 18px;
+      padding: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.055);
+    }
+
+    .room-settings-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .ranking-list {
+      margin: 18px 0;
+      display: grid;
+      gap: 8px;
+      text-align: left;
+    }
+
+    .ranking-row {
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
+      padding: 9px 10px;
+    }
+
+    .ranking-place {
+      color: var(--cyan);
+      font-size: 16px;
+      font-weight: 950;
+      text-align: center;
+    }
+
+    .ranking-name,
+    .ranking-distance {
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .ranking-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .ranking-player-button {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      color: #ffffff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 850;
+      padding: 0;
+      text-align: left;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .ranking-player-button:hover {
+      color: var(--cyan);
+    }
+
+    .ranking-distance {
+      text-align: right;
+    }
+
+    .ranking-meta {
+      grid-column: 2 / 4;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .ranking-detail {
+      display: none;
+      margin: 14px 0 18px;
+      text-align: left;
+    }
+
+    .ranking-detail-card {
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
+      padding: 12px;
+      margin-bottom: 10px;
+    }
+
+    .ranking-detail-title {
+      color: #ffffff;
+      font-size: 16px;
+      font-weight: 950;
+      margin-bottom: 4px;
+    }
+
+    .ranking-detail-meta {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .ranking-history-title {
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      margin: 12px 0 8px;
+      text-transform: uppercase;
+    }
+
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      z-index: 60;
+      display: none;
+      width: 242px;
+      pointer-events: none;
+      color: var(--ink);
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    }
+
+    .hud-panel {
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      background: rgba(9, 20, 34, 0.48);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+      backdrop-filter: blur(10px);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    #hud-hearts {
+      display: flex;
+      gap: 5px;
+      height: 22px;
+      align-items: center;
+    }
+
+    .heart {
+      color: #ffffff;
+      font-size: 20px;
+      line-height: 1;
+      filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.45));
+      transition: transform 0.16s ease, opacity 0.16s ease, color 0.16s ease;
+    }
+
+    .heart.lost {
+      color: rgba(255, 255, 255, 0.28);
+      opacity: 0.55;
+      filter: grayscale(1);
+    }
+
+    .heart.shake {
+      animation: heartShake 0.35s ease;
+    }
+
+    .heart.heal {
+      animation: heartHeal 0.42s ease;
+      color: #ff8fa5;
+      filter:
+        drop-shadow(0 2px 4px rgba(0, 0, 0, 0.45))
+        drop-shadow(0 0 10px rgba(255, 104, 138, 0.58));
+    }
+
+    @keyframes heartShake {
+      0%, 100% { transform: scale(1); }
+      25% { transform: scale(1.35) rotate(-12deg); }
+      60% { transform: scale(0.86) rotate(9deg); }
+    }
+
+    @keyframes heartHeal {
+      0%, 100% { transform: scale(1); }
+      35% { transform: scale(1.42); }
+      70% { transform: scale(0.92); }
+    }
+
+    .hud-stat {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .hud-stat span {
+      color: #ffffff;
+      font-size: 22px;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .speed-track {
+      position: relative;
+      overflow: hidden;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    .speed-fill {
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--green), var(--cyan), var(--blue-2));
+      transition: width 0.12s linear;
+    }
+
+    .hud-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .hud-pill {
+      min-height: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 999px;
+      padding: 4px 9px;
+      color: #dceeff;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    #jump-state.active {
+      border-color: rgba(121, 231, 255, 0.5);
+      color: #ffffff;
+      background: rgba(45, 127, 255, 0.32);
+    }
+
+    #spawn-shield {
+      display: none;
+      border-color: rgba(116, 234, 255, 0.5);
+      color: #ffffff;
+      background: rgba(39, 132, 255, 0.32);
+      box-shadow: 0 0 14px rgba(121, 231, 255, 0.2);
+    }
+
+    #spectator-target {
+      display: none;
+      max-width: 100%;
+      border-color: rgba(255, 213, 79, 0.42);
+      color: #fff7d6;
+      background: rgba(255, 193, 7, 0.18);
+    }
+
+    .yeti-radar {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 60;
+      display: none;
+      width: 132px;
+      pointer-events: none;
+      color: #ffe8ea;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+    }
+
+    .yeti-radar-panel {
+      border: 1px solid rgba(255, 93, 100, 0.42);
+      border-radius: 8px;
+      background: rgba(31, 7, 14, 0.52);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
+      backdrop-filter: blur(10px);
+      padding: 8px;
+      display: grid;
+      gap: 6px;
+    }
+
+    .yeti-radar-title {
+      display: flex;
+      justify-content: space-between;
+      color: #ffb7bf;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .yeti-radar-scope {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 50%;
+      background:
+        radial-gradient(circle, rgba(255, 93, 100, 0.08) 0 18%, transparent 19% 100%),
+        linear-gradient(90deg, transparent 49%, rgba(255, 255, 255, 0.12) 50%, transparent 51%),
+        linear-gradient(0deg, transparent 49%, rgba(255, 255, 255, 0.12) 50%, transparent 51%),
+        rgba(9, 20, 34, 0.52);
+    }
+
+    .yeti-radar-player {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--cyan);
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 10px rgba(121, 231, 255, 0.75);
+    }
+
+    .yeti-dot {
+      position: absolute;
+      border-radius: 50%;
+      background: #ff4d5d;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 12px rgba(255, 77, 93, 0.85);
+      animation: yetiRadarPulse 0.72s ease-in-out infinite alternate;
+    }
+
+    .yeti-dot.urgent {
+      background: #ffffff;
+      box-shadow: 0 0 16px rgba(255, 77, 93, 1);
+    }
+
+    @keyframes yetiRadarPulse {
+      from { opacity: 0.58; transform: translate(-50%, -50%) scale(0.9); }
+      to { opacity: 1; transform: translate(-50%, -50%) scale(1.15); }
+    }
+
+    #player-list {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 60;
+      display: none;
+      min-width: 180px;
+      max-width: min(280px, calc(100vw - 40px));
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 8px;
+      background: rgba(9, 20, 34, 0.48);
+      padding: 10px 12px;
+      color: #dceeff;
+      font-size: 13px;
+      line-height: 1.5;
+      text-align: right;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+      backdrop-filter: blur(10px);
+    }
+
+    .player-list-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px 10px;
+      align-items: baseline;
+      padding: 3px 0;
+    }
+
+    .player-list-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: left;
+    }
+
+    .player-list-meta {
+      color: rgba(220, 238, 255, 0.68);
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .player-status {
+      color: #7df7ba;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+
+    .player-status.dead {
+      color: #ff8c98;
+    }
+
+    #controls-hint {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      z-index: 60;
+      display: none;
+      width: min(430px, calc(100vw - 32px));
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 8px;
+      background: rgba(9, 20, 34, 0.5);
+      color: rgba(244, 249, 255, 0.76);
+      padding: 10px 12px;
+      pointer-events: none;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+    }
+
+    .controls-title {
+      margin-bottom: 7px;
+      color: var(--cyan);
+      font-size: 10px;
+      font-weight: 950;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .controls-notice {
+      margin: -2px 0 8px;
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .controls-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px 10px;
+    }
+
+    .control-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      color: rgba(222, 238, 255, 0.88);
+      font-size: 11px;
+      font-weight: 750;
+      line-height: 1.25;
+    }
+
+    .keycap {
+      flex: 0 0 auto;
+      min-width: 22px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.12);
+      color: #ffffff;
+      padding: 2px 5px;
+      font-size: 10px;
+      font-weight: 950;
+      text-align: center;
+      box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+    }
+
+    #btn-mute {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 200;
+      display: none;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      background: rgba(9, 20, 34, 0.55);
+      color: #ffffff;
+      font-size: 18px;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+    }
+
+    #hit-flash {
+      position: fixed;
+      inset: 0;
+      z-index: 300;
+      pointer-events: none;
+      opacity: 0;
+      background: rgba(255, 60, 70, 0.24);
+      transition: opacity 0.16s ease;
+    }
+
+    #hit-flash.active {
+      opacity: 1;
+      transition-duration: 0.04s;
+    }
+
+    .yeti-warning {
+      position: fixed;
+      top: 18px;
+      left: 50%;
+      z-index: 70;
+      display: none;
+      transform: translateX(-50%);
+      border: 1px solid rgba(255, 93, 100, 0.5);
+      border-radius: 8px;
+      background: rgba(43, 7, 13, 0.68);
+      color: #fff3f4;
+      padding: 9px 14px;
+      font-size: 16px;
+      font-weight: 950;
+      letter-spacing: 0.08em;
+      text-shadow: 0 0 20px rgba(255, 93, 100, 0.75);
+      pointer-events: none;
+      animation: warningPulse 0.55s ease-in-out infinite alternate;
+      backdrop-filter: blur(10px);
+    }
+
+    @keyframes warningPulse {
+      from { opacity: 0.72; }
+      to { opacity: 1; transform: translateX(-50%) scale(1.04); }
+    }
+
+    @media (max-width: 640px) {
+      .screen {
+        align-items: flex-start;
+        padding: 18px;
+        overflow-y: auto;
+      }
+
+      .menu-panel,
+      .dialog-panel {
+        padding: 20px;
+      }
+
+      .actions,
+      .input-row {
+        grid-template-columns: 1fr;
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .name-row {
+        grid-template-columns: 1fr;
+      }
+
+      #input-room {
+        width: 100%;
+      }
+
+      #hud {
+        top: 10px;
+        left: 10px;
+        width: min(230px, calc(100vw - 20px));
+      }
+
+      #player-list {
+        top: auto;
+        right: 10px;
+        bottom: 150px;
+      }
+
+      .yeti-radar {
+        right: 10px;
+        bottom: 10px;
+        width: 118px;
+      }
+
+      .yeti-warning {
+        top: 8px;
+        max-width: calc(100vw - 20px);
+        font-size: 13px;
+        padding: 7px 10px;
+      }
+
+      #controls-hint {
+        left: 10px;
+        right: 10px;
+        bottom: 136px;
+        width: auto;
+        padding: 9px 10px;
+      }
+
+      .controls-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-item {
+        font-size: 10px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="screen" id="screen-settings" style="display:none;">
+    <div class="dialog-panel">
+      <div class="brand">
+        <div class="eyebrow">Setup</div>
+        <h2>Settings</h2>
+      </div>
+
+      <div class="settings-grid" style="margin-top: 22px;">
+        <div class="setting-row">
+          <label for="control-mode">Control Mode</label>
+          <select id="control-mode">
+            <option value="keyboard">Keyboard Only</option>
+            <option value="mouse">Mouse Only</option>
+            <option value="both">Both</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="mouse-sensitivity">Mouse Sensitivity</label>
+            <span class="value-chip" id="mouse-sensitivity-value">1.0</span>
+          </div>
+          <input type="range" id="mouse-sensitivity" min="0.5" max="2.0" step="0.1" value="1.0" />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="invert-mouse">Invert Mouse Y</label>
+            <input type="checkbox" id="invert-mouse" />
+          </div>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="sfx-volume">Sound Volume</label>
+            <span class="value-chip" id="sfx-volume-value">60%</span>
+          </div>
+          <input type="range" id="sfx-volume" min="0" max="1" step="0.1" value="0.6" />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="fog-level">Fog Level</label>
+            <span class="value-chip" id="fog-level-value">100%</span>
+          </div>
+          <input type="range" id="fog-level" min="0" max="2" step="0.1" value="1.0" />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="snow-volume">Snowfall</label>
+            <span class="value-chip" id="snow-volume-value">100%</span>
+          </div>
+          <input type="range" id="snow-volume" min="0" max="2" step="0.1" value="1.0" />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <label for="obstacle-volume">Obstacles</label>
+            <span class="value-chip" id="obstacle-volume-value">100%</span>
+          </div>
+          <input type="range" id="obstacle-volume" min="0" max="2" step="0.1" value="1.0" />
+        </div>
+
+        <div class="setting-row">
+          <label for="graphics-quality">Graphics Quality</label>
+          <select id="graphics-quality">
+            <option value="high">High</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="difficulty">Difficulty</label>
+          <select id="difficulty">
+            <option value="easy">Easy</option>
+            <option value="normal">Normal</option>
+            <option value="hard">Hard</option>
+            <option value="extreme">Extreme</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <label for="yeti-start-mode">Yeti Mode</label>
+          <select id="yeti-start-mode">
+            <option value="distance">Distance Trigger</option>
+            <option value="immediate">Hunt From Start</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="actions" style="margin-top: 22px;">
+        <button class="btn btn-primary" id="btn-save-settings">Save</button>
+        <button class="btn btn-secondary" id="btn-back-to-menu">Back</button>
+      </div>
+      <div class="error-msg" style="margin-top: 10px;"></div>
+    </div>
+  </div>
+
+  <div class="screen" id="screen-title">
+    <div class="menu-panel">
+      <div class="brand">
+        <div class="eyebrow">Arcade Alpine</div>
+        <h1 class="logo">SKIFREE 3D</h1>
+        <div class="subtitle">Multiplayer Edition</div>
+      </div>
+
+      <div class="section">
+        <div class="field">
+          <div class="name-row">
+            <input type="text" id="input-name" placeholder="Your name" maxlength="16" value="Skier" />
+            <button class="btn btn-secondary" id="btn-save-name" type="button">Save Name</button>
+          </div>
+          <select id="game-mode">
+            <option value="classic">Classic / Arcade</option>
+            <option value="sky_mario">Sky Mario</option>
+          </select>
+          <button class="btn btn-primary" id="btn-solo">Play Solo</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Multiplayer</div>
+        <button class="btn btn-primary" id="btn-create">Create Room</button>
+        <div class="input-row">
+          <input type="text" id="input-room" placeholder="Room" maxlength="6" />
+          <button class="btn btn-secondary" id="btn-join">Join</button>
+        </div>
+      </div>
+
+      <div class="actions single">
+        <button class="btn btn-secondary" id="btn-ranking">Ranking</button>
+        <button class="btn btn-secondary" id="btn-settings">Settings</button>
+      </div>
+
+      <div class="error-msg"></div>
+    </div>
+  </div>
+
+  <div class="screen" id="screen-waiting" style="display:none;">
+    <div class="dialog-panel">
+      <div class="eyebrow">Room Lobby</div>
+      <div class="room-code" id="display-room-code">------</div>
+      <div class="subtitle">Share this code with friends</div>
+      <div id="waiting-players"></div>
+      <div class="room-countdown" id="room-countdown">Starting in 10</div>
+      <div class="room-settings" id="room-settings-panel">
+        <div class="room-settings-header">
+          <span>Room Settings</span>
+          <span id="room-host-label">Host Only</span>
+        </div>
+        <div class="settings-grid">
+          <div class="setting-row">
+            <label for="room-game-mode">Game Mode</label>
+            <select id="room-game-mode">
+              <option value="classic">Classic / Arcade</option>
+              <option value="sky_mario">Sky Mario</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label for="room-difficulty">Difficulty</label>
+            <select id="room-difficulty">
+              <option value="easy">Easy</option>
+              <option value="normal">Normal</option>
+              <option value="hard">Hard</option>
+              <option value="extreme">Extreme</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label for="room-yeti-start-mode">Yeti Mode</label>
+            <select id="room-yeti-start-mode">
+              <option value="distance">Distance Trigger</option>
+              <option value="immediate">Hunt From Start</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <label for="room-obstacle-volume">Obstacles</label>
+              <span class="value-chip" id="room-obstacle-volume-value">100%</span>
+            </div>
+            <input type="range" id="room-obstacle-volume" min="0" max="2" step="0.1" value="1.0" />
+          </div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-start-game">Start Game</button>
+        <button class="btn btn-secondary" id="btn-leave-room">Leave</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="screen" id="screen-gameover" style="display:none;">
+    <div class="dialog-panel">
+      <div class="eyebrow">Run Complete</div>
+      <h2>Game Over</h2>
+      <div class="label">Distance Skied</div>
+      <div class="big-number" id="final-distance">0 m</div>
+      <div id="leaderboard"></div>
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-play-again">Play Again</button>
+        <button class="btn btn-secondary" id="btn-gameover-ranking">Ranking</button>
+        <button class="btn btn-secondary" id="btn-main-menu">Main Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="screen" id="screen-ranking" style="display:none;">
+    <div class="dialog-panel">
+      <div class="eyebrow">Best Runs</div>
+      <h2>Ranking</h2>
+      <div id="ranking-empty">No runs recorded yet.</div>
+      <div class="ranking-list" id="ranking-list"></div>
+      <div class="ranking-detail" id="ranking-detail"></div>
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-back-from-ranking">Back</button>
+        <button class="btn btn-secondary" id="btn-clear-ranking">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="screen" id="screen-pause" style="display:none;">
+    <div class="dialog-panel pause-panel">
+      <div class="eyebrow">Paused</div>
+      <h2>Run Paused</h2>
+      <div class="actions single" style="margin-top: 22px;">
+        <button class="btn btn-primary" id="btn-resume-game">Resume</button>
+        <button class="btn btn-secondary" id="btn-pause-settings">Settings</button>
+        <button class="btn btn-secondary" id="btn-pause-main-menu">Main Menu</button>
+      </div>
+      <div class="small" style="margin-top: 14px;">Press Esc to resume</div>
+    </div>
+  </div>
+
+  <div id="hud">
+    <div class="hud-panel">
+      <div id="hud-hearts">
+        <span class="heart" id="heart-0">&hearts;</span>
+        <span class="heart" id="heart-1">&hearts;</span>
+        <span class="heart" id="heart-2">&hearts;</span>
+      </div>
+
+      <div class="hud-stat">Distance <span><span id="hud-distance">0</span> m</span></div>
+      <div class="hud-stat">Speed <span><span id="hud-speed">0</span> km/h</span></div>
+      <div class="speed-track" aria-hidden="true"><div class="speed-fill" id="speed-fill"></div></div>
+
+      <div class="hud-row">
+        <div class="hud-pill" id="jump-state">Ground</div>
+        <div class="hud-pill" id="hud-quality">High</div>
+        <div class="hud-pill" id="spawn-shield">Shield 5s</div>
+        <div class="hud-pill" id="spectator-target">Viewing Leader</div>
+      </div>
+    </div>
+  </div>
+
+  <button id="btn-mute" aria-label="Toggle sound">&#9835;</button>
+  <div id="hit-flash"></div>
+  <div id="player-list"></div>
+  <div class="yeti-radar" id="yeti-radar">
+    <div class="yeti-radar-panel">
+      <div class="yeti-radar-title"><span>Yeti</span><span id="yeti-radar-distance">--</span></div>
+      <div class="yeti-radar-scope">
+        <span class="yeti-radar-player"></span>
+        <span id="yeti-radar-dots"></span>
+      </div>
+    </div>
+  </div>
+  <div class="yeti-warning" id="yeti-warning">YETI INBOUND</div>
+  <div id="controls-hint">Run Active</div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
