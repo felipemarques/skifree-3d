@@ -1,3 +1,4 @@
+// @ts-nocheck
 import * as THREE from 'three';
 
 const SKY_TOP = new THREE.Color(0x426b92);

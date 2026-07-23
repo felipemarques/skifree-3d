@@ -1,3 +1,4 @@
+// @ts-nocheck
 // Settings - persisted to localStorage
 // controlMode: 'keyboard' | 'mouse' | 'both'
 // mouseSensitivity: 0.5 - 2.0

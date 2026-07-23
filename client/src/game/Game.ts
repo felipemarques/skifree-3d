@@ -1,22 +1,23 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { Terrain } from './Terrain.js';
-import { SnowTerrain } from './SnowTerrain.js';
-import { Player } from './Player.js';
-import { RemotePlayer } from './RemotePlayer.js';
-import { Obstacles } from './Obstacles.js';
-import { YetiManager } from './Yeti.js';
-import { GameCamera } from './Camera.js';
-import { SnowParticles } from './Snow.js';
-import { Input } from './Input.js';
-import { SeededRandom } from '../utils/SeededRandom.js';
-import { AudioManager } from './AudioManager.js';
-import { SkiTrail } from './SkiTrail.js';
-import { SkyBg } from './SkyBg.js';
-import { HorizonMountains } from './HorizonMountains.js';
-import { PostFX } from './PostFX.js';
-import { CourseDecor } from './CourseDecor.js';
-import { settings } from '../utils/Settings.js';
-import { getVisualTerrainY } from './VisualTerrain.js';
+import { Terrain } from './Terrain';
+import { SnowTerrain } from './SnowTerrain';
+import { Player } from './Player';
+import { RemotePlayer } from './RemotePlayer';
+import { Obstacles } from './Obstacles';
+import { YetiManager } from './Yeti';
+import { GameCamera } from './Camera';
+import { SnowParticles } from './Snow';
+import { Input } from './Input';
+import { SeededRandom } from '../utils/SeededRandom';
+import { AudioManager } from './AudioManager';
+import { SkiTrail } from './SkiTrail';
+import { SkyBg } from './SkyBg';
+import { HorizonMountains } from './HorizonMountains';
+import { PostFX } from './PostFX';
+import { CourseDecor } from './CourseDecor';
+import { settings } from '../utils/Settings';
+import { getVisualTerrainY } from './VisualTerrain';
 
 const CHUNK_SIZE = 80;
 const NET_UPDATE_HZ = 20; // send position 20 times per second

@@ -1,5 +1,6 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { SeededRandom } from '../utils/SeededRandom.js';
+import { SeededRandom } from '../utils/SeededRandom';
 
 const CHUNK_SIZE = 80;
 const TRACK_EDGE = 54;

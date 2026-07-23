@@ -1,4 +1,5 @@
-import { settings } from '../utils/Settings.js';
+// @ts-nocheck
+import { settings } from '../utils/Settings';
 
 /**
  * Input — reads keyboard and/or mouse depending on Settings.controlMode.

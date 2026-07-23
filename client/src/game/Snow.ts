@@ -1,3 +1,4 @@
+// @ts-nocheck
 import * as THREE from 'three';
 
 function clamp(value, min, max) {

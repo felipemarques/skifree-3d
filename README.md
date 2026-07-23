@@ -1,6 +1,6 @@
 # SkiFree 3D Multiplayer
 
-A 3D browser reimagining of the classic 1991 SkiFree game, built with Three.js and real-time multiplayer via Socket.io.
+A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript, Three.js, and real-time multiplayer via Socket.io.
 
 ## Features
 
@@ -61,28 +61,33 @@ npm start
 ```text
 skyfree-3d/
 |-- client/
+|   |-- tsconfig.json
 |   |-- src/
-|   |   |-- main.js
+|   |   |-- main.ts
 |   |   |-- game/
-|   |   |   |-- Game.js
-|   |   |   |-- Player.js
-|   |   |   |-- RemotePlayer.js
-|   |   |   |-- SkierModel.js
-|   |   |   |-- Yeti.js
-|   |   |   |-- Terrain.js
-|   |   |   |-- SnowTerrain.js
-|   |   |   |-- VisualTerrain.js
-|   |   |   |-- Obstacles.js
-|   |   |   |-- HorizonMountains.js
-|   |   |   |-- Snow.js
-|   |   |   |-- SkiTrail.js
-|   |   |   |-- Camera.js
-|   |   |   |-- Input.js
-|   |   |   `-- UI.js
+|   |   |   |-- Game.ts
+|   |   |   |-- Player.ts
+|   |   |   |-- RemotePlayer.ts
+|   |   |   |-- SkierModel.ts
+|   |   |   |-- Yeti.ts
+|   |   |   |-- Terrain.ts
+|   |   |   |-- SnowTerrain.ts
+|   |   |   |-- VisualTerrain.ts
+|   |   |   |-- Obstacles.ts
+|   |   |   |-- HorizonMountains.ts
+|   |   |   |-- Snow.ts
+|   |   |   |-- SkiTrail.ts
+|   |   |   |-- Camera.ts
+|   |   |   |-- Input.ts
+|   |   |   `-- UI.ts
 |   |   |-- net/
 |   |   `-- utils/
 |   `-- index.html
 `-- server/
+    |-- tsconfig.json
+    |-- index.ts
+    |-- GameRoom.ts
+    `-- RankingRepository.ts
 ```
 
 ## Multiplayer Architecture

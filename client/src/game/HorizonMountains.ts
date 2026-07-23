@@ -1,3 +1,4 @@
+// @ts-nocheck
 import * as THREE from 'three';
 
 function createRidgeSamples({ width, baseY, height, segments, depth, phase }) {

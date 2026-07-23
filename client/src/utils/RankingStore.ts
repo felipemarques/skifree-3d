@@ -1,3 +1,4 @@
+// @ts-nocheck
 const KEY = 'skifree3d_rankings';
 const PLAYER_ID_KEY = 'skifree3d_player_id';
 const MAX_ENTRIES = 50;

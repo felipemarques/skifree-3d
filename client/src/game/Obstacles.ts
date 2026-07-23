@@ -1,5 +1,6 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { buildSkierMesh, updateSkierAnimation } from './SkierModel.js';
+import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
 
 const CHUNK_SIZE = 80;
 const CHUNK_WIDTH = 120;

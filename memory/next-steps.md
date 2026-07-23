@@ -2,6 +2,8 @@
 
 ## Near Term
 
+- Add real TypeScript declarations incrementally and remove `// @ts-nocheck` module by module, starting with settings, rankings, room state, socket payloads, and obstacle records.
+- Browser-test the TypeScript migration with a hard reload after the developer restarts the existing dev server.
 - Validate the current graphics/obstacle pass in the browser with a hard reload.
 - Confirm `Play Solo` starts without console errors in both `high` and `low`.
 - Check that nearby obstacles remain readable by 30-50m with fog and snow enabled.
@@ -74,3 +76,4 @@
 - Deterministic obstacle generation depends on the shared room seed.
 - Visual terrain displacement is cosmetic only.
 - The developer runs the dev server; automation should not run `npm run dev`.
+- The TypeScript migration currently prioritizes runtime parity; strict typing is a follow-up pass.

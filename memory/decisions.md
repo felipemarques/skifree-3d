@@ -16,6 +16,13 @@
 - `low` must remain available for weaker machines and should avoid bloom and high particle counts.
 - No new runtime dependencies for the current graphics/obstacle pass.
 
+## TypeScript Migration
+
+- Client and server now use `.ts` source files and workspace-local `tsconfig.json` files.
+- The initial migration intentionally uses permissive TypeScript checking and `// @ts-nocheck` on migrated runtime files to avoid changing gameplay behavior while moving the toolchain.
+- Tightening types should be incremental and focused around stable boundaries first: settings, socket payloads, rankings, room state, player state, and obstacle records.
+- TypeScript, `tsx`, and `@types/*` packages are development dependencies only; no new runtime dependency was added for the migration.
+
 ## Gameplay Boundaries
 
 - Do not change room protocol or multiplayer event shapes during this pass.
@@ -54,7 +61,7 @@
 - Enemy NPC jumps stay local and procedural: low hazards trigger short vertical lift, while tall obstacles still use cheap avoidance instead of pathfinding.
 - Mountain polish should remain procedural and mesh-based for now: parallax layers, facets, snow caps, and foothills are preferred over imported image backdrops.
 - Ranking is now server-persisted in SQLite, with localStorage kept only as a resilience/cache fallback for offline API failures.
-- Swagger is served from a hand-maintained OpenAPI spec in `server/index.js` to avoid extra route annotation tooling.
+- Swagger is served from a hand-maintained OpenAPI spec in `server/index.ts` to avoid extra route annotation tooling.
 - Fatal collision animations are local presentation only; they do not alter socket payloads, scoring, or server state.
 - Radar screen-space convention is forward/up and behind/down, matching player intuition rather than raw world positive-Z screen placement.
 - Yeti capture should read as arcade slapstick/low-poly fragmentation, not gore; all three variants reuse existing skier mesh parts instead of adding violent assets.
@@ -82,3 +89,4 @@
 
 - Do not run `npm run dev`; the developer controls the local dev server.
 - Use `node --check` and `npm run build` for automated validation.
+- Prefer `npm run build` for TypeScript validation; `node --check` is useful on emitted server files under `server/dist`.

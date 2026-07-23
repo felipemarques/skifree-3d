@@ -1,3 +1,4 @@
+// @ts-nocheck
 // Deterministic pseudo-random number generator (LCG)
 // Given the same seed, always produces the same sequence.
 export class SeededRandom {

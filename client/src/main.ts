@@ -1,10 +1,11 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { Game } from './game/Game.js';
-import { UI } from './game/UI.js';
-import { MenuBackdrop } from './game/MenuBackdrop.js';
-import { SocketClient } from './net/SocketClient.js';
-import { settings } from './utils/Settings.js';
-import { rankingStore } from './utils/RankingStore.js';
+import { Game } from './game/Game';
+import { UI } from './game/UI';
+import { MenuBackdrop } from './game/MenuBackdrop';
+import { SocketClient } from './net/SocketClient';
+import { settings } from './utils/Settings';
+import { rankingStore } from './utils/RankingStore';
 
 const renderer = new THREE.WebGLRenderer({
   antialias: true,

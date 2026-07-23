@@ -1,3 +1,4 @@
+// @ts-nocheck
 // GameRoom manages a single multiplayer room
 const ROOM_ID_LENGTH = 6;
 const DEFAULT_ROOM_SETTINGS = {

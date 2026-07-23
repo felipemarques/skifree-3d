@@ -1,6 +1,7 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { settings } from '../utils/Settings.js';
-import { buildSkierMesh, updateSkierAnimation } from './SkierModel.js';
+import { settings } from '../utils/Settings';
+import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
 
 const MAX_HP = 3;
 const BASE_SPEED = 14;

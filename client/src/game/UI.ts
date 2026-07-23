@@ -1,3 +1,4 @@
+// @ts-nocheck
 const MAX_HEARTS = 3;
 const MAX_DISPLAY_SPEED_KMH = 105;
 

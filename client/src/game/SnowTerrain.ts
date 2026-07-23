@@ -1,3 +1,4 @@
+// @ts-nocheck
 import * as THREE from 'three';
 
 const CHUNK_SIZE = 80;

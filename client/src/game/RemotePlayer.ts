@@ -1,5 +1,6 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { buildSkierMesh, setSkierNameLabel, updateSkierAnimation } from './SkierModel.js';
+import { buildSkierMesh, setSkierNameLabel, updateSkierAnimation } from './SkierModel';
 
 const PLAYER_COLORS = [0xff6b35, 0x4caf50, 0xf9c74f, 0xa855f7, 0xef476f, 0x06d6a0, 0xff9f1c];
 let colorIdx = 0;

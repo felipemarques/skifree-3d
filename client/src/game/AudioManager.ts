@@ -1,4 +1,5 @@
-import { settings } from '../utils/Settings.js';
+// @ts-nocheck
+import { settings } from '../utils/Settings';
 
 /**
  * AudioManager — all sounds synthesized via Web Audio API.

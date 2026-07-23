@@ -1,3 +1,4 @@
+// @ts-nocheck
 const SLOPE_STRENGTH = 0.026;
 const SLOPE_BEHIND = 70;
 const SLOPE_AHEAD = 230;

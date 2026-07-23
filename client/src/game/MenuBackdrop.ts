@@ -1,7 +1,8 @@
+// @ts-nocheck
 import * as THREE from 'three';
-import { SkyBg } from './SkyBg.js';
-import { HorizonMountains } from './HorizonMountains.js';
-import { SnowParticles } from './Snow.js';
+import { SkyBg } from './SkyBg';
+import { HorizonMountains } from './HorizonMountains';
+import { SnowParticles } from './Snow';
 
 const TERRAIN_VERT = /* glsl */`
   uniform float uTime;

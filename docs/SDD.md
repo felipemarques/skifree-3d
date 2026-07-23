@@ -14,9 +14,9 @@ Operational memory files live in:
 
 ## 2. Architecture
 
-- Client: Vite + Three.js, entrypoint in `client/src/main.js`.
-- Server: Express + Socket.io, entrypoint in `server/index.js`.
-- Persistence: SQLite ranking database at `server/data/rankings.sqlite`, accessed through `server/RankingRepository.js`.
+- Client: Vite + Three.js + TypeScript, entrypoint in `client/src/main.ts`.
+- Server: Express + Socket.io + TypeScript, entrypoint in `server/index.ts`, built to `server/dist`.
+- Persistence: SQLite ranking database at `server/data/rankings.sqlite`, accessed through `server/RankingRepository.ts`.
 - Main loop: `Game` owns scene setup, terrain/chunk updates, player, obstacles, camera, snow, trail, yeti, HUD, and network updates.
 - HTTP API: `/health`, `/api/rankings`, `/openapi.json`, and Swagger UI under `/docs`.
 - Multiplayer: the client opens a socket only when creating or joining a room. The server owns per-room lobbies, relays room state and player updates, and clients simulate local physics from a shared deterministic seed.
@@ -66,7 +66,7 @@ Operational memory files live in:
 - `graphicsQuality: high` uses `SnowTerrain`, `SkyBg`, `HorizonMountains`, `PostFX`, denser layered snow, improved lights, tone mapping, and richer procedural models.
 - `graphicsQuality: low` keeps the simple terrain path, lower snow density, and avoids bloom-heavy rendering.
 - `SnowTerrain` adds visual downhill slope and stronger snow relief with shader displacement.
-- `VisualTerrain.js` mirrors the shader height function for local placement of obstacles, ski spray, grooves, and remote players.
+- `VisualTerrain.ts` mirrors the shader height function for local placement of obstacles, ski spray, grooves, and remote players.
 - Gameplay physics and collisions still use the stable plane `y = 0`; slope and relief are cosmetic only.
 - Mountains are layered ridgeline meshes with parallax/fog depth, jagged snow caps, low foothills, and lightweight shaded facets for more readable background depth.
 - `MenuBackdrop` renders a lightweight animated Three.js mountain scene behind title, settings, and lobby screens.
@@ -75,7 +75,7 @@ Operational memory files live in:
 
 ## 5. Settings and Interfaces
 
-- Settings are persisted in localStorage through `client/src/utils/Settings.js`.
+- Settings are persisted in localStorage through `client/src/utils/Settings.ts`.
 - Player name is persisted separately in localStorage with `skifree3d_player_name`; the title screen has a Save Name button and play/create/join also save the current normalized name.
 - `graphicsQuality` accepts `low` or `high`; default is `high`.
 - `fogLevel` and `snowVolume` are numeric sliders from `0` to `2`, where `1` preserves the tuned default, lower values reduce the effect, and higher values intensify it.
@@ -100,8 +100,8 @@ Operational memory files live in:
 ## 6. Constraints
 
 - Do not run `npm run dev` in automated work; the developer runs the local dev server.
-- Use `node --check` and `npm run build` for automated validation.
-- Avoid new dependencies for this polish pass.
+- Use TypeScript builds and `npm run build` for automated validation.
+- Avoid new runtime dependencies for this polish pass. TypeScript, `tsx`, and type packages are development-only.
 - Keep core gameplay and multiplayer protocol stable unless a future design explicitly changes them.
 
 ## 7. Next Milestones

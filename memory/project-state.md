@@ -4,16 +4,20 @@ Last updated: 2026-07-23
 
 ## Current Game
 
-- SkiFree 3D is a browser game built with Vite, Three.js, Express, and Socket.io.
+- SkiFree 3D is a browser game built with TypeScript, Vite, Three.js, Express, and Socket.io.
 - The client runs on `localhost:5173`; the server runs on `localhost:3000`.
 - Do not run `npm run dev` from automation because the developer runs it manually.
 
 ## Recent Fixes
 
-- Restored `client/src/main.js` bootstrap after missing globals caused `inputRoom is not defined`.
-- Rebuilt `client/src/game/UI.js` after corrupted/duplicated code caused runtime errors.
+- Migrated client and server source files from `.js` to `.ts`.
+- Added TypeScript configs for both workspaces. Client uses `tsc --noEmit && vite build`; server compiles CommonJS output into `server/dist`.
+- Server development now uses `tsx watch index.ts`; root/client dev scripts remain network-host enabled.
+- The first TypeScript pass is permissive with `// @ts-nocheck` on migrated runtime files so behavior stays stable while types are added incrementally.
+- Restored `client/src/main.ts` bootstrap after missing globals caused `inputRoom is not defined`.
+- Rebuilt `client/src/game/UI.ts` after corrupted/duplicated code caused runtime errors.
 - Added missing `#controls-hint` markup and made optional UI display updates null-safe.
-- Fixed `Game.js` constants/listeners/class closing issues so the full client bundle builds.
+- Fixed `Game.ts` constants/listeners/class closing issues so the full client bundle builds.
 - Spacebar triggers a manual player jump; airborne players pass over normal ground obstacles.
 - Keyboard acceleration is available through `S`, down arrow, `Shift`, and `F`; mouse acceleration remains tied to moving the cursor down.
 
@@ -22,7 +26,7 @@ Last updated: 2026-07-23
 - `graphicsQuality` setting exists with `high` as the default and `low` as the fallback.
 - High graphics uses shader snow terrain, gradient sky, layered ridgeline mountains, post-processing, denser layered snow, tone mapping, and richer lighting.
 - Visual fog/bloom/exposure were reduced after screenshots showed the first pass was too washed out for gameplay.
-- `VisualTerrain.js` keeps shader terrain and CPU-side visual placement aligned while gameplay physics remains on `y = 0`.
+- `VisualTerrain.ts` keeps shader terrain and CPU-side visual placement aligned while gameplay physics remains on `y = 0`.
 - Terrain now communicates downhill motion and snow relief visually without changing multiplayer payloads.
 - Obstacles now include holes and rare polar bears.
 - Player/ramp jumps now lock trajectory until landing; ramp jump height scales with entry speed.
