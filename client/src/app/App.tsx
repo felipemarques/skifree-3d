@@ -9,7 +9,6 @@ import { RankingScreen } from '@/components/screens/RankingScreen';
 import { GameOverScreen } from '@/components/screens/GameOverScreen';
 import { PauseScreen } from '@/components/screens/PauseScreen';
 import { GameHud } from '@/components/hud/GameHud';
-import { MuteButton } from '@/components/hud/MuteButton';
 import type { GameController } from './gameController';
 
 const defaultControllerSnapshot: ControllerSnapshot = {
@@ -22,6 +21,7 @@ const defaultControllerSnapshot: ControllerSnapshot = {
   roomStartDisabled: true,
   muted: false,
   muteVisible: false,
+  playerColor: '#2979ff',
 };
 
 export function App() {
@@ -46,13 +46,6 @@ export function App() {
       <GameShell store={store} onReady={handleReady} />
       <div className="fixed inset-0 z-50 pointer-events-none">
         <GameHud state={state} />
-        {controller && (
-          <MuteButton
-            visible={controllerSnapshot.muteVisible}
-            muted={controllerSnapshot.muted}
-            onToggle={() => controller.toggleMute()}
-          />
-        )}
       </div>
 
       {controller && state.screen === 'title' && (

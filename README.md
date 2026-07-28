@@ -7,8 +7,8 @@ A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript
 - **3D low-poly graphics** - third-person camera, shader snow, downhill visual relief, layered mountains, standing/fallen trees, rocks, ramps, holes, and polar bears.
 - **Classic gameplay** - endless descent with momentum physics, mouse + keyboard controls, jump, speed boost, HP, and heart pickups for recovery.
 - **The Yeti** - appears at 2000m and multiplies over time.
-- **Yeti mode** - optional setting can start the chase immediately from the beginning of a run.
-- **Multiplayer** - up to 8 players per room, real-time position sync, shared procedural mountain seed.
+- **Yeti mode** - optional setting can start the chase immediately from the beginning of a run or disable the Yeti entirely.
+- **Multiplayer** - up to 8 players per room, server-authoritative Classic mode, real-time snapshots, shared procedural mountain seed.
 - **Room lobby** - socket connection is opened only when creating or joining a multiplayer room.
 - **Ranking** - best-run screen persisted by the server in SQLite, grouped by player identity, with recent-run history per player and browser cache fallback.
 - **Server API docs** - Swagger UI is available at `http://localhost:3000/docs` when the server is running.
@@ -104,11 +104,11 @@ skyfree-3d/
 
 ## Multiplayer Architecture
 
-- Position updates run at 20 Hz.
-- Rooms share a deterministic seed, so terrain and obstacles are generated locally without per-obstacle network sync.
-- Player physics and collisions are client-side for this MVP.
-- Socket payloads are unchanged by the graphics and obstacle polish pass.
-- React owns presentation state; `ReactUiAdapter` exposes the same UI methods the Three.js game loop calls.
+- Classic multiplayer is server-authoritative: clients send `player:input`, the server simulates movement/collision/HP/distance, and clients render official `game:snapshot` updates.
+- The client still predicts local movement for responsiveness and reconciles against server snapshots.
+- Rooms share a deterministic seed, so gameplay-critical obstacles are generated from the same shared simulation on client and server.
+- Multiplayer rankings are recorded from server-authoritative distances; REST ranking writes reject fake multiplayer scores.
+- Sky Mario authoritative multiplayer is deferred to a later pass and cannot start from the lobby yet.
 
 ## Server API
 

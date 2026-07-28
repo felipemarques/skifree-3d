@@ -4,6 +4,11 @@
 
 - Add real TypeScript declarations incrementally and remove `// @ts-nocheck` module by module, starting with settings, rankings, room state, socket payloads, and obstacle records.
 - Browser-test the new React/Shadcn-style UI: title, settings, lobby, ranking, pause, game over, HUD, Yeti radar, player list, hit flash, and mute button.
+- Browser-test authoritative Classic multiplayer with two clients: input responsiveness, snapshot reconciliation, obstacle collision, heart pickup, death, spectator mode, restart, and official ranking persistence.
+- Stress-test the fixed-tick multiplayer path over LAN with 2-3 clients, including Chrome network throttling. Use `?netDebug=1` to inspect tick acknowledgement, pending inputs, snapshot age, and correction error before changing rates.
+- Decide whether decorative objects, NPC skiers, dogs, and bears should become shared deterministic multiplayer visuals or remain local-only presentation.
+- Port Sky Mario projectile/combat simulation to the authoritative runtime before re-enabling Sky Mario multiplayer rooms.
+- Add focused automated tests for `shared/AuthoritativeSim.ts` once a test runner is selected.
 - Consider splitting the larger React controller/UI types further after the migration stabilizes in the browser.
 - Browser-test the TypeScript migration with a hard reload after the developer restarts the existing dev server.
 - Validate the current graphics/obstacle pass in the browser with a hard reload.
@@ -35,7 +40,7 @@
 - Test ranking persistence after solo and multiplayer runs, clear action, and mobile layout.
 - Test dense obstacle chunks to confirm ramps remain clear of trees/rocks/holes and that retry-skipped spawns do not make high volume feel too sparse.
 - Test heart spacing across chunk boundaries and tune the 70m minimum if recovery feels too rare.
-- Test Yeti start mode in solo and multiplayer; decide later whether multiplayer rooms should sync this as a room rule.
+- Test Yeti start mode in solo and multiplayer, including `disabled`, confirming no warning, radar threat, capture, or authoritative Yeti death event occurs.
 - Watch NPC jumps over holes/fallen trees/rocks at different speeds and confirm they still avoid standing trees and ramps.
 - Test dogs/bears knocking down NPC skiers without excessive jitter, repeated stun-locking, or visible mesh clipping.
 - Test dog, bear, and Yeti jumps over low obstacles at high obstacle volume, confirming they still dodge standing trees and ramps without FPS drops.
@@ -59,8 +64,12 @@
 - Test joining a room while countdown is already running; the late client should see the current remaining seconds and then receive the same `game:start`.
 - Browser-test the persistent controls panel on desktop and mobile, including Classic and Sky Mario, to confirm it does not cover the player, Yeti radar, or critical obstacles.
 - Browser-test multiplayer spawn protection: after game start the HUD should show `Shield 5s`, early collisions/projectiles should not remove hearts, and damage should resume after the countdown reaches zero.
+- Browser-test multiplayer spawn lanes with 2, 3, and 8 players: everyone should start on the same horizontal line, visually separated, without immediate skier-skier collision.
+- Browser-test multiplayer outfit colors with 3 clients: duplicate colors should be disabled/rejected, lobby swatches should match, and a surviving skier should keep the same color on every spectator client.
+- Browser-test the wider multiplayer lobby at 1366x768 and mobile widths to confirm the two-column layout reduces scrolling without clipping controls.
 - Browser-test blocked shortcuts on Windows/Linux and macOS-style keyboards: `Ctrl/Cmd+S/O/A/B/F/P/W/Q` should not open browser dialogs, search, print, close the tab, or quit while the game page is focused where the browser allows prevention.
 - Browser-test multiplayer status/spectator flow with at least two clients: alive/dead status updates, dead local client follows the best living remote skier, and Game Over appears only after all players die or leave.
+- Browser-test three-player authoritative multiplayer: one player dies and spectates the best alive skier, the watched skier remains above the snow, and the last player to die receives their own death animation and final Game Over.
 - Browser-test player name labels in solo, multiplayer, spawn shield blink, jumps, death animations, and spectator camera to confirm labels stay readable above each player.
 - Browser-test saved player name: click Save Name, hard reload, confirm the input is restored, then start solo/create/join and verify the name appears above the skier and in ranking payloads.
 - Browser-test multiplayer restart: after all players die and return to the lobby, the host Start button should reset from `Starting...` to `Start Game`, show a fresh 10-second countdown, and launch a new run with both clients.
@@ -74,7 +83,7 @@
 
 ## Known Constraints
 
-- Multiplayer remains client-side authoritative for movement and collisions.
+- Multiplayer Classic is server-authoritative for movement, collisions, HP, death, and ranking. Solo remains client-side.
 - Deterministic obstacle generation depends on the shared room seed.
 - Visual terrain displacement is cosmetic only.
 - The developer runs the dev server; automation should not run `npm run dev`.

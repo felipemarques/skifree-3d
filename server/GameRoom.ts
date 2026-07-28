@@ -1,5 +1,7 @@
 // @ts-nocheck
 // GameRoom manages a single multiplayer room
+const { DEFAULT_PLAYER_COLOR, PLAYER_COLOR_OPTIONS, sanitizePlayerColor } = require('../shared/AuthoritativeSim');
+
 const ROOM_ID_LENGTH = 6;
 const DEFAULT_ROOM_SETTINGS = {
   gameMode: 'classic',
@@ -9,7 +11,7 @@ const DEFAULT_ROOM_SETTINGS = {
 };
 const VALID_GAME_MODES = new Set(['classic', 'sky_mario']);
 const VALID_DIFFICULTIES = new Set(['easy', 'normal', 'hard', 'extreme']);
-const VALID_YETI_START_MODES = new Set(['distance', 'immediate']);
+const VALID_YETI_START_MODES = new Set(['distance', 'immediate', 'disabled']);
 
 function generateRoomId() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -33,6 +35,20 @@ function sanitizeRoomSettings(input = {}) {
   };
 }
 
+function getUsedPlayerColors(players, exceptSocketId = null) {
+  return new Set(Array.from(players.values())
+    .filter(player => player.id !== exceptSocketId)
+    .map(player => sanitizePlayerColor(player.color)));
+}
+
+function getAvailablePlayerColor(players, requestedColor, exceptSocketId = null) {
+  const requested = sanitizePlayerColor(requestedColor);
+  const used = getUsedPlayerColors(players, exceptSocketId);
+  if (!used.has(requested)) return requested;
+  const fallback = PLAYER_COLOR_OPTIONS.find(option => !used.has(option.value));
+  return fallback?.value || DEFAULT_PLAYER_COLOR;
+}
+
 class GameRoom {
   constructor(id, seed, ownerId, roomSettings = {}) {
     this.id = id;
@@ -46,12 +62,15 @@ class GameRoom {
     this.createdAt = Date.now();
   }
 
-  addPlayer(socketId, name) {
+  addPlayer(socketId, name, playerId = socketId, playerColor = DEFAULT_PLAYER_COLOR) {
     this.players.set(socketId, {
       id: socketId,
+      playerId: String(playerId || socketId).slice(0, 80),
       name: name || 'Skier',
+      color: getAvailablePlayerColor(this.players, playerColor),
       distance: 0,
       state: null,
+      authoritativeState: null,
       finished: false,
     });
   }
@@ -71,10 +90,33 @@ class GameRoom {
     }
   }
 
+  updateAuthoritativePlayerState(socketId, state) {
+    const p = this.players.get(socketId);
+    if (p) {
+      p.authoritativeState = state;
+      state.color = p.color;
+      p.distance = Math.max(0, Math.round(Number(state.distance) || 0));
+      p.finished = !!state.finished;
+    }
+  }
+
+  updatePlayerColor(socketId, color) {
+    if (this.started || this.countdownTimer) return false;
+    const player = this.players.get(socketId);
+    if (!player) return false;
+    const nextColor = sanitizePlayerColor(color);
+    const used = getUsedPlayerColors(this.players, socketId);
+    if (used.has(nextColor)) return false;
+    player.color = nextColor;
+    return true;
+  }
+
   getPlayerList() {
     return Array.from(this.players.values()).map(p => ({
       id: p.id,
+      playerId: p.playerId,
       name: p.name,
+      color: sanitizePlayerColor(p.color),
       distance: p.distance,
       finished: !!p.finished,
     }));
@@ -84,6 +126,7 @@ class GameRoom {
     for (const player of this.players.values()) {
       player.distance = 0;
       player.state = null;
+      player.authoritativeState = null;
       player.finished = false;
     }
   }

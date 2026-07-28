@@ -1,6 +1,7 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
+import { generateGameplayChunk } from '../../../shared/AuthoritativeSim';
 
 const CHUNK_SIZE = 80;
 const CHUNK_WIDTH = 120;
@@ -938,12 +939,17 @@ export class Obstacles {
   constructor(scene, options = {}) {
     this.scene = scene;
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
+    this.authoritativeSeed = options.authoritativeSeed ?? null;
     this.chunks = new Map();
     this.active = [];
   }
 
   generateChunk(chunkIndex, rng) {
     if (this.chunks.has(chunkIndex)) return;
+    if (this.authoritativeSeed !== null && this.authoritativeSeed !== undefined) {
+      this.generateAuthoritativeChunk(chunkIndex, rng);
+      return;
+    }
 
     const zBase = chunkIndex * CHUNK_SIZE;
     const group = new THREE.Group();
@@ -1086,6 +1092,78 @@ export class Obstacles {
       spawnPlaced(() => makeDog(rng), [-40, 40], [10, CHUNK_SIZE - 10], {
         attempts: 10,
         padding: 0.55,
+      });
+    }
+
+    this.scene.add(group);
+    this.chunks.set(chunkIndex, { group, obstacles: chunkObstacles });
+    this.active.push(...chunkObstacles);
+  }
+
+  generateAuthoritativeChunk(chunkIndex, rng) {
+    if (this.chunks.has(chunkIndex)) return;
+
+    const group = new THREE.Group();
+    const chunkObstacles = [];
+    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set());
+
+    const makeMesh = (type) => {
+      if (type === 'tree') return makeTree(rng);
+      if (type === 'fallen_tree') return makeFallenTree(rng);
+      if (type === 'rock') return makeRock(rng);
+      if (type === 'stump') return makeStump(rng);
+      if (type === 'ramp') return makeRamp(rng);
+      if (type === 'hole') return makeHole(rng);
+      if (type === 'heart') return makeHeartPickup(rng);
+      return makeRock(rng);
+    };
+
+    for (const record of records) {
+      const mesh = makeMesh(record.type);
+      mesh.position.set(record.x, 0, record.z);
+      group.add(mesh);
+      chunkObstacles.push({
+        x: record.x,
+        z: record.z,
+        id: record.id,
+        halfW: record.halfW,
+        halfD: record.halfD,
+        type: record.type,
+        mesh,
+        dead: false,
+        speed: 0,
+        baseSpeed: 0,
+        minSpeed: 0,
+        maxSpeed: 0,
+        speedFreq: 0,
+        lateralSpeed: 0,
+        baseLateralSpeed: 0,
+        lateralDir: 1,
+        forwardSpeed: 0,
+        forwardDir: 1,
+        forwardFreq: 0,
+        moveX: 0,
+        moveZ: 0,
+        weaveAmp: 0,
+        weaveFreq: 0,
+        turnEase: 2,
+        driftBias: 0,
+        zigzagInterval: 0,
+        zigzagDuration: 0,
+        zigzagAmp: 0,
+        jumpTimer: 0,
+        jumpDuration: 0,
+        jumpHeight: 0,
+        jumpCooldown: 0,
+        knockdownTimer: 0,
+        patrolCenterX: record.x,
+        patrolRange: 0,
+        patrolCenterZ: record.z,
+        patrolDepth: 0,
+        phase: rng.range(0, Math.PI * 2),
+        animTime: rng.range(0, Math.PI * 2),
+        visualYOffset: mesh.userData.visualYOffset || 0,
+        chunkIndex,
       });
     }
 

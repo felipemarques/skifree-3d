@@ -30,6 +30,17 @@
 - The client uses Shadcn-style local primitives plus Tailwind utilities instead of importing a heavy UI runtime layer. Radix is only used where needed for Shadcn-compatible primitives.
 - Keep the arcade glass visual identity rather than adopting a generic dashboard look.
 
+## Authoritative Multiplayer
+
+- Classic multiplayer is authoritative on the server: clients send inputs, not trusted positions or distances.
+- The first authoritative pass covers movement, jump/ramp physics, HP, hearts, gameplay-critical static obstacles, player-player collision, Yeti pressure, death, snapshots, and official multiplayer ranking.
+- Client prediction is allowed for responsiveness, but snapshots from the server are the source of truth.
+- Client reconciliation must discard stale `game:snapshot` payloads and replay unacknowledged local inputs after accepted snapshots; direct hard-applying every snapshot causes visible rubber-banding.
+- Player input is reliable in authoritative rooms; snapshots may stay volatile. Small local correction deltas should be visually smoothed, while start/death/large divergence may snap.
+- Server `player:gameover` is also an official death signal in authoritative rooms; it is used as a reliable fallback for local finalization because snapshots are volatile.
+- Sky Mario multiplayer is blocked until projectile and combat simulation move server-side.
+- Multiplayer ranking entries must come from the authoritative runtime; REST ranking writes for multiplayer modes are rejected.
+
 ## Gameplay Boundaries
 
 - Do not change room protocol or multiplayer event shapes during this pass.
@@ -61,7 +72,7 @@
 - Ranking is local-only for now: top runs persist in browser localStorage with name, distance, mode, difficulty, and date.
 - Obstacle spawn overlap prevention uses deterministic retry attempts with AABB padding, favoring plausible placement over guaranteed exact counts in crowded chunks.
 - Heart pickups prioritize spacing over count: if no valid point is found after deterministic retries, that heart spawn is skipped.
-- Immediate Yeti mode is a local game setting. It starts the chase at run start but keeps the selected difficulty's speed, multiply interval, and max Yeti count.
+- Yeti start mode is a gameplay setting. `immediate` starts the chase at run start while keeping the selected difficulty tuning; `disabled` removes Yeti pressure entirely for that run.
 - NPC jumping is visual/lightweight inside `Obstacles`: low hazards trigger a short airborne state, while high obstacles still use avoidance.
 - Animal-vs-NPC skier collisions are local visual simulation only. They do not affect player HP, scoring, sockets, or deterministic terrain generation.
 - Animal gait polish stays part-based and procedural; no rigged assets or animation dependencies are introduced.
@@ -84,10 +95,22 @@
 - Ranking stores mode labels separately from difficulty so Classic, Multiplayer, Sky Mario, and Multiplayer Sky Mario runs can coexist in the same player history.
 - Multiplayer countdown is server-side. The host triggers it, room settings lock immediately, `room:countdown` is broadcast to the lobby, and `game:start` remains the only transition into gameplay.
 - Controls help should stay visible during gameplay because the game now has more commands than the original arcade loop. Temporary landing/heal feedback may reuse the panel briefly but must restore the command list instead of hiding it.
-- Multiplayer spawn invincibility is local and presentation-visible through the HUD. It reuses the existing Player invincibility gate for HP loss and combat damage instead of adding server-authoritative health.
+- Multiplayer spawn invincibility is now part of the authoritative Classic server simulation and is mirrored in the HUD from snapshots.
+- Multiplayer spawn positions are server-owned deterministic lanes derived from the room seed. They are shuffled to avoid every run looking identical, but keep minimum lateral spacing so clients cannot start overlapped.
+- Multiplayer outfit colors are server-owned room player state. Clients can request a color before the run starts, but the server rejects duplicates and snapshots carry the official color.
 - Browser shortcut blocking is explicit and narrow: capture-phase `Ctrl/Cmd` combos for `S`, `O`, `A`, `B`, `F`, `P`, `W`, and `Q` are prevented, while ordinary gameplay keys remain available.
 - Multiplayer death is not an immediate local screen transition. The local client sends its final distance, marks itself dead, and keeps rendering remote players as a spectator until all known room players are dead.
+- Authoritative multiplayer uses fixed 30 Hz prediction and ordered server input queues. `lastProcessedInputSeq` means "simulated", not merely "received".
+- Remote multiplayer rendering uses the newest 30 Hz authoritative state plus bounded 140 ms extrapolation. The visual model favors nearby racers staying aligned over deliberately buffering them in the past.
+- Authoritative snapshots remain volatile. State packets are disposable; tick ordering, history interpolation, and bounded extrapolation are responsible for smooth rendering instead of allowing an old snapshot backlog.
+- Server fixed ticks are paced from elapsed wall-clock time with bounded catch-up, not assumed to equal one raw `setInterval` callback. This keeps server/client simulation clocks aligned over long runs.
+- Local reconciliation uses a decaying render-only correction for deltas up to 8 m, then snaps for large divergence, death, and run initialization.
+- `Both` controls resolve all held gameplay keys before mouse input. Boost/brake input disables mouse steering for that tick so keyboard races do not inherit arbitrary cursor direction.
+- Obstacle volume `0` is a strict empty-track mode: it disables trees, ramps, holes, and hearts for deterministic multiplayer movement tests.
+- In authoritative multiplayer, local death is decided by the server; the client may predict movement locally, but final death animation/game-over must be triggered from an official snapshot or server death event.
 - Spectator target selection is client-side and based on highest distance among living remote players; it does not add a new socket payload or server authority.
+- Spectator target selection can remain client-side for now, but camera smoothing resets on target change so multiple dead clients converge to the same follow angle faster.
+- Only gameplay-critical Classic objects are guaranteed cross-client deterministic today; decorative-only environment can diverge until shared decoration generation is added.
 - Player name labels are mesh-attached Three.js sprites rather than DOM overlays, so they follow local/remote skier transforms, jumps, camera movement, and spectator mode without extra layout work.
 - Player display name is browser-local and independent from ranking `playerId`. Saving the name updates only localStorage/default form state and future run payloads.
 - Multiplayer room lifecycle is multi-run. `player:gameover` marks server-side per-player finished state; all-finished rooms return to lobby by clearing `started`, preserving room/settings/host, and resetting per-player run state only when the next countdown starts.

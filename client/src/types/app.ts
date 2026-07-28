@@ -2,7 +2,7 @@ export type ScreenState = 'title' | 'settings' | 'lobby' | 'ranking' | 'game' | 
 
 export type GameMode = 'classic' | 'sky_mario';
 export type Difficulty = 'easy' | 'normal' | 'hard' | 'extreme';
-export type YetiStartMode = 'distance' | 'immediate';
+export type YetiStartMode = 'distance' | 'immediate' | 'disabled';
 export type GraphicsQuality = 'low' | 'high';
 
 export interface RoomSettings {
@@ -25,6 +25,7 @@ export interface GameSettings extends RoomSettings {
 export interface PlayerStatus {
   id?: string;
   name?: string;
+  color?: string;
   distance?: number;
   hp?: number;
   alive?: boolean;
@@ -134,4 +135,5 @@ export interface ControllerSnapshot {
   roomStartDisabled: boolean;
   muted: boolean;
   muteVisible: boolean;
+  playerColor: string;
 }

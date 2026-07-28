@@ -64,7 +64,7 @@ Last updated: 2026-07-23
 - Added a local Ranking screen that stores top runs in localStorage and can be opened from the menu or game-over screen.
 - Chunk obstacle placement now retries positions and rejects overlapping AABBs, preventing trees and ramps from spawning on top of each other.
 - Heart spawning now enforces a 70m minimum distance from other active/generated hearts.
-- Added `yetiStartMode` setting with `distance` default and `immediate` mode to start the Yeti chase as soon as a run begins.
+- Added `yetiStartMode` setting with `distance` default, `immediate` mode to start the chase as soon as a run begins, and `disabled` mode to remove Yeti pressure for that run.
 - NPC skiers now detect low obstacles ahead and perform short visual jumps over them while continuing to avoid standing trees and ramps.
 - Dogs and polar bears can now knock down NPC skiers on collision; knocked NPCs slide briefly before recovering.
 - Dog and polar bear gait animation was strengthened with clearer leg lift/reach, body weight shift, head motion, and tail/body movement.
@@ -88,9 +88,27 @@ Last updated: 2026-07-23
 - Multiplayer room start now uses a server-side 10-to-0 countdown. The lobby shows `room:countdown`, locks host-editable room settings during the countdown, and starts the run only after the server emits `game:start`.
 - In-game controls help is now a persistent bottom HUD panel instead of a short temporary hint. It lists movement, boost, jump, mouse, pause, and Sky Mario throw controls when relevant.
 - Multiplayer runs now grant the local skier 5 seconds of spawn invincibility after the game starts. The same Player invincibility path blocks HP loss, skier collisions, and Sky Mario projectile damage, while the HUD shows `Shield Ns`.
+- Multiplayer Classic now assigns each player an authoritative deterministic horizontal spawn lane at run start, shuffled by room seed, so players begin side by side without immediate collisions.
 - The page now blocks `Ctrl/Cmd+S`, `O`, `A`, `B`, `F`, `P`, `W`, and `Q` in capture phase so browser shortcuts do not interrupt gameplay.
 - Multiplayer HUD now shows each room player as `Playing` or `Dead` with current distance.
 - When the local multiplayer skier dies, the client stays in the run as spectator, following the highest-distance living remote skier until every player is dead, then opens the final Game Over screen.
 - Local and remote skier meshes now render persistent camera-facing name labels above the head using canvas-backed Three.js sprites. Player blink effects keep the label visible.
 - Title screen now has a `Save Name` button next to the player name field. The name is stored in localStorage under `skifree3d_player_name`, loaded on page start, and also saved when starting solo or creating/joining multiplayer.
 - Multiplayer rooms now reset after all current players emit `player:gameover`: the server marks the run finished, sets `started` back to false, broadcasts `room:state`, and allows the host to start a new countdown. New room runs reset player run state and use a fresh seed.
+- Multiplayer Classic now has a server-authoritative v1 runtime. Clients send `player:input`; the server simulates fixed ticks, owns distance/HP/death, emits `game:snapshot`, and writes multiplayer rankings from official distances only.
+- Added shared pure simulation in `shared/AuthoritativeSim.ts` for movement, jump/ramp physics, deterministic gameplay obstacle records, heart pickup consumption, AABB collision, player-player collision, Yeti pressure, and snapshot types.
+- Client multiplayer Classic now predicts locally with the shared sim and reconciles from official snapshots. Gameplay-critical visual obstacles in multiplayer Classic are generated from the same shared records used by the server.
+- Client reconciliation now runs in fixed 30 Hz ticks matching the server. Each accepted snapshot restores official state and replays only inputs after the server-confirmed sequence.
+- Multiplayer lobby now lets each player choose a unique outfit color. The server prevents duplicates and includes the selected color in room state/snapshots so local and remote skier colors stay consistent across clients.
+- Multiplayer lobby layout is wider on desktop and splits players/color selection from room settings horizontally to reduce vertical crowding.
+- The authoritative runtime now queues ordered inputs per player and only acknowledges an input after consuming it in a simulation tick; stale input becomes neutral after 500 ms.
+- Local multiplayer rendering applies a decaying correction only after a meaningful simulation divergence. Remote skiers render from the newest 30 Hz authoritative snapshot with bounded 140 ms extrapolation, avoiding permanent visual separation while keeping volatile snapshots performant.
+- The server runtime uses a real-time fixed-step accumulator with bounded catch-up, preventing Node timer drift from making authoritative world time progressively slower than client prediction.
+- `?netDebug=1` enables a compact in-game diagnostic with server tick, input acknowledgement, pending input count, snapshot age, and reconciliation error.
+- Fixed `Both` controls so boost/brake keys suppress mouse steering as intended. This prevents equal-speed keyboard players with different mouse X positions from diverging down the course.
+- Obstacle volume `0` now produces an entirely empty gameplay track, including no ramps or heart pickups.
+- Authoritative multiplayer death handling now uses the server `player:gameover` event as a reliable fallback for the local player, including death animation and final Game Over when the last volatile snapshot is missed.
+- Spectator terrain anchoring now follows the watched skier instead of the dead local skier, and remote skier rendering clamps to the visual snow surface.
+- Spectator camera smoothing now resets when the best-alive watched player changes, reducing per-client camera angle differences after death.
+- REST ranking writes reject `multiplayer` and `multiplayer_sky_mario` modes; multiplayer rankings are saved by the authoritative room runtime.
+- Sky Mario authoritative multiplayer is intentionally deferred; the server rejects starting Sky Mario rooms with a clear lobby error for now.

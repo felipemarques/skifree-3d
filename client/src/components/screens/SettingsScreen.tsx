@@ -89,6 +89,7 @@ export function SettingsScreen({ controller }: SettingsScreenProps) {
           <Select value={form.yetiStartMode} onChange={event => update('yetiStartMode', event.target.value as GameSettings['yetiStartMode'])}>
             <option value="distance">Distance Trigger</option>
             <option value="immediate">Hunt From Start</option>
+            <option value="disabled">No Yeti</option>
           </Select>
         ))}
       </div>

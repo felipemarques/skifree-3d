@@ -10,7 +10,7 @@
 // obstacleVolume: 0 - 2
 // gameMode: 'classic' | 'sky_mario'
 // difficulty: 'easy' | 'normal' | 'hard' | 'extreme'
-// yetiStartMode: 'distance' | 'immediate'
+// yetiStartMode: 'distance' | 'immediate' | 'disabled'
 // showFPS: bool
 
 const KEY = 'skifree3d_settings';

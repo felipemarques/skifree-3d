@@ -4,6 +4,7 @@ import { MenuBackdrop } from '@/game/MenuBackdrop';
 import { SocketClient } from '@/net/SocketClient';
 import { rankingStore } from '@/utils/RankingStore';
 import { settings } from '@/utils/Settings';
+import { DEFAULT_PLAYER_COLOR, sanitizePlayerColor } from '../../../shared/AuthoritativeSim';
 import type {
   ControllerSnapshot,
   GameMode,
@@ -16,6 +17,7 @@ import type {
 import type { UiStore } from './uiStore';
 
 const PLAYER_NAME_KEY = 'skifree3d_player_name';
+const PLAYER_COLOR_KEY = 'skifree3d_player_color';
 const blockedBrowserShortcutKeys = new Set(['s', 'o', 'a', 'b', 'f', 'p', 'w', 'q']);
 
 type SnapshotListener = () => void;
@@ -32,6 +34,14 @@ function loadSavedPlayerName() {
   }
 }
 
+function loadSavedPlayerColor() {
+  try {
+    return sanitizePlayerColor(localStorage.getItem(PLAYER_COLOR_KEY) || DEFAULT_PLAYER_COLOR);
+  } catch (e) {
+    return DEFAULT_PLAYER_COLOR;
+  }
+}
+
 function randomSeed() {
   return Math.floor(Math.random() * 999999) + 1;
 }
@@ -44,12 +54,16 @@ function getRankingMode(result: any) {
 }
 
 function normalizeRoomSettings(nextSettings: Partial<RoomSettings> = {}): RoomSettings {
+  const yetiStartMode = ['distance', 'immediate', 'disabled'].includes(String(nextSettings.yetiStartMode))
+    ? nextSettings.yetiStartMode as RoomSettings['yetiStartMode']
+    : 'distance';
+
   return {
     gameMode: nextSettings.gameMode === 'sky_mario' ? 'sky_mario' : 'classic',
     difficulty: ['easy', 'hard', 'extreme'].includes(String(nextSettings.difficulty))
       ? nextSettings.difficulty as RoomSettings['difficulty']
       : 'normal',
-    yetiStartMode: nextSettings.yetiStartMode === 'immediate' ? 'immediate' : 'distance',
+    yetiStartMode,
     obstacleVolume: Number(nextSettings.obstacleVolume ?? 1),
   };
 }
@@ -60,6 +74,7 @@ export class GameController {
   private socket = new SocketClient();
   private currentGame: any = null;
   private playerName = loadSavedPlayerName();
+  private playerColor = loadSavedPlayerColor();
   private isMultiplayer = false;
   private roomId: string | null = null;
   private roomSeed: number | null = null;
@@ -121,7 +136,16 @@ export class GameController {
       roomStartDisabled: !host || countingDown,
       muted: !!this.currentGame?.audio?.muted,
       muteVisible: !!this.currentGame,
+      playerColor: this.playerColor,
     };
+  }
+
+  getSocketId() {
+    return this.socket.id;
+  }
+
+  getPlayerColor() {
+    return this.playerColor;
   }
 
   getSettingsValues(): GameSettings {
@@ -175,7 +199,7 @@ export class GameController {
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
     this.roomSettings = this.getLocalRoomSettings(gameMode);
-    this.socket.createRoom(this.playerName, this.roomSettings);
+    this.socket.createRoom(this.playerName, this.roomSettings, (rankingStore as any).playerId, this.playerColor);
     this.emit();
   }
 
@@ -187,7 +211,18 @@ export class GameController {
     }
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
-    this.socket.joinRoom(roomCode, this.playerName);
+    this.socket.joinRoom(roomCode, this.playerName, (rankingStore as any).playerId, this.playerColor);
+    this.emit();
+  }
+
+  updatePlayerColor(color: string) {
+    this.playerColor = sanitizePlayerColor(color);
+    try {
+      localStorage.setItem(PLAYER_COLOR_KEY, this.playerColor);
+    } catch (e) {
+      // Ignore localStorage write failures.
+    }
+    this.socket.updatePlayerColor(this.playerColor);
     this.emit();
   }
 
@@ -206,7 +241,7 @@ export class GameController {
   playAgain() {
     this.destroyCurrentGame();
     if (this.isMultiplayer && this.roomId) {
-      this.socket.joinRoom(this.roomId, this.playerName);
+      this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor);
     } else {
       this.startGame({ seed: randomSeed(), multiplayer: false, gameMode: settings.get('gameMode') });
     }
@@ -322,8 +357,11 @@ export class GameController {
       ...options,
       roomSettings: options.multiplayer ? this.roomSettings : null,
       playerName: this.playerName,
+      playerId: (rankingStore as any).playerId,
+      playerColor: this.playerColor,
       roomId: this.roomId,
       onRunComplete: (result: any) => {
+        if (result.multiplayer) return;
         rankingStore.addRemote({
           playerId: (rankingStore as any).playerId,
           name: result.playerName,
@@ -426,6 +464,17 @@ export class GameController {
     this.emit();
   }
 
+  private syncLocalPlayerColor(players: PlayerStatus[] = []) {
+    const local = players.find(player => player.id && player.id === this.socket.id);
+    if (!local?.color) return;
+    this.playerColor = sanitizePlayerColor(local.color);
+    try {
+      localStorage.setItem(PLAYER_COLOR_KEY, this.playerColor);
+    } catch (e) {
+      // Ignore localStorage write failures.
+    }
+  }
+
   private setRoomCountdown(remaining: number | null = null) {
     const parsed = remaining === null || remaining === undefined
       ? null
@@ -445,6 +494,7 @@ export class GameController {
       this.roomSeed = seed;
       this.roomPlayers = players;
       this.roomOwnerId = ownerId;
+      this.syncLocalPlayerColor(players);
       this.applyRoomSettings(serverSettings);
       this.store.set(current => ({
         ...current,
@@ -459,6 +509,7 @@ export class GameController {
       this.roomSeed = seed;
       this.roomPlayers = players;
       this.roomOwnerId = ownerId;
+      this.syncLocalPlayerColor(players);
       this.applyRoomSettings(serverSettings);
       this.store.set(current => ({
         ...current,
@@ -470,6 +521,7 @@ export class GameController {
 
     this.socket.on('room:state', ({ players, ownerId, settings: serverSettings, countdown }: any) => {
       this.roomPlayers = players;
+      this.syncLocalPlayerColor(players);
       if (ownerId) this.roomOwnerId = ownerId;
       if (serverSettings) this.applyRoomSettings(serverSettings);
       if (countdown !== undefined) this.setRoomCountdown(countdown);
@@ -512,7 +564,7 @@ export class GameController {
 
     this.socket.on('connect', () => {
       if (this.roomId && this.isMultiplayer) {
-        this.socket.joinRoom(this.roomId, this.playerName);
+        this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor);
       }
       this.emit();
     });

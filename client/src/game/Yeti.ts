@@ -185,7 +185,9 @@ export class YetiManager {
     this.active = false;
     this._timeSinceMultiply = 0;
     this._onCapture = null;
-    this.startMode = options.startMode === 'immediate' ? 'immediate' : 'distance';
+    this.startMode = ['distance', 'immediate', 'disabled'].includes(options.startMode)
+      ? options.startMode
+      : 'distance';
     this.setDifficulty(options.difficulty || 'normal');
   }
 
@@ -199,6 +201,11 @@ export class YetiManager {
   }
 
   update(dt, playerPos, playerDistance, groundYAt = null, blockers = null) {
+    if (this.startMode === 'disabled') {
+      if (this.active || this.yetis.length) this.dispose();
+      return;
+    }
+
     // Trigger if player has skied far enough
     const shouldStartImmediately = this.startMode === 'immediate' && playerDistance >= 0;
     if (!this.active && (shouldStartImmediately || playerDistance >= this.config.triggerDistance)) {

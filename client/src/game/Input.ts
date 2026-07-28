@@ -62,6 +62,21 @@ export class Input {
     return !!this.keys[code];
   }
 
+  _getKeyboardState() {
+    const keyLeft = this.isDown('ArrowLeft') || this.isDown('KeyA') || this.isDown('a');
+    const keyRight = this.isDown('ArrowRight') || this.isDown('KeyD') || this.isDown('d');
+    const keyBrake = this.isDown('ArrowUp') || this.isDown('KeyW') || this.isDown('w');
+    const keyBoost = this._isBoostKeyDown();
+    return {
+      keyLeft,
+      keyRight,
+      keyBrake,
+      keyBoost,
+      keyAxis: (keyLeft ? -1 : 0) + (keyRight ? 1 : 0),
+      anyHeld: keyLeft || keyRight || keyBrake || keyBoost || this.jump,
+    };
+  }
+
   // ---- aggregated inputs used by Player.js ----
 
   /**
@@ -73,16 +88,11 @@ export class Input {
     const sensitivity = settings.get('mouseSensitivity');
     const deadzone = settings.get('mouseDeadzone');
 
-    const keyLeft  = this.isDown('ArrowLeft')  || this.isDown('KeyA') || this.isDown('a');
-    const keyRight = this.isDown('ArrowRight') || this.isDown('KeyD') || this.isDown('d');
-    const keyBrake = this.isDown('ArrowUp') || this.isDown('KeyW') || this.isDown('w');
-    const keyBoost = this._isBoostKeyDown();
-    const keyAxis  = (keyLeft ? -1 : 0) + (keyRight ? 1 : 0);
-    this._anyKeyHeld = keyLeft || keyRight ||
-      keyBrake || keyBoost || this.jump;
+    const keyboard = this._getKeyboardState();
+    this._anyKeyHeld = keyboard.anyHeld;
 
     if (mode === 'keyboard') {
-      return keyAxis;
+      return keyboard.keyAxis;
     }
 
     // Mouse lateral: use mouse.x if outside deadzone
@@ -97,8 +107,9 @@ export class Input {
       return Math.max(-1, Math.min(1, mouseAxis));
     }
 
-    // 'both': if any key is held, keyboard wins; otherwise mouse
-    if (keyAxis !== 0) return keyAxis;
+    // 'both': any gameplay key takes ownership. In particular, holding boost
+    // must not leave a stale mouse X position steering the skier sideways.
+    if (keyboard.anyHeld) return keyboard.keyAxis;
     return Math.max(-1, Math.min(1, mouseAxis));
   }
 
@@ -110,11 +121,12 @@ export class Input {
     const mode = settings.get('controlMode');
     const deadzone = settings.get('mouseDeadzone');
     const invertY = settings.get('invertMouseY');
+    const keyboard = this._getKeyboardState();
 
     if (mode === 'keyboard') return null;
 
     // In 'both' mode, mouse speed only applies when no keys held
-    if (mode === 'both' && this._anyKeyHeld) return null;
+    if (mode === 'both' && keyboard.anyHeld) return null;
 
     let my = this.mouse.y; // +1 = top, -1 = bottom
     if (invertY) my = -my;

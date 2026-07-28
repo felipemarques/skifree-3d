@@ -34,6 +34,7 @@ export class SocketClient {
       'player:left',
       'player:gameover',
       'combat:throw',
+      'game:snapshot',
       'game:start',
     ].forEach(ev => {
       this.socket.on(ev, data => this._emit(ev, data));
@@ -54,14 +55,14 @@ export class SocketClient {
     (this._handlers[event] || []).forEach(h => h(data));
   }
 
-  createRoom(playerName, roomSettings = {}) {
+  createRoom(playerName, roomSettings = {}, playerId = '', playerColor = '') {
     this.connect();
-    this.socket?.emit('room:create', { playerName, settings: roomSettings });
+    this.socket?.emit('room:create', { playerName, playerId, playerColor, settings: roomSettings });
   }
 
-  joinRoom(roomId, playerName) {
+  joinRoom(roomId, playerName, playerId = '', playerColor = '') {
     this.connect();
-    this.socket?.emit('room:join', { roomId: roomId.toUpperCase(), playerName });
+    this.socket?.emit('room:join', { roomId: roomId.toUpperCase(), playerName, playerId, playerColor });
   }
 
   leaveRoom() {
@@ -72,12 +73,20 @@ export class SocketClient {
     this.socket?.emit('room:updateSettings', roomSettings);
   }
 
+  updatePlayerColor(color) {
+    this.socket?.emit('player:color', { color });
+  }
+
   startGame() {
     this.socket?.emit('game:start');
   }
 
   sendPlayerUpdate(state) {
     this.socket?.volatile.emit('player:update', state);
+  }
+
+  sendPlayerInput(input) {
+    this.socket?.emit('player:input', input);
   }
 
   sendGameOver(distance) {

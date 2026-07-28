@@ -18,9 +18,17 @@ import { PostFX } from './PostFX';
 import { CourseDecor } from './CourseDecor';
 import { settings } from '../utils/Settings';
 import { getVisualTerrainY } from './VisualTerrain';
+import {
+  GRAVITY,
+  SIM_DT,
+  DEFAULT_PLAYER_COLOR,
+  createInitialPlayerState,
+  getGameplayObstaclesNear,
+  sanitizePlayerColor,
+  simulatePlayerTick,
+} from '../../../shared/AuthoritativeSim';
 
 const CHUNK_SIZE = 80;
-const NET_UPDATE_HZ = 20; // send position 20 times per second
 const MAX_HP = 3;
 const GAME_OVER_SCREEN_DELAY_MS = 1850;
 const YETI_GAME_OVER_SCREEN_DELAY_MS = 2250;
@@ -47,6 +55,10 @@ function getFogDistances(useHighGraphics, fogLevel) {
     near: Math.max(30, near),
     far: Math.max(near + 80, far),
   };
+}
+
+function colorToNumber(color) {
+  return parseInt(sanitizePlayerColor(color).slice(1), 16);
 }
 
 export class Game {
@@ -93,9 +105,30 @@ export class Game {
     this.yetiStartMode = this.options.multiplayer
       ? (this.roomSettings.yetiStartMode || settings.get('yetiStartMode'))
       : settings.get('yetiStartMode');
+    this.playerColor = sanitizePlayerColor(this.options.playerColor || DEFAULT_PLAYER_COLOR);
     this._useHighGraphics = this.graphicsQuality === 'high';
+    this._authoritativeMultiplayer = !!this.options.multiplayer;
+    this._authInputSeq = 0;
+    this._authPredictionAccumulator = 0;
+    this._authState = null;
+    this._authPreviousState = null;
+    this._authHasReceivedSnapshot = false;
+    this._authLastServerTick = -1;
+    this._authPendingInputs = [];
+    this._authVisualCorrection = new THREE.Vector3();
+    this._authVisualAngleCorrection = 0;
+    this._authLastReconciliationError = 0;
+    this._authLastSnapshotAt = 0;
+    this._netDebugEnabled = new URLSearchParams(window.location.search).get('netDebug') === '1';
+    this._netDebugElement = null;
+    this._spectatorTargetId = null;
+    this._authLocalSnapshotAlive = true;
+    this._authLocalDeathHandled = false;
+    this._authConsumedPickupIds = new Set();
+    this._authLastYetiWarning = 0;
     
     this._setup();
+    this._createNetDebugOverlay();
   }
   
   _setup() {
@@ -142,9 +175,12 @@ export class Game {
     this.terrain = this._useHighGraphics
       ? new SnowTerrain(this.scene, seed)
       : new Terrain(this.scene);
-    this.obstacles = new Obstacles(this.scene, { volume: this.obstacleVolume });
+    this.obstacles = new Obstacles(this.scene, {
+      volume: this.obstacleVolume,
+      authoritativeSeed: this._authoritativeMultiplayer ? seed : null,
+    });
     this.courseDecor = new CourseDecor(this.scene, seed, this.graphicsQuality);
-    this.player = new Player(this.scene, 0x2979ff, this.options.playerName || 'Skier');
+    this.player = new Player(this.scene, colorToNumber(this.playerColor), this.options.playerName || 'Skier');
     if (this.options.multiplayer) {
       this.player.grantInvincibility(MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS);
     }
@@ -193,6 +229,7 @@ export class Game {
     this._scores.set('local', { 
       id: 'local',
       name: this.options.playerName || 'You', 
+      color: this.playerColor,
       distance: 0,
       hp: MAX_HP,
       alive: true,
@@ -206,6 +243,7 @@ export class Game {
         this._scores.set(player.id, {
           id: player.id,
           name: player.name || 'Player',
+          color: sanitizePlayerColor(player.color),
           distance: 0,
           alive: true,
         });
@@ -218,12 +256,59 @@ export class Game {
       this._boundPlayerLeft = data => this._onPlayerLeft(data);
       this._boundRemoteGameOver = data => this._onRemoteGameOver(data);
       this._boundCombatThrow = data => this._onCombatThrow(data);
+      this._boundGameSnapshot = data => this._onGameSnapshot(data);
 
       this.socket.on('player:update', this._boundRemoteUpdate);
       this.socket.on('player:left', this._boundPlayerLeft);
       this.socket.on('player:gameover', this._boundRemoteGameOver);
       this.socket.on('combat:throw', this._boundCombatThrow);
+      this.socket.on('game:snapshot', this._boundGameSnapshot);
     }
+
+    if (this._authoritativeMultiplayer) {
+      this._authState = createInitialPlayerState(
+        this.socket?.id || 'local',
+        this.options.playerName || 'Skier',
+        this.options.playerId || this.socket?.id || 'local',
+        { color: this.playerColor },
+      );
+      this._authPreviousState = { ...this._authState };
+    }
+  }
+
+  _createNetDebugOverlay() {
+    if (!this._netDebugEnabled || !this.renderer?.domElement?.parentElement) return;
+    const overlay = document.createElement('pre');
+    overlay.style.cssText = [
+      'position:absolute',
+      'right:12px',
+      'bottom:12px',
+      'z-index:20',
+      'margin:0',
+      'padding:7px 9px',
+      'border:1px solid rgba(105,228,255,.55)',
+      'border-radius:4px',
+      'background:rgba(4,15,31,.72)',
+      'color:#9eeeff',
+      'font:11px/1.35 ui-monospace,monospace',
+      'pointer-events:none',
+    ].join(';');
+    overlay.textContent = 'net: waiting for snapshot';
+    this.renderer.domElement.parentElement.appendChild(overlay);
+    this._netDebugElement = overlay;
+  }
+
+  _updateNetDebug() {
+    if (!this._netDebugElement || !this._authoritativeMultiplayer) return;
+    const acknowledged = Number(this._authState?.lastProcessedInputSeq) || 0;
+    const age = this._authLastSnapshotAt ? Math.round(performance.now() - this._authLastSnapshotAt) : '-';
+    this._netDebugElement.textContent = [
+      `tick: ${this._authLastServerTick}`,
+      `ack/input: ${acknowledged}/${this._authInputSeq}`,
+      `pending: ${this._authPendingInputs.length}`,
+      `snapshot age: ${age}ms`,
+      `reconcile: ${this._authLastReconciliationError.toFixed(2)}m`,
+    ].join('\n');
   }
   
   start() {
@@ -272,6 +357,11 @@ export class Game {
   }
   
   _update(dt) {
+    if (this._authoritativeMultiplayer) {
+      this._updateAuthoritativeMultiplayer(dt);
+      return;
+    }
+
     if (!this.player.isAlive) {
       const spectator = this.options.multiplayer ? this._getBestAliveRemotePlayer() : null;
       const focusPos = spectator?.rp?.mesh?.position || this.player.position;
@@ -398,6 +488,365 @@ export class Game {
     }
   }
 
+  _buildAuthoritativeInput() {
+    const mouseSpeedFraction = this.input.mouseSpeedFraction;
+    return {
+      seq: this._authInputSeq,
+      clientTime: performance.now(),
+      lateralAxis: this.input.lateralAxis,
+      boost: this.input.boost || (mouseSpeedFraction !== null && mouseSpeedFraction > 0.58),
+      brake: this.input.brake || (mouseSpeedFraction !== null && mouseSpeedFraction < 0.42),
+      jumpPressed: this.input.jump,
+      firePressed: this.input.fire,
+    };
+  }
+
+  _updateAuthoritativeMultiplayer(dt) {
+    if (!this._authState) return;
+
+    const focusState = this._authState;
+    const spectator = focusState.alive ? null : this._getBestAliveRemotePlayer();
+    const spectatorId = spectator?.id || null;
+    if (!focusState.alive && spectatorId !== this._spectatorTargetId) {
+      this._spectatorTargetId = spectatorId;
+      this.camera.reset();
+    } else if (focusState.alive) {
+      this._spectatorTargetId = null;
+    }
+    const focusMesh = focusState.alive ? this.player.mesh : (spectator?.rp?.mesh || this.player.mesh);
+    const focusSpeed = focusState.alive ? focusState.speed : (spectator?.rp?.currentSpeed || Math.max(this.player.speed, 4));
+    const focusX = focusState.alive ? focusState.x : focusMesh.position.x;
+    const focusZ = focusState.alive ? focusState.z : focusMesh.position.z;
+    const currentChunk = Math.floor(focusZ / CHUNK_SIZE);
+    for (let i = currentChunk; i <= currentChunk + 5; i++) {
+      if (!this.obstacles.chunks.has(i)) {
+        this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
+      }
+    }
+
+    this._elapsedSeconds = (performance.now() - this._startTime) / 1000;
+    const visualGroundY = this._useHighGraphics
+      ? (x, z) => getVisualTerrainY(x, z, focusX, focusZ)
+      : null;
+
+    if (focusState.alive) {
+      this._authPredictionAccumulator = Math.min(this._authPredictionAccumulator + dt, SIM_DT * 4);
+      while (this._authPredictionAccumulator >= SIM_DT) {
+        this._authPreviousState = { ...this._authState };
+        this._authInputSeq += 1;
+        const input = this._buildAuthoritativeInput();
+        input.seq = this._authInputSeq;
+        this.socket?.sendPlayerInput(input);
+        this._authPendingInputs.push({ ...input });
+        if (this._authPendingInputs.length > 120) {
+          this._authPendingInputs.splice(0, this._authPendingInputs.length - 120);
+        }
+        this._simulatePredictedAuthoritativeTick(this._authState, input, this._authConsumedPickupIds);
+        this._authPredictionAccumulator -= SIM_DT;
+      }
+      this._applyAuthoritativeStateToLocalPlayer(this._getPredictedRenderState(), { dt });
+    } else {
+      this.player.updateDeathAnimation(dt, visualGroundY);
+    }
+
+    this.terrain.update(focusMesh.position.z, this._elapsedSeconds, focusMesh.position.x);
+    this.obstacles.update(dt, focusMesh.position.z, visualGroundY);
+    this.courseDecor.update(dt, focusMesh.position.z, visualGroundY);
+    this.camera.update(dt, focusMesh, focusSpeed);
+    this.sky?.update(this.threeCamera.position);
+    this.mountains?.update(this.threeCamera.position);
+    this.snow.update(dt, this.threeCamera.position, focusSpeed);
+    this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
+    this.audio.updateContinuous(focusState.alive ? focusState.speed : 0, this.player.angle, this.player.isAirborne);
+
+    for (const [, rp] of this.remotePlayers) {
+      rp.update(dt, visualGroundY);
+    }
+
+    this.ui.updateHUD(focusState.distance, focusState.speed, focusState.hp, {
+      isAirborne: focusState.isAirborne,
+      graphicsQuality: this.graphicsQuality,
+      spawnShieldSeconds: focusState.invincibilityRemaining,
+      spectatorTarget: focusState.alive ? '' : (spectator?.score?.name || ''),
+    });
+    this.ui.updatePlayerList(this._getScoreList());
+    if (performance.now() - this._authLastYetiWarning > 1000) {
+      this.ui.showYetiWarning(false);
+    }
+
+    if (!focusState.alive && this._allPlayersFinished()) {
+      this._scheduleFinalGameOver(650);
+    }
+    this._updateNetDebug();
+  }
+
+  _simulatePredictedAuthoritativeTick(state, input, consumedPickupIds) {
+    const obstacles = getGameplayObstaclesNear(
+      this.seed,
+      state.z,
+      32,
+      this.obstacleVolume,
+      consumedPickupIds,
+    );
+    const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
+    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime);
+    if (officiallyAliveBeforePrediction && state.alive === false) {
+      state.alive = true;
+      state.finished = false;
+      state.hp = Math.max(1, state.hp || 1);
+      state.deathKind = undefined;
+    }
+  }
+
+  _getPredictedRenderState() {
+    const state = { ...this._authState };
+    const residualDt = THREE.MathUtils.clamp(this._authPredictionAccumulator, 0, SIM_DT);
+    if (!state.alive || residualDt <= 0) return state;
+
+    if (state.isAirborne) {
+      state.x = clamp(state.x + state.airVelocityX * residualDt, -55, 55);
+      state.z += state.airVelocityZ * residualDt;
+      state.y = Math.max(0, state.y + state.jumpVelocityY * residualDt - 0.5 * GRAVITY * residualDt * residualDt);
+      return state;
+    }
+
+    state.x = clamp(state.x + Math.sin(state.angle) * state.speed * residualDt, -55, 55);
+    state.z += Math.cos(state.angle) * state.speed * residualDt;
+    return state;
+  }
+
+  _setVisualReconciliation(previousLogicalState, previousPosition, previousAngle, state, snap = false) {
+    const target = new THREE.Vector3(state.x, state.y, state.z);
+    const logicalError = Math.hypot(
+      previousLogicalState.x - state.x,
+      previousLogicalState.y - state.y,
+      previousLogicalState.z - state.z,
+    );
+    this._authLastReconciliationError = logicalError;
+    if (snap || this._authLastReconciliationError > 8) {
+      this._authVisualCorrection.set(0, 0, 0);
+      this._authVisualAngleCorrection = 0;
+      return;
+    }
+    // Normal prediction is usually less than one tick ahead of the latest
+    // snapshot. It is not a reconciliation error and must not restart a
+    // visual correction every 50 ms.
+    if (this._authLastReconciliationError < 0.75) return;
+
+    const correction = previousPosition.clone().sub(target);
+    this._authVisualCorrection.copy(correction);
+    this._authVisualAngleCorrection = Math.atan2(
+      Math.sin(previousAngle - state.angle),
+      Math.cos(previousAngle - state.angle),
+    );
+  }
+
+  _applyAuthoritativeStateToLocalPlayer(state, options = {}) {
+    const snap = !!options.snap || !state.alive;
+    const dt = Math.max(0.001, Number(options.dt) || 1 / 60);
+    if (snap) {
+      this._authVisualCorrection.set(0, 0, 0);
+      this._authVisualAngleCorrection = 0;
+    } else {
+      const decay = Math.exp(-12 * dt);
+      this._authVisualCorrection.multiplyScalar(decay);
+      this._authVisualAngleCorrection *= decay;
+    }
+    const renderPosition = new THREE.Vector3(state.x, state.y, state.z).add(this._authVisualCorrection);
+
+    this.player.position.copy(renderPosition);
+    this.player.mesh.position.copy(renderPosition);
+    this.player.angle = state.angle;
+    this.player.mesh.rotation.y = -(state.angle + this._authVisualAngleCorrection);
+    this.player.speed = state.speed;
+    this.player.hp = state.hp;
+    this.player.isAlive = state.alive;
+    this.player.isAirborne = state.isAirborne;
+    this.player.jumpVelocityY = state.jumpVelocityY || 0;
+    this.player.airTime = state.airTime || 0;
+    this.player.mesh.visible = true;
+    this._spawnProtectionRemaining = state.invincibilityRemaining;
+  }
+
+  _buildStateFromSnapshotPlayer(player) {
+    return {
+      ...this._authState,
+      ...player,
+      startZ: this._authState?.startZ ?? player.startZ ?? 0,
+      jumpVelocityY: player.jumpVelocityY ?? this._authState?.jumpVelocityY ?? 0,
+      airVelocityX: player.airVelocityX ?? this._authState?.airVelocityX ?? 0,
+      airVelocityZ: player.airVelocityZ ?? this._authState?.airVelocityZ ?? 0,
+      airTime: player.airTime ?? this._authState?.airTime ?? 0,
+      airborneFromRamp: player.airborneFromRamp ?? this._authState?.airborneFromRamp ?? false,
+      jumpHeld: this._authState?.jumpHeld ?? false,
+      lastInputAtMs: this._authState?.lastInputAtMs ?? 0,
+    };
+  }
+
+  _replayPendingInputsFromSnapshot(baseState, serverConsumedPickupIds) {
+    const lastProcessedSeq = Number(baseState.lastProcessedInputSeq) || 0;
+    const pending = this._authPendingInputs.filter(input => Number(input.seq) > lastProcessedSeq);
+    this._authPendingInputs = pending;
+    if (!pending.length || baseState.alive === false) return baseState;
+
+    const replayState = { ...baseState };
+    const replayConsumed = new Set(serverConsumedPickupIds);
+    for (const pendingInput of pending) {
+      this._simulatePredictedAuthoritativeTick(replayState, pendingInput, replayConsumed);
+    }
+    this._authConsumedPickupIds = replayConsumed;
+    return replayState;
+  }
+
+  _onGameSnapshot(snapshot) {
+    if (!this._authoritativeMultiplayer || !snapshot) return;
+    const receivedAtMs = performance.now();
+    this._authLastSnapshotAt = receivedAtMs;
+    const serverTick = Number(snapshot.serverTick);
+    if (Number.isFinite(serverTick)) {
+      if (serverTick <= this._authLastServerTick) return;
+      this._authLastServerTick = serverTick;
+    }
+
+    const serverConsumedPickupIds = new Set(Array.isArray(snapshot.consumedPickupIds) ? snapshot.consumedPickupIds : []);
+    if (Array.isArray(snapshot.consumedPickupIds)) {
+      this._authConsumedPickupIds = new Set(snapshot.consumedPickupIds);
+      for (const obs of this.obstacles.active) {
+        if (this._authConsumedPickupIds.has(obs.id)) {
+          obs.dead = true;
+          if (obs.mesh) obs.mesh.visible = false;
+        }
+      }
+    }
+
+    const localId = this.socket?.id;
+    const seen = new Set();
+    for (const player of snapshot.players || []) {
+      seen.add(player.id);
+      const score = {
+        id: player.id,
+        name: player.name || 'Player',
+        color: sanitizePlayerColor(player.color),
+        distance: player.distance || 0,
+        hp: player.hp,
+        alive: player.alive !== false,
+        local: player.id === localId,
+      };
+      this._scores.set(player.id === localId ? 'local' : player.id, score);
+
+      if (player.id === localId) {
+        const previousLogicalState = { ...this._authState };
+        const displayedPosition = this.player.position.clone();
+        const displayedAngle = this.player.angle;
+        const previousOfficialAlive = this._authLocalSnapshotAlive !== false;
+        this._authLocalSnapshotAlive = player.alive !== false;
+        const snapshotState = this._buildStateFromSnapshotPlayer(player);
+        this._authState = this._replayPendingInputsFromSnapshot(snapshotState, serverConsumedPickupIds);
+        this._authPreviousState = { ...this._authState };
+        const snap = !this._authHasReceivedSnapshot || this._authInputSeq <= 1 || player.alive === false;
+        this._authHasReceivedSnapshot = true;
+        this._setVisualReconciliation(
+          previousLogicalState,
+          displayedPosition,
+          displayedAngle,
+          this._authState,
+          snap,
+        );
+        if (snap) {
+          this._applyAuthoritativeStateToLocalPlayer(this._authState, { snap: true });
+        }
+        if (previousOfficialAlive && player.alive === false) {
+          this._handleAuthoritativeLocalDeath(player);
+        }
+        continue;
+      }
+
+      if (!this.remotePlayers.has(player.id)) {
+        const rp = new RemotePlayer(this.scene, player.id, player.name || 'Player', player.color);
+        this.remotePlayers.set(player.id, rp);
+      } else if (player.name) {
+        this.remotePlayers.get(player.id).setName(player.name);
+      }
+      this.remotePlayers.get(player.id).setColor(player.color);
+      this.remotePlayers.get(player.id).receiveState({
+        x: player.x,
+        y: player.y,
+        z: player.z,
+        angle: player.angle,
+        speed: player.speed,
+        alive: player.alive !== false,
+      }, serverTick, receivedAtMs);
+    }
+
+    for (const [id, rp] of this.remotePlayers) {
+      if (seen.has(id)) continue;
+      rp.dispose();
+      this.remotePlayers.delete(id);
+      this._scores.delete(id);
+    }
+
+    for (const event of snapshot.events || []) {
+      if (event.socketId !== localId) continue;
+      if (event.type === 'hit') {
+        this.ui.showHitFeedback();
+        this.audio.playCollision();
+        this.audio.playHeartLost();
+      } else if (event.type === 'heal') {
+        this.ui.showHealFeedback();
+      } else if (event.type === 'jump') {
+        this.audio.playJump();
+      } else if (event.type === 'landing') {
+        this.audio.playLand();
+      } else if (event.type === 'yeti-warning') {
+        this._authLastYetiWarning = performance.now();
+        this.ui.showYetiWarning(true);
+        if (!this._yetiWasNear) this.audio.playYetiRoar();
+        this._yetiWasNear = true;
+      } else if (event.type === 'yeti-capture') {
+        this._authLastYetiWarning = performance.now();
+        this.ui.showYetiWarning(true);
+      }
+    }
+
+    if (this._allPlayersFinished()) {
+      this._scheduleFinalGameOver(650);
+    }
+    this._updateNetDebug();
+  }
+
+  _handleAuthoritativeLocalDeath(player) {
+    if (this._authLocalDeathHandled) return;
+    this._authLocalDeathHandled = true;
+    this._gameOverSent = true;
+    this._gameOverDistance = player.distance || 0;
+    this.player.isAlive = false;
+    this.player.hp = player.hp || 0;
+    this.player.startDeathAnimation({
+      kind: player.deathKind || 'generic',
+      impactSpeed: player.speed || this.player.speed,
+    });
+    this._scores.set('local', {
+      id: this.socket?.id || 'local',
+      name: player.name || this.options.playerName || 'You',
+      color: sanitizePlayerColor(player.color || this.playerColor),
+      distance: this._gameOverDistance,
+      hp: this.player.hp,
+      alive: false,
+      local: true,
+      time: Math.floor((performance.now() - this._startTime) / 1000),
+    });
+    this.audio.stopAll();
+    this.audio.playGameOver();
+    this.options.onRunComplete?.({
+      distance: this._gameOverDistance,
+      scores: this._getScoreList(),
+      multiplayer: true,
+      gameMode: this.gameMode,
+      playerName: this.options.playerName || 'Skier',
+      difficulty: this.difficulty,
+    });
+  }
+
   _getScoreList() {
     return Array.from(this._scores.values()).map(score => ({ ...score }));
   }
@@ -440,6 +889,11 @@ export class Game {
     this._updateProjectiles(dt, visualGroundY);
 
     const target = spectator || this._getBestAliveRemotePlayer();
+    const spectatorId = target?.id || null;
+    if (spectatorId !== this._spectatorTargetId) {
+      this._spectatorTargetId = spectatorId;
+      this.camera.reset();
+    }
     const focusMesh = target?.rp?.mesh || this.player.mesh;
     const focusSpeed = target?.rp?.currentSpeed || Math.max(this.player.speed, 4);
     const focusZ = focusMesh.position.z;
@@ -475,6 +929,7 @@ export class Game {
   }
   
   _onRemoteUpdate(data) {
+    if (this._authoritativeMultiplayer) return;
     const { id, name, x, z, y, angle, speed, distance } = data;
     if (id === this.socket?.id) return;
     
@@ -509,15 +964,49 @@ export class Game {
   
   _onRemoteGameOver(data) {
     const { id, name, distance } = data;
+    if (this._authoritativeMultiplayer && id === this.socket?.id) {
+      const officialDeath = {
+        ...this._authState,
+        ...data,
+        alive: false,
+        finished: true,
+        hp: data.hp ?? this._authState?.hp ?? 0,
+        speed: data.speed ?? this._authState?.speed ?? this.player.speed,
+        deathKind: data.deathKind || data.kind || this._authState?.deathKind || 'generic',
+        distance: distance ?? this._authState?.distance ?? 0,
+      };
+      this._authLocalSnapshotAlive = false;
+      this._authState = officialDeath;
+      this._authPreviousState = { ...officialDeath };
+      this._applyAuthoritativeStateToLocalPlayer(officialDeath, { snap: true });
+      this._handleAuthoritativeLocalDeath(officialDeath);
+      if (this._allPlayersFinished()) {
+        this._scheduleFinalGameOver(650);
+      }
+      return;
+    }
     const previous = this._scores.get(id);
     this._scores.set(id, {
       id,
       name: name || previous?.name || id,
+      color: sanitizePlayerColor(data.color || previous?.color),
       distance: distance ?? previous?.distance ?? 0,
       alive: false,
     });
+    const rp = this.remotePlayers.get(id);
+    const latestRemoteState = rp?.getLatestState();
+    if (latestRemoteState) {
+      rp.receiveState({
+        ...latestRemoteState,
+        speed: 0,
+        alive: false,
+      });
+    }
     if (!this.player.isAlive) {
       this._updateMultiplayerSpectator(0, null);
+    }
+    if (this._authoritativeMultiplayer && this._allPlayersFinished()) {
+      this._scheduleFinalGameOver(650);
     }
   }
 
@@ -672,6 +1161,7 @@ export class Game {
     this._scores.set('local', {
       id: 'local',
       name: this.options.playerName || 'You',
+      color: this.playerColor,
       distance,
       hp: this.player.hp,
       alive: false,
@@ -744,6 +1234,7 @@ export class Game {
       this.socket.off('player:left', this._boundPlayerLeft);
       this.socket.off('player:gameover', this._boundRemoteGameOver);
       this.socket.off('combat:throw', this._boundCombatThrow);
+      this.socket.off('game:snapshot', this._boundGameSnapshot);
     }
   }
 }

@@ -10,7 +10,10 @@ export function PlayerStatusPanel({ players }: { players: PlayerStatus[] }) {
         const alive = player.alive !== false;
         return (
           <div key={`${player.id || player.name}-${index}`} className="grid grid-cols-[1fr_auto] items-baseline gap-x-2.5 py-0.5">
-            <div className="min-w-0 truncate text-left">{index + 1}. {player.name || 'Player'}</div>
+            <div className="flex min-w-0 items-center gap-1.5 truncate text-left">
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full border border-white/40" style={{ backgroundColor: player.color || '#2979ff' }} />
+              <span className="truncate">{index + 1}. {player.name || 'Player'}</span>
+            </div>
             <div className="text-right text-[11px] text-white/70">
               <span className={`font-black uppercase ${alive ? 'text-[#7df7ba]' : 'text-[#ff8c98]'}`}>{alive ? 'Playing' : 'Dead'}</span>
               {' - '}

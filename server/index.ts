@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const swaggerUi = require('swagger-ui-express');
 const { GameRoom, generateRoomId, sanitizeRoomSettings } = require('./GameRoom');
 const { RankingRepository } = require('./RankingRepository');
+const { AuthoritativeRoomRuntime } = require('./AuthoritativeRoomRuntime');
 
 const app = express();
 const server = http.createServer(app);
@@ -169,6 +170,10 @@ app.get('/api/rankings/players/:playerId', async (req, res, next) => {
 
 app.post('/api/rankings', async (req, res, next) => {
   try {
+    if (req.body?.mode === 'multiplayer' || req.body?.mode === 'multiplayer_sky_mario') {
+      res.status(400).json({ error: 'multiplayer rankings are recorded by the authoritative server runtime' });
+      return;
+    }
     const entry = await rankings.add(req.body);
     if (!entry) {
       res.status(400).json({ error: 'distance must be greater than 0' });
@@ -200,14 +205,14 @@ io.on('connection', (socket) => {
   console.log(`[+] ${socket.id} connected`);
 
   // ---- Create Room ----
-  socket.on('room:create', ({ playerName, settings }) => {
+  socket.on('room:create', ({ playerName, playerId, playerColor, settings }) => {
     let roomId;
     // Ensure unique ID
     do { roomId = generateRoomId(); } while (rooms.has(roomId));
 
     const seed = Math.floor(Math.random() * 999999) + 1;
     const room = new GameRoom(roomId, seed, socket.id, sanitizeRoomSettings(settings));
-    room.addPlayer(socket.id, playerName);
+    room.addPlayer(socket.id, playerName, playerId, playerColor);
     rooms.set(roomId, room);
     playerRooms.set(socket.id, roomId);
 
@@ -224,7 +229,7 @@ io.on('connection', (socket) => {
   });
 
   // ---- Join Room ----
-  socket.on('room:join', ({ roomId, playerName }) => {
+  socket.on('room:join', ({ roomId, playerName, playerId, playerColor }) => {
     const room = rooms.get(roomId);
     const prevRoom = playerRooms.get(socket.id);
     if (!room) {
@@ -245,7 +250,7 @@ io.on('connection', (socket) => {
       _leaveRoom(socket, prevRoom);
     }
 
-    room.addPlayer(socket.id, playerName);
+    room.addPlayer(socket.id, playerName, playerId, playerColor);
     playerRooms.set(socket.id, roomId);
     socket.join(roomId);
 
@@ -266,6 +271,24 @@ io.on('connection', (socket) => {
       countdown: room.countdownRemaining,
     });
     console.log(`[room] ${playerName} joined ${roomId}`);
+  });
+
+  // ---- Player Color ----
+  socket.on('player:color', ({ color }) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
+    if (!room.updatePlayerColor(socket.id, color)) {
+      socket.emit('room:error', { message: 'This color is already taken or the room is starting.' });
+      return;
+    }
+    io.to(roomId).emit('room:state', {
+      players: room.getPlayerList(),
+      ownerId: room.ownerId,
+      settings: room.settings,
+      countdown: room.countdownRemaining,
+    });
   });
 
   // ---- Room Settings ----
@@ -302,8 +325,21 @@ io.on('connection', (socket) => {
       socket.emit('room:error', { message: 'Only the room host can start the game.' });
       return;
     }
+    if (room.settings.gameMode === 'sky_mario') {
+      socket.emit('room:error', { message: 'Sky Mario authoritative multiplayer is coming in a later pass. Use Classic for now.' });
+      return;
+    }
     if (room.started || room.countdownTimer) return;
     _startRoomCountdown(roomId, room);
+  });
+
+  // ---- Authoritative player input ----
+  socket.on('player:input', (input) => {
+    const roomId = playerRooms.get(socket.id);
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room || !room.started || !room.runtime) return;
+    room.runtime.handleInput(socket.id, input);
   });
 
   // ---- Player position update ----
@@ -312,6 +348,7 @@ io.on('connection', (socket) => {
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
+    if (room.started && room.runtime) return;
 
     room.updatePlayerState(socket.id, state);
 
@@ -328,7 +365,7 @@ io.on('connection', (socket) => {
     const roomId = playerRooms.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
-    if (!room || room.settings.gameMode !== 'sky_mario') return;
+    if (!room || room.runtime || room.settings.gameMode !== 'sky_mario') return;
     const safeProjectile = {
       x: Number(projectile?.x) || 0,
       y: Number(projectile?.y) || 0.8,
@@ -350,6 +387,7 @@ io.on('connection', (socket) => {
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
+    if (room.started && room.runtime) return;
 
     const player = room.players.get(socket.id);
     const finishedPlayer = room.markPlayerFinished(socket.id, distance);
@@ -378,12 +416,19 @@ io.on('connection', (socket) => {
 function _leaveRoom(socket, roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
+  if (room.runtime) {
+    room.runtime.removePlayer(socket.id);
+  }
   room.removePlayer(socket.id);
   playerRooms.delete(socket.id);
   socket.leave(roomId);
   socket.to(roomId).emit('player:left', { id: socket.id });
   if (room.isEmpty()) {
     room.clearCountdown();
+    if (room.runtime) {
+      room.runtime.stop();
+      room.runtime = null;
+    }
     rooms.delete(roomId);
     console.log(`[room] ${roomId} closed (empty)`);
   } else {
@@ -426,6 +471,8 @@ function _startRoomCountdown(roomId, room) {
 
     currentRoom.clearCountdown();
     currentRoom.started = true;
+    currentRoom.runtime = new AuthoritativeRoomRuntime(io, roomId, currentRoom, rankings, _finishRoomRun);
+    currentRoom.runtime.start();
     io.to(roomId).emit('game:start', { seed: currentRoom.seed, settings: currentRoom.settings });
     console.log(`[room] ${roomId} game started`);
   }, 1000);
@@ -434,6 +481,10 @@ function _startRoomCountdown(roomId, room) {
 function _finishRoomRun(roomId, room) {
   room.started = false;
   room.clearCountdown();
+  if (room.runtime) {
+    room.runtime.stop();
+    room.runtime = null;
+  }
   io.to(roomId).emit('room:state', {
     players: room.getPlayerList(),
     ownerId: room.ownerId,

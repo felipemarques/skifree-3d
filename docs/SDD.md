@@ -20,8 +20,14 @@ Operational memory files live in:
 - Main loop: `Game` owns scene setup, terrain/chunk updates, player, obstacles, camera, snow, trail, yeti, HUD, and network updates.
 - UI loop: React owns menus, settings, lobby, ranking, pause, game over, HUD, and overlays. `GameController` owns app orchestration and `ReactUiAdapter` translates existing imperative game UI calls into React state updates.
 - HTTP API: `/health`, `/api/rankings`, `/openapi.json`, and Swagger UI under `/docs`.
-- Multiplayer: the client opens a socket only when creating or joining a room. The server owns per-room lobbies, relays room state and player updates, and clients simulate local physics from a shared deterministic seed.
+- Multiplayer: the client opens a socket only when creating or joining a room. The server owns per-room lobbies, countdowns, room settings, authoritative Classic simulation, and final multiplayer distances.
+- Multiplayer Classic is server-authoritative at 30 Hz. The server queues each player's ordered inputs, consumes one valid input per simulation tick, owns HP/distance/death/ranking, and emits volatile `game:snapshot` updates at 30 Hz.
+- The authoritative room loop is paced by elapsed wall-clock time, not raw `setInterval` callback count. Delayed Node timers run bounded catch-up ticks so the server cannot progressively fall behind client prediction during a long run.
+- The client predicts only fixed `SIM_DT` ticks, sends and records the exact input used for each tick, ignores stale snapshots by `serverTick`, then restores the official state and replays only unacknowledged inputs.
+- Local reconciliation uses a decaying visual correction only for meaningful simulation divergence. Remote skiers render from the newest authoritative snapshot with bounded 140 ms extrapolation for a missed packet, avoiding a permanent visual delay between racers.
+- Multiplayer Classic treats `player:gameover` from the server as a reliable official death fallback because `game:snapshot` is intentionally volatile for performance.
 - Multiplayer rooms own shared gameplay rules: `gameMode`, `difficulty`, `yetiStartMode`, and `obstacleVolume`. The room host can edit these rules in the lobby before start; other players receive them read-only and use them when the run begins.
+- Multiplayer rooms also own each player's outfit color. The server assigns and validates unique colors, then broadcasts them in lobby state and authoritative snapshots so every client renders the same player with the same color.
 - Multiplayer start is server-counted: when the host starts a room, the server emits `room:countdown` from 10 to 0, locks lobby settings during the countdown, then emits `game:start`.
 - Multiplayer HUD keeps a live room status panel with each player marked as playing or dead.
 - Multiplayer rooms are reusable: the server marks each player finished on `player:gameover`; when all current room players are finished, the room returns to lobby state and can start another countdown/run.
@@ -30,8 +36,12 @@ Operational memory files live in:
 
 - Game mode is selected before a run. `classic` preserves the current arcade descent loop; `sky_mario` keeps the same skiing rules but enables lightweight item combat.
 - Player movement supports mouse and keyboard steering, braking, keyboard boost through `S`/down arrow/`Shift`/`F`, Space jump, ramp jumps, HP, invincibility, and unstuck handling.
+- In `Both` control mode, any held gameplay key owns movement for that tick; holding boost or brake cannot leave mouse X steering active in the background.
 - Multiplayer runs grant the local player 5 seconds of spawn invincibility after `game:start`; damage is ignored during this window and the HUD shows a shield countdown.
+- Multiplayer Classic starts players on deterministic shuffled horizontal spawn lanes, far enough apart to avoid immediate skier-skier collisions at the beginning of the run.
 - In multiplayer, local death enters spectator mode instead of opening Game Over immediately. The camera follows the best placed living remote skier until every remaining player is dead, then the final room scores are shown.
+- Spectator rendering anchors visual terrain to the watched skier so remote players and obstacles stay above the snow while the camera follows another player.
+- Spectator camera smoothing resets when the watched target changes, reducing angle differences between dead clients following the same surviving skier.
 - Each multiplayer restart resets per-player run state and generates a fresh room seed for the next `game:start`.
 - Jump and ramp trajectories are locked until landing; steering and speed input do not change the horizontal path while airborne.
 - Ramp jump height scales with entry speed, producing smaller jumps at low speed and higher jumps when boosted.
@@ -58,8 +68,7 @@ Operational memory files live in:
 - Fatal collisions play a short local death animation before the game-over screen: rocks/fallen trees tumble the skier with forward slide/roll intensity based on impact speed, holes use a squash/tilt fall inside the hole shape, standing trees use a distinct impact fall, and skier-vs-skier deaths knock both visible skiers down.
 - Death animations clamp the skier and loose gear above the visual ground plane; hole deaths use squash/tilt into the hole shape instead of pushing the skier through the snow surface.
 - Yeti capture uses one of three stylized arcade animations before the game-over screen: upward launch/fragmentation, lateral corkscrew throw, or ground slam with low-poly parts popping apart.
-- Sky Mario currently adds snowball-style projectiles fired with `E`, `Ctrl`, or mouse left. Projectiles arc forward from the skier, can damage/push the local player when received from another multiplayer client, and can knock visible remote/NPC skiers locally.
-- In multiplayer Sky Mario, the server relays a compact `combat:throw` socket event only inside rooms whose `gameMode` is `sky_mario`; player position payloads remain unchanged.
+- Sky Mario currently adds snowball-style projectiles fired with `E`, `Ctrl`, or mouse left in solo. Authoritative Sky Mario multiplayer is deferred; rooms using `sky_mario` cannot start until projectile/combat simulation is ported server-side.
 
 ## 4. Graphics Systems
 
@@ -83,7 +92,7 @@ Operational memory files live in:
 - `obstacleVolume` is a numeric slider from `0` to `2`, where `1` preserves current obstacle density and higher values spawn more static obstacles, ramps, holes, NPCs, dogs, and a higher capped bear chance.
 - `gameMode` accepts `classic` or `sky_mario`; in solo it is selected from the main menu, while multiplayer rooms expose it as a host-controlled lobby setting.
 - `difficulty` accepts `easy`, `normal`, `hard`, or `extreme`; default is `normal`.
-- `yetiStartMode` accepts `distance` or `immediate`; `immediate` starts the Yeti chase at the beginning of a run while preserving the selected difficulty tuning.
+- `yetiStartMode` accepts `distance`, `immediate`, or `disabled`; `immediate` starts the Yeti chase at the beginning of a run, while `disabled` prevents Yeti warning/capture logic for that run.
 - Fog and snowfall are local presentation settings. Obstacle volume is local in solo, but is synchronized as a room rule in multiplayer.
 - The menu/HUD use a compact glass-style shell, speed bar, quality badge, jump state badge, multiplayer shield countdown, hit flash, landing feedback, and a persistent controls panel during runs.
 - The menu/HUD are React components organized under `client/src/components/screens`, `client/src/components/hud`, and `client/src/components/ui`; Shadcn-style primitives provide buttons, inputs, selects, sliders, cards, badges, and related controls.
@@ -95,8 +104,11 @@ Operational memory files live in:
 - Pressing `Esc` during a run pauses the game and opens a pause menu with Resume, Settings, and Main Menu actions.
 - The page blocks browser/editor shortcuts that conflict with gameplay focus: `Ctrl/Cmd+S`, `O`, `A`, `B`, `F`, `P`, `W`, and `Q`.
 - Multiplayer lobby shows a shared 10-second countdown before entering gameplay; players can still leave, but settings/start controls are locked while the countdown runs.
+- Multiplayer lobby uses a wider desktop panel with players/color selection and room settings side by side, while preserving a stacked layout on small screens.
 - Audio is synthesized locally with Web Audio and driven by game events: wind/slide continuous loops, jump, landing, collision, heart loss, boost, Yeti warning, and game-over sounds.
-- Socket event payloads and multiplayer protocol are unchanged by the graphics and obstacle pass.
+- Multiplayer protocol uses sequenced `player:input` client-to-server and `game:snapshot` server-to-client for authoritative Classic runs. `lastProcessedInputSeq` acknowledges only inputs actually simulated by the server. Legacy `player:update` remains only as a deprecated fallback for non-runtime rooms.
+- Room obstacle volume `0` creates no gameplay obstacles or pickups, allowing a genuinely empty multiplayer test track.
+- In authoritative Classic, gameplay-critical objects are deterministic from the shared room seed; purely visual decoration may still differ per client until it is moved into shared generation.
 - Solo mode does not open a socket connection; leaving a multiplayer lobby/run returns to the main menu and disconnects the client.
 
 ## 6. Constraints
