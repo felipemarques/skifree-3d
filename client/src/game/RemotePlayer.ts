@@ -3,9 +3,12 @@ import * as THREE from 'three';
 import { buildSkierMesh, setSkierNameLabel, updateSkierAnimation } from './SkierModel';
 import { DEFAULT_PLAYER_COLOR, sanitizePlayerColor } from '../../../shared/AuthoritativeSim';
 
-const INTERPOLATION_DELAY_MS = 0;
+const INTERPOLATION_DELAY_MS = 100;
 const MAX_SNAPSHOT_HISTORY = 12;
 const MAX_EXTRAPOLATION_MS = 140;
+const CLOCK_OFFSET_SMOOTHING = 0.15;
+const VISUAL_SMOOTHING_RATE = 18;
+const VISUAL_SNAP_DISTANCE = 6;
 
 function colorToNumber(color) {
   return parseInt(sanitizePlayerColor(color).slice(1), 16);
@@ -22,6 +25,9 @@ export class RemotePlayer {
 
     this._snapshots = [];
     this._lastServerTick = -1;
+    this._clockOffsetMs = null;
+    this._visualPosition = null;
+    this._visualAngle = 0;
     this.currentSpeed = 0;
   }
 
@@ -53,15 +59,26 @@ export class RemotePlayer {
     this.scene.add(this.mesh);
   }
 
-  receiveState(state, serverTick, receivedAtMs = performance.now()) {
+  receiveState(state, serverTick, simTimeMs, receivedAtMs = performance.now()) {
     const tick = Number(serverTick);
     if (Number.isFinite(tick) && tick <= this._lastServerTick) return false;
 
     if (Number.isFinite(tick)) this._lastServerTick = tick;
+
+    // Snapshots key their position on the buffer by the authoritative sim
+    // clock, not arrival time: the server tick loop can emit two snapshots
+    // back-to-back to catch up on drift, which would otherwise collapse the
+    // interpolation span between them to ~0ms and read as a snap.
+    const resolvedSimTimeMs = Number.isFinite(simTimeMs) ? simTimeMs : receivedAtMs;
+    const offsetSample = resolvedSimTimeMs - receivedAtMs;
+    this._clockOffsetMs = this._clockOffsetMs === null
+      ? offsetSample
+      : this._clockOffsetMs + (offsetSample - this._clockOffsetMs) * CLOCK_OFFSET_SMOOTHING;
+
     this._snapshots.push({
       state: { ...state },
       serverTick: Number.isFinite(tick) ? tick : this._lastServerTick + 1,
-      receivedAtMs,
+      simTimeMs: resolvedSimTimeMs,
     });
     if (this._snapshots.length > MAX_SNAPSHOT_HISTORY) this._snapshots.shift();
     return true;
@@ -78,25 +95,26 @@ export class RemotePlayer {
     setSkierNameLabel(this.mesh, this.name);
   }
 
-  _sampleState(renderAtMs) {
+  _sampleState(renderSimTimeMs) {
     const snapshots = this._snapshots;
-    if (snapshots.length === 1 || renderAtMs <= snapshots[0].receivedAtMs) {
+    if (snapshots.length === 1 || renderSimTimeMs <= snapshots[0].simTimeMs) {
       return snapshots[0].state;
     }
 
     for (let i = 1; i < snapshots.length; i++) {
       const previous = snapshots[i - 1];
       const next = snapshots[i];
-      if (renderAtMs > next.receivedAtMs) continue;
+      if (renderSimTimeMs > next.simTimeMs) continue;
 
-      const span = Math.max(1, next.receivedAtMs - previous.receivedAtMs);
-      const t = THREE.MathUtils.clamp((renderAtMs - previous.receivedAtMs) / span, 0, 1);
+      const span = Math.max(1, next.simTimeMs - previous.simTimeMs);
+      const t = THREE.MathUtils.clamp((renderSimTimeMs - previous.simTimeMs) / span, 0, 1);
       return this._interpolate(previous.state, next.state, t);
     }
 
-    const latest = snapshots[snapshots.length - 1].state;
+    const last = snapshots[snapshots.length - 1];
+    const latest = last.state;
     const extraSeconds = THREE.MathUtils.clamp(
-      (renderAtMs - snapshots[snapshots.length - 1].receivedAtMs) / 1000,
+      (renderSimTimeMs - last.simTimeMs) / 1000,
       0,
       MAX_EXTRAPOLATION_MS / 1000,
     );
@@ -127,15 +145,39 @@ export class RemotePlayer {
   update(dt, groundYAt = null, nowMs = performance.now()) {
     if (!this._snapshots.length) return;
 
-    const state = this._sampleState(nowMs - INTERPOLATION_DELAY_MS);
+    const renderSimTimeMs = nowMs + (this._clockOffsetMs || 0) - INTERPOLATION_DELAY_MS;
+    const state = this._sampleState(renderSimTimeMs);
     const x = state.x;
     const z = state.z;
     const airborneY = Math.max(0, state.y || 0);
     const groundY = groundYAt ? groundYAt(x, z) : 0;
     const alive = state.alive !== false;
+    const targetY = Math.max(groundY + airborneY, groundY + 0.035);
+    const targetAngle = state.angle || 0;
 
-    this.mesh.position.set(x, Math.max(groundY + airborneY, groundY + 0.035), z);
-    const angle = state.angle || 0;
+    // The sampled snapshot state above is the logical/authoritative target.
+    // What actually gets drawn eases toward it instead of snapping straight
+    // there, so any residual micro-jitter in the sampled value (clock-offset
+    // drift, the interpolate/extrapolate seam) doesn't show up 1:1 on screen
+    // — mirroring the decaying visual correction already used for the local
+    // player in Game.ts.
+    if (!this._visualPosition) {
+      this._visualPosition = new THREE.Vector3(x, targetY, z);
+      this._visualAngle = targetAngle;
+    } else if (Math.hypot(x - this._visualPosition.x, z - this._visualPosition.z) > VISUAL_SNAP_DISTANCE) {
+      this._visualPosition.set(x, targetY, z);
+      this._visualAngle = targetAngle;
+    } else {
+      const blend = 1 - Math.exp(-VISUAL_SMOOTHING_RATE * dt);
+      this._visualPosition.x += (x - this._visualPosition.x) * blend;
+      this._visualPosition.y += (targetY - this._visualPosition.y) * blend;
+      this._visualPosition.z += (z - this._visualPosition.z) * blend;
+      const angleDelta = Math.atan2(Math.sin(targetAngle - this._visualAngle), Math.cos(targetAngle - this._visualAngle));
+      this._visualAngle += angleDelta * blend;
+    }
+
+    this.mesh.position.copy(this._visualPosition);
+    const angle = this._visualAngle;
     const speed = alive ? state.speed || 0 : 0;
     this.currentSpeed = speed;
     this.mesh.rotation.y = -angle;

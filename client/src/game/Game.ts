@@ -36,6 +36,23 @@ const SKY_MARIO_THROW_COOLDOWN = 0.75;
 const PROJECTILE_LIFETIME = 2.4;
 const PROJECTILE_SPEED = 34;
 const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
+const DEV_REMOTE_HALF_W = 0.35;
+const DEV_REMOTE_HALF_D = 0.55;
+const DEV_HITBOX_COLORS = {
+  player: 0x4dffb0,
+  remote: 0xffe066,
+  ramp: 0x4dd2ff,
+  hole: 0xb37bff,
+  heart: 0xff8fd0,
+  npc: 0xffa94d,
+  dog: 0xffa94d,
+  bear: 0xff6b4d,
+  tree: 0xff4d6d,
+  rock: 0xff4d6d,
+  stump: 0xff4d6d,
+  fallen_tree: 0xff4d6d,
+  default: 0xffffff,
+};
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -126,9 +143,171 @@ export class Game {
     this._authLocalDeathHandled = false;
     this._authConsumedPickupIds = new Set();
     this._authLastYetiWarning = 0;
-    
+    this._devModeEnabled = false;
+    this._devOverlayElement = null;
+    this._devHitboxGroup = null;
+    this._devHitboxMaterials = null;
+    this._devUnitBoxGeometry = null;
+    this._devFpsAccum = 0;
+    this._devFpsFrames = 0;
+    this._devFps = 0;
+    this._devPing = null;
+    this._devPingTimer = 0;
+    this._boundDevModeKeydown = this._onDevModeKeydown.bind(this);
+    window.addEventListener('keydown', this._boundDevModeKeydown);
+
     this._setup();
     this._createNetDebugOverlay();
+  }
+
+  _onDevModeKeydown(e) {
+    if (e.key !== "'" && e.code !== 'Quote') return;
+    const tag = e.target?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
+    e.preventDefault();
+    this._setDevModeEnabled(!this._devModeEnabled);
+  }
+
+  _setDevModeEnabled(enabled) {
+    this._devModeEnabled = enabled;
+    if (enabled) {
+      this._createDevOverlay();
+      this._createDevHitboxGroup();
+    } else {
+      this._destroyDevOverlay();
+      this._destroyDevHitboxGroup();
+    }
+  }
+
+  _createDevOverlay() {
+    if (this._devOverlayElement || !this.renderer?.domElement?.parentElement) return;
+    const overlay = document.createElement('pre');
+    overlay.style.cssText = [
+      'position:absolute',
+      'left:12px',
+      'top:50%',
+      'transform:translateY(-50%)',
+      'z-index:250',
+      'margin:0',
+      'padding:7px 9px',
+      'border:1px solid rgba(255,209,102,.55)',
+      'border-radius:4px',
+      'background:rgba(4,15,31,.72)',
+      'color:#ffe066',
+      'font:11px/1.35 ui-monospace,monospace',
+      'pointer-events:none',
+      'white-space:pre',
+    ].join(';');
+    overlay.textContent = 'dev mode: on';
+    this.renderer.domElement.parentElement.appendChild(overlay);
+    this._devOverlayElement = overlay;
+  }
+
+  _destroyDevOverlay() {
+    this._devOverlayElement?.remove();
+    this._devOverlayElement = null;
+  }
+
+  _createDevHitboxGroup() {
+    if (this._devHitboxGroup) return;
+    this._devUnitBoxGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+    this._devHitboxMaterials = new Map();
+    this._devHitboxGroup = new THREE.Group();
+    this._devHitboxGroup.renderOrder = 999;
+    this.scene.add(this._devHitboxGroup);
+  }
+
+  _destroyDevHitboxGroup() {
+    if (!this._devHitboxGroup) return;
+    this.scene.remove(this._devHitboxGroup);
+    this._devHitboxGroup.children.length = 0;
+    this._devUnitBoxGeometry?.dispose();
+    this._devUnitBoxGeometry = null;
+    for (const material of this._devHitboxMaterials.values()) material.dispose();
+    this._devHitboxMaterials = null;
+    this._devHitboxGroup = null;
+  }
+
+  _getDevHitboxMaterial(color) {
+    let material = this._devHitboxMaterials.get(color);
+    if (!material) {
+      material = new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.9 });
+      this._devHitboxMaterials.set(color, material);
+    }
+    return material;
+  }
+
+  _addDevHitbox(x, y, z, halfW, halfD, height, color) {
+    const box = new THREE.LineSegments(this._devUnitBoxGeometry, this._getDevHitboxMaterial(color));
+    box.scale.set(Math.max(halfW, 0.05) * 2, height, Math.max(halfD, 0.05) * 2);
+    box.position.set(x, y + height / 2, z);
+    this._devHitboxGroup.add(box);
+  }
+
+  _rebuildDevHitboxes() {
+    if (!this._devHitboxGroup) return;
+    this._devHitboxGroup.children.length = 0;
+
+    this._addDevHitbox(
+      this.player.position.x, this.player.position.y, this.player.position.z,
+      this.player.halfW, this.player.halfD, 1.7, DEV_HITBOX_COLORS.player,
+    );
+
+    for (const [, rp] of this.remotePlayers) {
+      if (!rp.mesh) continue;
+      this._addDevHitbox(
+        rp.mesh.position.x, rp.mesh.position.y, rp.mesh.position.z,
+        DEV_REMOTE_HALF_W, DEV_REMOTE_HALF_D, 1.7, DEV_HITBOX_COLORS.remote,
+      );
+    }
+
+    for (const obs of this.obstacles.getObstaclesNear(this.player.position.z, 45)) {
+      if (obs.dead) continue;
+      const color = DEV_HITBOX_COLORS[obs.type] || DEV_HITBOX_COLORS.default;
+      const y = obs.mesh?.position?.y ?? 0;
+      this._addDevHitbox(obs.x, y, obs.z, obs.halfW, obs.halfD, 1.4, color);
+    }
+  }
+
+  _renderDevOverlay() {
+    if (!this._devOverlayElement) return;
+    const p = this.player;
+    const ping = this._devPing == null ? '-' : `${Math.round(this._devPing)}ms`;
+    this._devOverlayElement.textContent = [
+      "DEV MODE (')",
+      `fps: ${this._devFps.toFixed(0)}`,
+      `pos: ${p.position.x.toFixed(1)}, ${p.position.y.toFixed(1)}, ${p.position.z.toFixed(1)}`,
+      `speed: ${p.speed.toFixed(2)}  angle: ${p.angle.toFixed(2)}`,
+      `hp: ${p.hp}  alive: ${p.isAlive}  airborne: ${p.isAirborne}`,
+      `mode: ${this.gameMode}  difficulty: ${this.difficulty}`,
+      `ping: ${ping}`,
+      `obstacles: ${this.obstacles.active.length}  remotes: ${this.remotePlayers.size}`,
+    ].join('\n');
+  }
+
+  _updateDevMode(dt) {
+    if (!this._devModeEnabled) return;
+
+    this._devFpsAccum += dt;
+    this._devFpsFrames += 1;
+    if (this._devFpsAccum >= 0.5) {
+      this._devFps = this._devFpsFrames / this._devFpsAccum;
+      this._devFpsAccum = 0;
+      this._devFpsFrames = 0;
+    }
+
+    if (this.socket?.connected) {
+      this._devPingTimer -= dt;
+      if (this._devPingTimer <= 0) {
+        this._devPingTimer = 1;
+        this.socket.ping(ms => { this._devPing = ms; });
+      }
+    } else {
+      this._devPing = null;
+    }
+
+    this._rebuildDevHitboxes();
+    this._renderDevOverlay();
   }
   
   _setup() {
@@ -353,6 +532,7 @@ export class Game {
     this._lastTime = now;
     
     this._update(dt);
+    this._updateDevMode(dt);
     this._render();
   }
   
@@ -775,7 +955,7 @@ export class Game {
         angle: player.angle,
         speed: player.speed,
         alive: player.alive !== false,
-      }, serverTick, receivedAtMs);
+      }, serverTick, snapshot.roomTimeMs, receivedAtMs);
     }
 
     for (const [id, rp] of this.remotePlayers) {
@@ -1209,6 +1389,9 @@ export class Game {
   destroy() {
     this._running = false;
     if (this._animFrame) cancelAnimationFrame(this._animFrame);
+    window.removeEventListener('keydown', this._boundDevModeKeydown);
+    this._destroyDevOverlay();
+    this._destroyDevHitboxGroup();
     this.input.destroy();
     this.terrain.dispose();
     this.obstacles.dispose();

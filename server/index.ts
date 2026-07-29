@@ -405,6 +405,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ---- Dev-mode latency probe ----
+  socket.on('debug:ping', (clientTime, callback) => {
+    if (typeof callback === 'function') callback(clientTime);
+  });
+
   // ---- Disconnect ----
   socket.on('disconnect', () => {
     console.log(`[-] ${socket.id} disconnected`);

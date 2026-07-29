@@ -97,6 +97,14 @@ export class SocketClient {
     this.socket?.volatile.emit('combat:throw', projectile);
   }
 
+  ping(callback) {
+    if (!this.socket?.connected) return;
+    const sentAt = performance.now();
+    this.socket.emit('debug:ping', sentAt, () => {
+      callback?.(performance.now() - sentAt);
+    });
+  }
+
   disconnect() {
     if (!this.socket) return;
     const socket = this.socket;
