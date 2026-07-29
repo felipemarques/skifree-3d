@@ -4,6 +4,7 @@ import { Terrain } from './Terrain';
 import { SnowTerrain } from './SnowTerrain';
 import { Player } from './Player';
 import { RemotePlayer } from './RemotePlayer';
+import { GhostPlayer } from './GhostPlayer';
 import { Obstacles } from './Obstacles';
 import { YetiManager } from './Yeti';
 import { GameCamera } from './Camera';
@@ -12,6 +13,7 @@ import { Input } from './Input';
 import { SeededRandom } from '../utils/SeededRandom';
 import { AudioManager } from './AudioManager';
 import { SkiTrail } from './SkiTrail';
+import { ImpactParticles } from './ImpactParticles';
 import { SkyBg } from './SkyBg';
 import { HorizonMountains } from './HorizonMountains';
 import { PostFX } from './PostFX';
@@ -21,9 +23,14 @@ import { getVisualTerrainY } from './VisualTerrain';
 import {
   GRAVITY,
   SIM_DT,
+  BASE_SPEED,
   DEFAULT_PLAYER_COLOR,
+  PLAYER_TURN_RATE,
+  PLAYER_MAX_TURN_ANGLE,
   createInitialPlayerState,
+  getChainWindowMs,
   getGameplayObstaclesNear,
+  getYetiConfig,
   sanitizePlayerColor,
   simulatePlayerTick,
 } from '../../../shared/AuthoritativeSim';
@@ -36,6 +43,10 @@ const SKY_MARIO_THROW_COOLDOWN = 0.75;
 const PROJECTILE_LIFETIME = 2.4;
 const PROJECTILE_SPEED = 34;
 const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
+const HITSTOP_TIME_SCALE = 0.05;
+const YETI_DANGER_RADIUS = 16;
+const YETI_PROXIMITY_BONUS_RATE = 3;
+const GHOST_SAMPLE_INTERVAL_S = 0.12;
 const DEV_REMOTE_HALF_W = 0.35;
 const DEV_REMOTE_HALF_D = 0.55;
 const DEV_HITBOX_COLORS = {
@@ -56,6 +67,14 @@ const DEV_HITBOX_COLORS = {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function round3(n) {
+  return Math.round(n * 1000) / 1000;
 }
 
 function getFogDistances(useHighGraphics, fogLevel) {
@@ -90,9 +109,14 @@ export class Game {
     
     this._running = false;
     this._lastTime = 0;
+    this._hitstopRemaining = 0;
+    this._yetiDangerT = 0;
+    this._chainRemainingT = 0;
     this._netTimer = 0;
     this._animFrame = null;
     this._scores = new Map();
+    this._ghostRecording = !this.options.multiplayer ? { keyframes: [], sampleTimer: 0 } : null;
+    this._pendingGhostSaved = false;
     this._gameOverSent = false;
     this._finalGameOverShown = false;
     this._gameOverDistance = 0;
@@ -115,13 +139,19 @@ export class Game {
     this.roomSettings = this.options.multiplayer ? (this.options.roomSettings || {}) : {};
     this.obstacleVolume = this.options.multiplayer
       ? Number(this.roomSettings.obstacleVolume ?? settings.get('obstacleVolume'))
-      : settings.get('obstacleVolume');
+      : Number(this.options.obstacleVolume ?? settings.get('obstacleVolume'));
     this.difficulty = this.options.multiplayer
       ? (this.roomSettings.difficulty || settings.get('difficulty'))
-      : settings.get('difficulty');
+      : (this.options.difficulty || settings.get('difficulty'));
     this.yetiStartMode = this.options.multiplayer
       ? (this.roomSettings.yetiStartMode || settings.get('yetiStartMode'))
       : settings.get('yetiStartMode');
+    this.difficultyRamp = this.options.multiplayer
+      ? !!this.roomSettings.difficultyRamp
+      : (this.options.difficultyRamp !== undefined ? !!this.options.difficultyRamp : !!settings.get('difficultyRamp'));
+    this.skillScoring = this.options.multiplayer
+      ? !!this.roomSettings.skillScoring
+      : (this.options.skillScoring !== undefined ? !!this.options.skillScoring : !!settings.get('skillScoring'));
     this.playerColor = sanitizePlayerColor(this.options.playerColor || DEFAULT_PLAYER_COLOR);
     this._useHighGraphics = this.graphicsQuality === 'high';
     this._authoritativeMultiplayer = !!this.options.multiplayer;
@@ -282,6 +312,8 @@ export class Game {
       `mode: ${this.gameMode}  difficulty: ${this.difficulty}`,
       `ping: ${ping}`,
       `obstacles: ${this.obstacles.active.length}  remotes: ${this.remotePlayers.size}`,
+      `skillScoring: ${this.skillScoring}  difficultyRamp: ${this.difficultyRamp}`,
+      `chainCount: ${this._authoritativeMultiplayer ? this._authState?.chainCount : p.chainCount}  bonusDistance: ${(this._authoritativeMultiplayer ? this._authState?.bonusDistance : p.bonusDistance)?.toFixed(1)}`,
     ].join('\n');
   }
 
@@ -357,29 +389,70 @@ export class Game {
     this.obstacles = new Obstacles(this.scene, {
       volume: this.obstacleVolume,
       authoritativeSeed: this._authoritativeMultiplayer ? seed : null,
+      difficultyRamp: this.difficultyRamp,
     });
     this.courseDecor = new CourseDecor(this.scene, seed, this.graphicsQuality);
     this.player = new Player(this.scene, colorToNumber(this.playerColor), this.options.playerName || 'Skier');
+    this.ghostPlayer = (!this.options.multiplayer && this.options.ghostRecord)
+      ? new GhostPlayer(this.scene, this.options.ghostRecord.keyframes, {
+        color: colorToNumber(this.options.ghostRecord.color || this.playerColor),
+      })
+      : null;
     if (this.options.multiplayer) {
       this.player.grantInvincibility(MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS);
     }
     this.player.onDie = context => this._handleGameOver(context);
-    this.player.onHit = () => {
+    this.player.onHit = (hp, pan = 0) => {
       this.ui.showHitFeedback();
-      this.audio.playCollision();
+      this.audio.playCollision(pan);
       this.audio.playHeartLost();
+      this.camera.shake(0.35, 0.28);
+      this.triggerHitstop(0.13);
+      this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.3, this.player.position.z, {
+        count: 16,
+        color: [0.42, 0.36, 0.32],
+        speed: 3.2,
+        spread: 1,
+        upBias: 1.6,
+        life: 0.5,
+        groundY: this.player.position.y,
+      });
     };
     this.player.onHeal = () => this.ui.showHealFeedback();
+    this.player.onNearMiss = (bonus, pan = 0) => {
+      this.ui.showNearMissFeedback(bonus);
+      this.audio.playNearMiss(pan);
+    };
+    this.player.onJumpChain = (bonus, chainCount) => {
+      this.ui.showJumpChainFeedback(bonus, chainCount);
+      this.audio.playJumpChain();
+    };
     this.player.onJumpStart = () => this.audio.playJump();
     this.player.onJumpLand = airSeconds => {
       this.audio.playLand();
-      if (airSeconds > 0.36) this.ui.showLandingFeedback();
+      if (airSeconds > 0.36) {
+        this.ui.showLandingFeedback();
+        this.player.playLandingSquash(Math.min(1.4, airSeconds * 1.6));
+        this.camera.shake(Math.min(0.3, airSeconds * 0.35), 0.22);
+        if (airSeconds > 0.6) this.triggerHitstop(0.09);
+        this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.05, this.player.position.z, {
+          count: Math.round(8 + Math.min(1, airSeconds) * 10),
+          color: [0.5, 0.82, 1],
+          speed: 2.2,
+          spread: 0.9,
+          upBias: 1.3,
+          life: 0.4,
+          groundY: this.player.position.y,
+        });
+      }
     };
     this.snow = new SnowParticles(this.scene, {
       quality: this.graphicsQuality,
       volume: this.snowVolume,
     });
     this.skiTrail = new SkiTrail(this.scene);
+    this.impactParticles = new ImpactParticles(this.scene);
+    this._skiSprayCooldown = 0;
     this.input = new Input();
     this.yeti = new YetiManager(this.scene, {
       difficulty: this.difficulty,
@@ -402,14 +475,22 @@ export class Game {
     this._startTime = performance.now();
     
     // Yeti capture
-    this.yeti.onCapture(() => this._handleGameOver({ capturedByYeti: true }));
+    this.yeti.onCapture(() => {
+      // In authoritative multiplayer the yeti is purely a local, cosmetic
+      // chase sim with no knowledge of the server's actual distance/time
+      // capture math — ending the run from here would desync the client
+      // from the server, which is the sole authority on that death.
+      if (this._authoritativeMultiplayer) return;
+      this._handleGameOver({ capturedByYeti: true });
+    });
     
     // Register score for self (with initial HP)
-    this._scores.set('local', { 
+    this._scores.set('local', {
       id: 'local',
-      name: this.options.playerName || 'You', 
+      name: this.options.playerName || 'You',
       color: this.playerColor,
       distance: 0,
+      bonusDistance: 0,
       hp: MAX_HP,
       alive: true,
       local: true,
@@ -527,13 +608,134 @@ export class Game {
   _loop(now) {
     if (!this._running) return;
     this._animFrame = requestAnimationFrame(t => this._loop(t));
-    
-    const dt = Math.min((now - this._lastTime) / 1000, 0.05); // cap at 50ms
+
+    let dt = Math.min((now - this._lastTime) / 1000, 0.05); // cap at 50ms
     this._lastTime = now;
-    
+
+    if (this._hitstopRemaining > 0) {
+      this._hitstopRemaining -= dt;
+      dt *= HITSTOP_TIME_SCALE;
+    }
+
     this._update(dt);
     this._updateDevMode(dt);
     this._render();
+  }
+
+  /** Brief slow-motion pulse on hard impacts/landings - sells weight. */
+  triggerHitstop(durationSeconds = 0.07) {
+    this._hitstopRemaining = Math.max(this._hitstopRemaining, durationSeconds);
+  }
+
+  /** Stereo pan (-1..1) for a sound source offset dx meters from the player. */
+  _panForDx(dx) {
+    if (dx === undefined || dx === null) return 0;
+    return clamp(dx / 8, -1, 1);
+  }
+
+  /** Periodic snow spray kicked up while carving hard on the ground. */
+  _updateSkiSpray(dt, mesh, speed, isAirborne, groundYAt) {
+    if (!mesh) return;
+    this._skiSprayCooldown = Math.max(0, this._skiSprayCooldown - dt);
+    if (isAirborne || this._skiSprayCooldown > 0) return;
+    if (speed < 7 || Math.abs(this.input.lateralAxis) < 0.5) return;
+    this._skiSprayCooldown = 0.09;
+    const groundY = groundYAt ? groundYAt(mesh.position.x, mesh.position.z) : 0;
+    this.impactParticles.burst(mesh.position.x, groundY + 0.04, mesh.position.z, {
+      count: 4,
+      color: [0.5, 0.82, 1],
+      speed: 1.6,
+      spread: 0.55,
+      upBias: 1.1,
+      life: 0.32,
+      groundY,
+    });
+  }
+
+  /** Fades in a low tension drone as the player nears the yeti trigger range. */
+  _updateYetiTension(distance) {
+    if (this.yeti.startMode === 'disabled' || this.yeti.active) {
+      this.audio.updateTension(0);
+      return;
+    }
+    const triggerDistance = this.yeti.config?.triggerDistance ?? Infinity;
+    const rampStart = triggerDistance * 0.7;
+    const span = triggerDistance - rampStart;
+    const t = span > 0 ? clamp((distance - rampStart) / span, 0, 1) : 0;
+    this.audio.updateTension(t);
+  }
+
+  /**
+   * Solo only: rewards surviving close to an active yeti instead of only
+   * punishing capture. Position-based (uses the real chase sim), which is
+   * only safe here because solo has no server to disagree with - see the
+   * multiplayer version below, which is authoritative-driven instead.
+   */
+  _updateYetiDangerBonus(dt) {
+    if (!this.skillScoring || !this.yeti.active || !this.player.isAlive) {
+      this._yetiDangerT = 0;
+      return;
+    }
+    let closest = Infinity;
+    for (const yeti of this.yeti.yetis) {
+      if (yeti.captured) continue;
+      const d = yeti.mesh.position.distanceTo(this.player.position);
+      if (d < closest) closest = d;
+    }
+    this._yetiDangerT = closest < YETI_DANGER_RADIUS ? clamp(1 - closest / YETI_DANGER_RADIUS, 0, 1) : 0;
+    if (this._yetiDangerT > 0) {
+      this.player.bonusDistance += dt * this._yetiDangerT * YETI_PROXIMITY_BONUS_RATE;
+    }
+  }
+
+  /**
+   * Multiplayer only: display-side estimate of the same danger window the
+   * server actually scores from (see maybeApplyYetiCapture) - cosmetic only,
+   * the real bonusDistance always comes from the server snapshot. Reuses
+   * the exported getYetiConfig so the numbers can't drift from the real
+   * formula, but elapsed time here is the client's own clock, not the
+   * server's roomTimeMs, so treat this as an approximation for the meter.
+   */
+  _updateYetiDangerDisplay(distance, speed) {
+    if (!this.skillScoring || this.yetiStartMode === 'disabled') {
+      this._yetiDangerT = 0;
+      return;
+    }
+    const config = getYetiConfig(this.roomSettings);
+    if (distance < config.triggerDistance) {
+      this._yetiDangerT = 0;
+      return;
+    }
+    const activeSeconds = Math.max(0, this._elapsedSeconds - config.triggerDistance / Math.max(BASE_SPEED, speed));
+    const captureThreshold = Math.max(8, config.captureAfterSeconds - distance / 220);
+    this._yetiDangerT = clamp(activeSeconds / captureThreshold, 0, 1);
+  }
+
+  /** 1 = chain just extended, 0 = window about to expire and reset it. */
+  _updateChainRemainingSolo() {
+    if (!this.player.chainCount) {
+      this._chainRemainingT = 0;
+      return;
+    }
+    const elapsed = performance.now() - this.player._lastRampJumpAtMs;
+    this._chainRemainingT = clamp(1 - elapsed / getChainWindowMs(this.player.momentum), 0, 1);
+  }
+
+  _updateChainRemainingAuthoritative() {
+    if (!this._authState?.chainCount) {
+      this._chainRemainingT = 0;
+      return;
+    }
+    const nowMs = performance.now() - this._startTime;
+    const elapsed = nowMs - this._authState.lastRampJumpAtMs;
+    this._chainRemainingT = clamp(1 - elapsed / getChainWindowMs(this._authState.momentum), 0, 1);
+  }
+
+  _panForObstacleId(obstacleId) {
+    if (!obstacleId) return 0;
+    const obs = this.obstacles.active.find(o => o.id === obstacleId);
+    if (!obs) return 0;
+    return this._panForDx(obs.x - this.player.position.x);
   }
   
   _update(dt) {
@@ -555,6 +757,7 @@ export class Game {
         return;
       }
 
+      if (this.ghostPlayer) this.ghostPlayer.update(dt, performance.now() - this._startTime, visualGroundY);
       this.camera.update(dt, this.player.mesh, Math.max(this.player.speed, 4));
       this.sky?.update(this.threeCamera.position);
       this.mountains?.update(this.threeCamera.position);
@@ -567,10 +770,13 @@ export class Game {
     const pz = this.player.position.z;
     const currentChunk = Math.floor(pz / CHUNK_SIZE);
     
-    // Generate ahead
+    // Generate ahead. Chunks not yet generated when a chain is active get a
+    // ramp density boost - safe here because solo caches each chunk forever
+    // once generated (see Obstacles.chunks), so this can never retroactively
+    // disagree with anything already rendered/collided against.
     for (let i = currentChunk; i <= currentChunk + 5; i++) {
       if (!this.obstacles.chunks.has(i)) {
-        this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
+        this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919), this.player.chainCount > 0);
       }
     }
 
@@ -583,7 +789,22 @@ export class Game {
     const nearby = this.obstacles.getObstaclesNear(pz, 25);
     
     // Update player
-    this.player.update(dt, this.input, nearby);
+    this.player.update(dt, this.input, nearby, this.skillScoring);
+    if (this._ghostRecording) {
+      this._ghostRecording.sampleTimer += dt;
+      if (this._ghostRecording.sampleTimer >= GHOST_SAMPLE_INTERVAL_S) {
+        this._ghostRecording.sampleTimer = 0;
+        this._ghostRecording.keyframes.push({
+          t: Math.round(performance.now() - this._startTime),
+          x: round2(this.player.position.x),
+          y: round2(this.player.position.y),
+          z: round2(this.player.position.z),
+          angle: round3(this.player.angle),
+          airborne: this.player.isAirborne,
+          speed: round2(this.player.speed),
+        });
+      }
+    }
     if (this._spawnProtectionRemaining > 0) {
       this._spawnProtectionRemaining = Math.max(0, this._spawnProtectionRemaining - dt);
     }
@@ -600,12 +821,13 @@ export class Game {
     this._boostHeld = boostHeld;
     
     // Distance and timer
-    const distance = Math.max(0, this.player.position.z - this._startZ);
+    const distance = Math.max(0, this.player.position.z - this._startZ) + this.player.bonusDistance;
     const elapsed = performance.now() - this._startTime;
-    this._scores.set('local', { 
+    this._scores.set('local', {
       id: 'local',
-      name: this.options.playerName || 'You', 
-      distance, 
+      name: this.options.playerName || 'You',
+      distance,
+      bonusDistance: this.player.bonusDistance,
       hp: this.player.hp,
       alive: this.player.isAlive,
       local: true,
@@ -624,30 +846,43 @@ export class Game {
       this.obstacles.getAvoidanceBlockers(pz, 110),
     );
     const yetiNear = this.yeti.isNearPlayer(this.player.position);
-    if (yetiNear && !this._yetiWasNear) this.audio.playYetiRoar();
-    this._yetiWasNear = yetiNear;
     const yetiThreats = this.yeti.getThreats(this.player.position);
+    if (yetiNear && !this._yetiWasNear) {
+      this.audio.playYetiRoar(this._panForDx(yetiThreats[0]?.dx));
+    }
+    this._yetiWasNear = yetiNear;
     this.ui.showYetiWarning(yetiNear);
     this.ui.updateYetiRadar(yetiThreats);
+    this._updateYetiTension(distance);
+    this._updateYetiDangerBonus(dt);
     this.camera.update(dt, this.player.mesh, this.player.speed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, this.player.speed);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
+    this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
+    this.impactParticles.update(dt);
     this.audio.updateContinuous(this.player.speed, this.player.angle, this.player.isAirborne);
-    
+
     // HUD
+    this._updateChainRemainingSolo();
     this.ui.updateHUD(distance, this.player.speed, this.player.hp, {
       isAirborne: this.player.isAirborne,
       graphicsQuality: this.graphicsQuality,
       spawnShieldSeconds: this._spawnProtectionRemaining,
+      chainCount: this.player.chainCount || 0,
+      chainRemainingT: this._chainRemainingT,
+      momentum: this.player.momentum || 0,
+      cleanStreakSeconds: this.player.cleanStreakSeconds || 0,
+      yetiDangerT: this._yetiDangerT || 0,
     });
     
     // Update remote players
     for (const [, rp] of this.remotePlayers) {
       rp.update(dt, visualGroundY);
     }
-    
+    if (this.ghostPlayer) this.ghostPlayer.update(dt, performance.now() - this._startTime, visualGroundY);
+
     // Build player list for HUD
     const allPlayers = [];
     for (const [id, score] of this._scores) {
@@ -725,6 +960,26 @@ export class Game {
         this._authPredictionAccumulator -= SIM_DT;
       }
       this._applyAuthoritativeStateToLocalPlayer(this._getPredictedRenderState(), { dt });
+      // update() (and the lean/squash/limb-animation it drives) never runs in
+      // authoritative multiplayer since movement comes from the shared sim
+      // instead — apply the same presentation-only pass here so it isn't a
+      // static mesh, then re-assert the reconciliation-corrected yaw that
+      // applyPresentation's own rotation.y write would otherwise clobber.
+      this.player.applyPresentation(dt, this.input.lateralAxis);
+      this.player.mesh.rotation.y = -(this.player.angle + this._authVisualAngleCorrection);
+      // Cosmetic-only: real capture/death is server-authoritative (see the
+      // onCapture guard above). This just gives multiplayer runs the same
+      // visible chase presence solo has.
+      this.yeti.update(
+        dt,
+        this.player.position,
+        focusState.distance,
+        visualGroundY,
+        this.obstacles.getAvoidanceBlockers(focusState.z, 110),
+      );
+      this.ui.updateYetiRadar(this.yeti.getThreats(this.player.position));
+      this._updateYetiTension(focusState.distance);
+      this._updateYetiDangerDisplay(focusState.distance, focusState.speed);
     } else {
       this.player.updateDeathAnimation(dt, visualGroundY);
     }
@@ -737,17 +992,25 @@ export class Game {
     this.mountains?.update(this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, focusSpeed);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
+    this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
+    this.impactParticles.update(dt);
     this.audio.updateContinuous(focusState.alive ? focusState.speed : 0, this.player.angle, this.player.isAirborne);
 
     for (const [, rp] of this.remotePlayers) {
       rp.update(dt, visualGroundY);
     }
 
+    this._updateChainRemainingAuthoritative();
     this.ui.updateHUD(focusState.distance, focusState.speed, focusState.hp, {
       isAirborne: focusState.isAirborne,
       graphicsQuality: this.graphicsQuality,
       spawnShieldSeconds: focusState.invincibilityRemaining,
       spectatorTarget: focusState.alive ? '' : (spectator?.score?.name || ''),
+      chainCount: focusState.chainCount || 0,
+      chainRemainingT: this._chainRemainingT,
+      momentum: focusState.momentum || 0,
+      cleanStreakSeconds: focusState.cleanStreakSeconds || 0,
+      yetiDangerT: this._yetiDangerT || 0,
     });
     this.ui.updatePlayerList(this._getScoreList());
     if (performance.now() - this._authLastYetiWarning > 1000) {
@@ -767,9 +1030,10 @@ export class Game {
       32,
       this.obstacleVolume,
       consumedPickupIds,
+      this.difficultyRamp,
     );
     const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
-    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime);
+    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring);
     if (officiallyAliveBeforePrediction && state.alive === false) {
       state.alive = true;
       state.finished = false;
@@ -789,6 +1053,17 @@ export class Game {
       state.y = Math.max(0, state.y + state.jumpVelocityY * residualDt - 0.5 * GRAVITY * residualDt * residualDt);
       return state;
     }
+
+    // Render-only: steer across the residual slice of time since the last
+    // authoritative tick using the latest live input, instead of holding
+    // that tick's angle until the next one lands (~33ms of dead steering
+    // input otherwise). this._authState itself is untouched, so the next
+    // real tick still starts from the true pre-extrapolation angle.
+    state.angle = clamp(
+      state.angle + this.input.lateralAxis * PLAYER_TURN_RATE * residualDt,
+      -PLAYER_MAX_TURN_ANGLE,
+      PLAYER_MAX_TURN_ANGLE,
+    );
 
     state.x = clamp(state.x + Math.sin(state.angle) * state.speed * residualDt, -55, 55);
     state.z += Math.cos(state.angle) * state.speed * residualDt;
@@ -860,6 +1135,15 @@ export class Game {
       airborneFromRamp: player.airborneFromRamp ?? this._authState?.airborneFromRamp ?? false,
       jumpHeld: this._authState?.jumpHeld ?? false,
       lastInputAtMs: this._authState?.lastInputAtMs ?? 0,
+      bonusDistance: player.bonusDistance ?? this._authState?.bonusDistance ?? 0,
+      chainCount: player.chainCount ?? this._authState?.chainCount ?? 0,
+      momentum: player.momentum ?? this._authState?.momentum ?? 0,
+      cleanStreakSeconds: player.cleanStreakSeconds ?? this._authState?.cleanStreakSeconds ?? 0,
+      // Not sent in snapshots (see jumpHeld/lastInputAtMs above) - the skill
+      // scoring window only needs to be locally consistent between real
+      // ticks, and gets corrected like any other prediction error the next
+      // time a snapshot's bonusDistance/distance lands.
+      lastRampJumpAtMs: this._authState?.lastRampJumpAtMs ?? -Infinity,
     };
   }
 
@@ -908,6 +1192,7 @@ export class Game {
         name: player.name || 'Player',
         color: sanitizePlayerColor(player.color),
         distance: player.distance || 0,
+        bonusDistance: player.bonusDistance || 0,
         hp: player.hp,
         alive: player.alive !== false,
         local: player.id === localId,
@@ -969,18 +1254,52 @@ export class Game {
       if (event.socketId !== localId) continue;
       if (event.type === 'hit') {
         this.ui.showHitFeedback();
-        this.audio.playCollision();
+        this.audio.playCollision(this._panForObstacleId(event.obstacleId));
         this.audio.playHeartLost();
+        this.camera.shake(0.35, 0.28);
+        this.triggerHitstop(0.13);
+        this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.3, this.player.position.z, {
+          count: 16,
+          color: [0.42, 0.36, 0.32],
+          speed: 3.2,
+          spread: 1,
+          upBias: 1.6,
+          life: 0.5,
+          groundY: this.player.position.y,
+        });
       } else if (event.type === 'heal') {
         this.ui.showHealFeedback();
       } else if (event.type === 'jump') {
         this.audio.playJump();
       } else if (event.type === 'landing') {
         this.audio.playLand();
+        // The server doesn't report air time/impact speed on this event, so
+        // this uses a fixed moderate intensity rather than the speed-scaled
+        // one solo gets from onJumpLand's airSeconds.
+        this.player.playLandingSquash(0.75);
+        this.camera.shake(0.18, 0.2);
+        this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.05, this.player.position.z, {
+          count: 12,
+          color: [0.5, 0.82, 1],
+          speed: 2.2,
+          spread: 0.9,
+          upBias: 1.3,
+          life: 0.4,
+          groundY: this.player.position.y,
+        });
+      } else if (event.type === 'near-miss') {
+        this.ui.showNearMissFeedback(event.bonus ?? 1.5);
+        this.audio.playNearMiss(this._panForObstacleId(event.obstacleId));
+      } else if (event.type === 'jump-chain') {
+        this.ui.showJumpChainFeedback(event.bonus ?? 4, event.chainCount ?? 0);
+        this.audio.playJumpChain();
       } else if (event.type === 'yeti-warning') {
         this._authLastYetiWarning = performance.now();
         this.ui.showYetiWarning(true);
-        if (!this._yetiWasNear) this.audio.playYetiRoar();
+        if (!this._yetiWasNear) {
+          const nearestThreat = this.yeti.getThreats(this.player.position)[0];
+          this.audio.playYetiRoar(this._panForDx(nearestThreat?.dx));
+        }
         this._yetiWasNear = true;
       } else if (event.type === 'yeti-capture') {
         this._authLastYetiWarning = performance.now();
@@ -1010,6 +1329,7 @@ export class Game {
       name: player.name || this.options.playerName || 'You',
       color: sanitizePlayerColor(player.color || this.playerColor),
       distance: this._gameOverDistance,
+      bonusDistance: player.bonusDistance || 0,
       hp: this.player.hp,
       alive: false,
       local: true,
@@ -1055,7 +1375,12 @@ export class Game {
     this._finalGameOverShown = true;
     const distance = this._gameOverDistance || Math.max(0, this.player.position.z - this._startZ);
     window.setTimeout(() => {
-      this.ui.showGameOver(distance, this._getScoreList());
+      this.ui.showGameOver(distance, this._getScoreList(), {
+        gameMode: this.gameMode,
+        difficulty: this.difficulty,
+        multiplayer: !!this.options.multiplayer,
+        ghostSaved: this._pendingGhostSaved,
+      });
     }, delayMs);
   }
 
@@ -1100,6 +1425,11 @@ export class Game {
       graphicsQuality: this.graphicsQuality,
       spawnShieldSeconds: 0,
       spectatorTarget: target?.score?.name || '',
+      chainCount: 0,
+      chainRemainingT: 0,
+      momentum: 0,
+      cleanStreakSeconds: 0,
+      yetiDangerT: 0,
     });
     this.ui.updatePlayerList(this._getScoreList());
 
@@ -1335,7 +1665,7 @@ export class Game {
     this.audio.stopAll();
     this.audio.playGameOver();
     
-    const distance = Math.max(0, this.player.position.z - this._startZ);
+    const distance = Math.max(0, this.player.position.z - this._startZ) + this.player.bonusDistance;
     this._gameOverDistance = distance;
     this._gameOverTime = performance.now();
     this._scores.set('local', {
@@ -1343,21 +1673,37 @@ export class Game {
       name: this.options.playerName || 'You',
       color: this.playerColor,
       distance,
+      bonusDistance: this.player.bonusDistance,
       hp: this.player.hp,
       alive: false,
       local: true,
       time: Math.floor((performance.now() - this._startTime) / 1000),
     });
     const scores = Array.from(this._scores.values());
-    this.options.onRunComplete?.({
+    const ghostRecord = this._ghostRecording ? {
+      version: 1,
+      mode: this.gameMode,
+      difficulty: this.difficulty,
+      seed: this.seed,
+      obstacleVolume: this.obstacleVolume,
+      difficultyRamp: this.difficultyRamp,
+      skillScoring: this.skillScoring,
+      color: this.playerColor,
+      distance,
+      recordedAt: Date.now(),
+      keyframes: this._ghostRecording.keyframes,
+    } : null;
+    const runResult = this.options.onRunComplete?.({
       distance,
       scores,
       multiplayer: !!this.options.multiplayer,
       gameMode: this.gameMode,
       playerName: this.options.playerName || 'Skier',
       difficulty: this.difficulty,
+      ghostRecord,
     });
-    
+    this._pendingGhostSaved = !!runResult?.ghostSaved;
+
     if (this.socket && this.options.multiplayer) {
       this.socket.sendGameOver(distance);
     }
@@ -1399,6 +1745,7 @@ export class Game {
     this.player.dispose();
     this.snow.dispose();
     this.skiTrail.dispose();
+    this.impactParticles.dispose();
     this.audio.dispose();
     this.yeti.dispose();
     this.sky?.dispose();
@@ -1412,6 +1759,7 @@ export class Game {
     this.projectiles.length = 0;
     for (const [, rp] of this.remotePlayers) rp.dispose();
     this.remotePlayers.clear();
+    this.ghostPlayer?.dispose();
     if (this.socket) {
       this.socket.off('player:update', this._boundRemoteUpdate);
       this.socket.off('player:left', this._boundPlayerLeft);

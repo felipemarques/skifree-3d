@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Play, Save, Settings, Trophy, Users } from 'lucide-react';
+import { Ghost, Play, Save, Settings, Trophy, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Brand, ScreenFrame, Section } from './ScreenFrame';
 import type { GameController } from '@/app/gameController';
 import type { GameMode } from '@/types/app';
+import { ghostStore } from '@/utils/GhostStore';
 
 interface TitleScreenProps {
   controller: GameController;
@@ -17,6 +18,8 @@ export function TitleScreen({ controller, playerName, defaultGameMode }: TitleSc
   const [name, setName] = useState(playerName);
   const [roomCode, setRoomCode] = useState('');
   const [gameMode, setGameMode] = useState<GameMode>(defaultGameMode || 'classic');
+  const difficulty = controller.getSettingsValues().difficulty;
+  const ghost = ghostStore.getBest(gameMode, difficulty);
 
   useEffect(() => setName(playerName), [playerName]);
 
@@ -41,6 +44,12 @@ export function TitleScreen({ controller, playerName, defaultGameMode }: TitleSc
             <Play className="h-4 w-4" />
             Play Solo
           </Button>
+          {ghost && (
+            <Button variant="secondary" type="button" onClick={() => controller.startGhostRace(gameMode, difficulty)}>
+              <Ghost className="h-4 w-4" />
+              Race Ghost
+            </Button>
+          )}
         </div>
       </Section>
 

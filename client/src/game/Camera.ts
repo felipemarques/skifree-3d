@@ -1,6 +1,10 @@
 // @ts-nocheck
 import * as THREE from 'three';
 
+const FOV_MAX_SPEED = 28; // matches BOOST_SPEED in Player.ts / shared sim
+const FOV_WIDEN_DEGREES = 7;
+const FOV_SMOOTHING_RATE = 3;
+
 export class GameCamera {
   constructor(camera) {
     this.camera = camera;
@@ -9,6 +13,18 @@ export class GameCamera {
     this._lookAheadDist = 5;
     this._smoothPos = null;
     this._smoothLook = null;
+    this._shakeTime = 0;
+    this._shakeDuration = 0;
+    this._shakeIntensity = 0;
+    this._baseFov = camera.fov;
+    this._fov = camera.fov;
+  }
+
+  /** Short decaying positional shake — landings, collisions, boost kick. */
+  shake(intensity = 0.3, duration = 0.25) {
+    this._shakeTime = duration;
+    this._shakeDuration = duration;
+    this._shakeIntensity = intensity;
   }
 
   update(dt, playerMesh, playerSpeed) {
@@ -41,11 +57,34 @@ export class GameCamera {
     );
 
     this.camera.position.copy(this._smoothPos);
+
+    if (this._shakeTime > 0) {
+      this._shakeTime = Math.max(0, this._shakeTime - dt);
+      const falloff = this._shakeDuration > 0 ? this._shakeTime / this._shakeDuration : 0;
+      const magnitude = this._shakeIntensity * falloff * falloff;
+      this.camera.position.x += (Math.random() - 0.5) * 2 * magnitude;
+      this.camera.position.y += (Math.random() - 0.5) * 2 * magnitude;
+    }
+
     this.camera.lookAt(this._smoothLook);
+
+    // Widen slightly at speed for a sense of velocity, same trick as a
+    // dolly zoom - purely cosmetic, no effect on gameplay framing logic.
+    const speed01 = THREE.MathUtils.clamp((playerSpeed || 0) / FOV_MAX_SPEED, 0, 1);
+    const targetFov = this._baseFov + speed01 * FOV_WIDEN_DEGREES;
+    this._fov = THREE.MathUtils.lerp(this._fov, targetFov, Math.min(1, FOV_SMOOTHING_RATE * dt));
+    if (Math.abs(this.camera.fov - this._fov) > 0.01) {
+      this.camera.fov = this._fov;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   reset() {
     this._smoothPos = null;
     this._smoothLook = null;
+    this._shakeTime = 0;
+    this._fov = this._baseFov;
+    this.camera.fov = this._baseFov;
+    this.camera.updateProjectionMatrix();
   }
 }

@@ -8,6 +8,8 @@ const DEFAULT_ROOM_SETTINGS = {
   difficulty: 'normal',
   yetiStartMode: 'distance',
   obstacleVolume: 1,
+  difficultyRamp: false,
+  skillScoring: false,
 };
 const VALID_GAME_MODES = new Set(['classic', 'sky_mario']);
 const VALID_DIFFICULTIES = new Set(['easy', 'normal', 'hard', 'extreme']);
@@ -32,6 +34,8 @@ function sanitizeRoomSettings(input = {}) {
     difficulty: VALID_DIFFICULTIES.has(input.difficulty) ? input.difficulty : DEFAULT_ROOM_SETTINGS.difficulty,
     yetiStartMode: VALID_YETI_START_MODES.has(input.yetiStartMode) ? input.yetiStartMode : DEFAULT_ROOM_SETTINGS.yetiStartMode,
     obstacleVolume: clamp(Number(input.obstacleVolume ?? DEFAULT_ROOM_SETTINGS.obstacleVolume) || 0, 0, 2),
+    difficultyRamp: input.difficultyRamp === undefined ? DEFAULT_ROOM_SETTINGS.difficultyRamp : !!input.difficultyRamp,
+    skillScoring: input.skillScoring === undefined ? DEFAULT_ROOM_SETTINGS.skillScoring : !!input.skillScoring,
   };
 }
 

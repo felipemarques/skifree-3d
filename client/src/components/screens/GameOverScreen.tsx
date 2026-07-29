@@ -1,13 +1,18 @@
-import { Home, RotateCcw, Trophy } from 'lucide-react';
+import { Ghost, Home, RotateCcw, Trophy } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { GameController } from '@/app/gameController';
 import type { GameOverState } from '@/types/app';
+import { ghostStore } from '@/utils/GhostStore';
 import { ScreenFrame } from './ScreenFrame';
 
 export function GameOverScreen({ controller, gameOver }: { controller: GameController; gameOver: GameOverState }) {
   const scores = gameOver.scores.length > 1
     ? [...gameOver.scores].sort((a, b) => (b.distance || 0) - (a.distance || 0))
     : [];
+  const localScore = gameOver.scores.find(score => score.local);
+  const bonusDistance = localScore?.bonusDistance || 0;
+  const baseDistance = Math.max(0, gameOver.distance - bonusDistance);
+  const ghost = !gameOver.multiplayer ? ghostStore.getBest(gameOver.gameMode, gameOver.difficulty) : null;
 
   return (
     <ScreenFrame panelClassName="text-center">
@@ -19,6 +24,11 @@ export function GameOverScreen({ controller, gameOver }: { controller: GameContr
       <div className="text-[clamp(48px,12vw,78px)] font-black text-[#ff6b77] drop-shadow-[0_12px_40px_rgba(45,127,255,0.28)]">
         {Math.round(gameOver.distance)} m
       </div>
+      {bonusDistance > 0 && (
+        <div className="text-xs font-bold text-[#aab9cf]">
+          {Math.round(baseDistance)} m skied <span className="text-cyan-300">+ {Math.round(bonusDistance)} m skill bonus</span>
+        </div>
+      )}
       {!!scores.length && (
         <div className="grid gap-1 text-sm text-[#dbeaff]">
           <div className="mb-1 text-xs font-black uppercase tracking-[0.12em] text-[#aab9cf]">Room Scores</div>
@@ -28,6 +38,15 @@ export function GameOverScreen({ controller, gameOver }: { controller: GameContr
             </div>
           ))}
         </div>
+      )}
+      {gameOver.ghostSaved && (
+        <div className="text-xs font-bold text-cyan-300">New ghost record saved!</div>
+      )}
+      {ghost && (
+        <Button type="button" onClick={() => controller.startGhostRace(gameOver.gameMode, gameOver.difficulty)}>
+          <Ghost className="h-4 w-4" />
+          Race Ghost
+        </Button>
       )}
       <div className="grid grid-cols-3 gap-2 max-sm:grid-cols-1">
         <Button type="button" onClick={() => controller.playAgain()}>

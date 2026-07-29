@@ -10,6 +10,8 @@ export const MANUAL_JUMP_VELOCITY = 7.2;
 export const RAMP_JUMP_MIN_VELOCITY = 4.8;
 export const RAMP_JUMP_MAX_VELOCITY = 9.6;
 export const GRAVITY = 18;
+export const PLAYER_TURN_RATE = 1.8;
+export const PLAYER_MAX_TURN_ANGLE = Math.PI * 0.42;
 export const INVINCIBILITY_TIME = 1.8;
 export const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
 export const PLAYER_COLOR_OPTIONS = [
@@ -54,6 +56,10 @@ export class FixedStepClock {
 }
 
 const TRACK_LIMIT = 52;
+// Ramps rotate through these lanes (by chunk + spawn index) instead of a
+// pure uniform-random x, so consecutive ramps are never side-by-side and
+// chaining requires actually crossing the track rather than holding a line.
+const RAMP_LANES: [number, number][] = [[-34, -14], [-9, 9], [14, 34]];
 const OBSTACLES_PER_CHUNK = 18;
 const RAMPS_PER_CHUNK = 2;
 const HOLES_PER_CHUNK = 2;
@@ -63,6 +69,31 @@ const PLAYER_HALF_W = 0.35;
 const PLAYER_HALF_D = 0.55;
 const MULTIPLAYER_SPAWN_SPACING = 8;
 const MULTIPLAYER_SPAWN_JITTER = 1.15;
+const NEAR_MISS_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree', 'npc', 'dog', 'bear']);
+const NEAR_MISS_MARGIN = 0.4;
+const NEAR_MISS_MIN_BONUS = 0.5;
+const NEAR_MISS_MAX_BONUS = 3;
+const JUMP_CHAIN_WINDOW_MS = 4500;
+const JUMP_CHAIN_BONUS_DISTANCE = 4;
+// Momentum: builds while sustaining speed, decays (faster than it builds)
+// when braking - a continuous "how committed are you right now" value, 0..1.
+const MOMENTUM_BUILD_RATE = 0.6;
+const MOMENTUM_DECAY_RATE = 1.4;
+const MOMENTUM_BONUS_THRESHOLD = 0.5;
+const MOMENTUM_MAX_BONUS_RATE = 0.3;
+// Staying fast pays twice: momentum both boosts distance directly (above)
+// and grants extra grace time to reach the next ramp before the chain
+// resets, up to 60% longer at full momentum.
+const JUMP_CHAIN_MOMENTUM_WINDOW_BONUS = 0.6;
+// Clean streak: a slower-building, whole-run version of the same idea -
+// ramps up over CLEAN_STREAK_MAX_SECONDS of no hits, resets hard on one.
+const CLEAN_STREAK_MAX_SECONDS = 45;
+const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
+// Yeti proximity: rewards surviving deep in the danger window instead of
+// only punishing capture - see maybeApplyYetiCapture, which already
+// computes exactly how close a player is to being caught for the real
+// capture decision, reused here as a continuous bonus signal.
+const YETI_PROXIMITY_BONUS_RATE = 3;
 const MULTIPLAYER_SPAWN_LIMIT = 34;
 
 export type GameMode = 'classic' | 'sky_mario';
@@ -74,6 +105,8 @@ export interface RoomSettings {
   difficulty: Difficulty;
   yetiStartMode: YetiStartMode;
   obstacleVolume: number;
+  difficultyRamp?: boolean;
+  skillScoring?: boolean;
 }
 
 export interface ControlInput {
@@ -179,13 +212,18 @@ export interface PlayerSimState {
   jumpHeld: boolean;
   invincibilityRemaining: number;
   distance: number;
+  bonusDistance: number;
+  lastRampJumpAtMs: number;
+  chainCount: number;
+  momentum: number;
+  cleanStreakSeconds: number;
   lastProcessedInputSeq: number;
   lastInputAtMs: number;
   deathKind?: string;
 }
 
 export interface SimEvent {
-  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture';
+  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -193,6 +231,8 @@ export interface SimEvent {
   hp?: number;
   distance?: number;
   kind?: string;
+  chainCount?: number;
+  bonus?: number;
 }
 
 export interface RoomSnapshotPlayer {
@@ -209,6 +249,10 @@ export interface RoomSnapshotPlayer {
   alive: boolean;
   finished: boolean;
   distance: number;
+  bonusDistance?: number;
+  chainCount?: number;
+  momentum?: number;
+  cleanStreakSeconds?: number;
   isAirborne: boolean;
   airborneFromRamp?: boolean;
   jumpVelocityY?: number;
@@ -345,12 +389,42 @@ function createObstacle(id: string, type: ObstacleType, chunkIndex: number, zBas
   };
 }
 
-export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set()) {
+const DIFFICULTY_RAMP_DISTANCE = 1400;
+const DIFFICULTY_RAMP_MIN = 0.6;
+const DIFFICULTY_RAMP_MAX = 1.3;
+
+export function getRampedHazardVolume(baseVolume: number, chunkIndex: number, difficultyRamp: boolean) {
+  if (!difficultyRamp) return baseVolume;
+  const distance = Math.max(0, chunkIndex) * CHUNK_SIZE;
+  const rampT = clamp(distance / DIFFICULTY_RAMP_DISTANCE, 0, 1);
+  const rampMultiplier = DIFFICULTY_RAMP_MIN + rampT * (DIFFICULTY_RAMP_MAX - DIFFICULTY_RAMP_MIN);
+  return clamp(baseVolume * rampMultiplier, 0, 2);
+}
+
+// Deterministic, distance-only stand-in for "more ramps while chaining" in
+// multiplayer: a live per-player signal can't safely drive this path (it's
+// recomputed from scratch every tick and must stay identical between the
+// server and every client - see the ramps loop below), so instead ramp
+// availability itself grows with distance, same mechanism as the hazard
+// ramp above but never below the base volume.
+export function getRampedRampVolume(baseVolume: number, chunkIndex: number, difficultyRamp: boolean) {
+  if (!difficultyRamp) return baseVolume;
+  const distance = Math.max(0, chunkIndex) * CHUNK_SIZE;
+  const rampT = clamp(distance / DIFFICULTY_RAMP_DISTANCE, 0, 1);
+  return clamp(baseVolume * (1 + rampT * 0.6), 0, 2);
+}
+
+export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false) {
   const rng = new SimRandom((seed + chunkIndex * 7919) >>> 0);
   const zBase = chunkIndex * CHUNK_SIZE;
   const records: ObstacleRecord[] = [];
   const volume = clamp(Number(obstacleVolume) || 0, 0, 2);
   if (volume <= 0) return records;
+  // Only the hazard categories (static obstacles, holes) ramp with distance;
+  // ramps and hearts stay on the base volume so the difficulty ramp doesn't
+  // also strip away the tools that make the added hazards survivable.
+  const hazardVolume = getRampedHazardVolume(volume, chunkIndex, difficultyRamp);
+  const rampVolume = getRampedRampVolume(volume, chunkIndex, difficultyRamp);
 
   const trySpawn = (type: ObstacleType, xRange: [number, number], zRange: [number, number], options: { attempts?: number; padding?: number; heartSpacing?: boolean } = {}) => {
     const attempts = options.attempts ?? 12;
@@ -364,7 +438,7 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
     return false;
   };
 
-  for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, volume); i++) {
+  for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume); i++) {
     const r = rng.next();
     if (r < 0.44) trySpawn('tree', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
     else if (r < 0.62) trySpawn('fallen_tree', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
@@ -372,11 +446,12 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
     else trySpawn('stump', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
   }
 
-  for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, volume, 1); i++) {
-    trySpawn('ramp', [-36, 36], [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+  for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume, 1); i++) {
+    const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+    trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
   }
 
-  for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, volume); i++) {
+  for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume); i++) {
     trySpawn('hole', [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
   }
 
@@ -387,12 +462,12 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   return records;
 }
 
-export function getGameplayObstaclesNear(seed: number, z: number, radius: number, obstacleVolume: number, consumedPickupIds: Set<string>) {
+export function getGameplayObstaclesNear(seed: number, z: number, radius: number, obstacleVolume: number, consumedPickupIds: Set<string>, difficultyRamp = false) {
   const currentChunk = Math.floor(z / CHUNK_SIZE);
   const result: ObstacleRecord[] = [];
   for (let chunk = currentChunk - 1; chunk <= currentChunk + 2; chunk++) {
     if (chunk < 0) continue;
-    for (const obs of generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds)) {
+    for (const obs of generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds, difficultyRamp)) {
       if (consumedPickupIds.has(obs.id)) continue;
       if (Math.abs(obs.z - z) <= radius) result.push(obs);
     }
@@ -443,6 +518,11 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     jumpHeld: false,
     invincibilityRemaining: MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS,
     distance: 0,
+    bonusDistance: 0,
+    lastRampJumpAtMs: -Infinity,
+    chainCount: 0,
+    momentum: 0,
+    cleanStreakSeconds: 0,
     lastProcessedInputSeq: 0,
     lastInputAtMs: 0,
   };
@@ -479,6 +559,9 @@ function getRampJumpVelocity(speed: number) {
 function damagePlayer(state: PlayerSimState, obstacle: ObstacleRecord, impactSpeed: number, events: SimEvent[]) {
   if (state.invincibilityRemaining > 0 || !state.alive) return;
   state.hp = Math.max(0, state.hp - 1);
+  state.chainCount = 0;
+  state.momentum = 0;
+  state.cleanStreakSeconds = 0;
   const baseEvent = {
     playerId: state.playerId,
     socketId: state.id,
@@ -512,6 +595,10 @@ function resolveCollision(px: number, pz: number, obs: ObstacleRecord) {
   return { x: px, z: pz + overlapZ * (Math.sign(pz - obs.z) || -1) };
 }
 
+export function getChainWindowMs(momentum: number): number {
+  return JUMP_CHAIN_WINDOW_MS * (1 + clamp(momentum, 0, 1) * JUMP_CHAIN_MOMENTUM_WINDOW_BONUS);
+}
+
 export function simulatePlayerTick(
   state: PlayerSimState,
   input: ControlInput,
@@ -519,10 +606,12 @@ export function simulatePlayerTick(
   obstacles: ObstacleRecord[],
   consumedPickupIds: Set<string>,
   nowMs: number,
+  skillScoring = false,
 ): SimEvent[] {
   const events: SimEvent[] = [];
   if (!state.alive) return events;
 
+  const previousZ = state.z;
   const cleanInput = sanitizeControlInput(input);
   state.lastProcessedInputSeq = Math.max(state.lastProcessedInputSeq, cleanInput.seq);
   state.lastInputAtMs = nowMs;
@@ -531,9 +620,13 @@ export function simulatePlayerTick(
     state.invincibilityRemaining = Math.max(0, state.invincibilityRemaining - dt);
   }
 
+  if (skillScoring && state.chainCount > 0 && nowMs - state.lastRampJumpAtMs > getChainWindowMs(state.momentum)) {
+    state.chainCount = 0;
+  }
+
   const steer = state.isAirborne ? 0 : cleanInput.lateralAxis;
   if (!state.isAirborne) {
-    state.angle = clamp(state.angle + steer * 1.8 * dt, -Math.PI * 0.42, Math.PI * 0.42);
+    state.angle = clamp(state.angle + steer * PLAYER_TURN_RATE * dt, -PLAYER_MAX_TURN_ANGLE, PLAYER_MAX_TURN_ANGLE);
     let targetSpeed = BASE_SPEED;
     if (cleanInput.boost) targetSpeed = BOOST_SPEED;
     if (cleanInput.brake) targetSpeed = MIN_SPEED;
@@ -553,6 +646,7 @@ export function simulatePlayerTick(
 
   let newX = clamp(state.x + moveX * dt, -55, 55);
   let newZ = state.z + moveZ * dt;
+  const hitObstacleIds = new Set<string>();
 
   for (const obs of obstacles) {
     if (consumedPickupIds.has(obs.id)) continue;
@@ -571,6 +665,15 @@ export function simulatePlayerTick(
       if (!state.isAirborne) {
         if (triggerJump(state, getRampJumpVelocity(state.speed), 'ramp')) {
           events.push({ type: 'jump', playerId: state.playerId, socketId: state.id, obstacleId: obs.id, obstacleType: obs.type, distance: state.distance });
+          if (skillScoring) {
+            const chained = nowMs - state.lastRampJumpAtMs <= getChainWindowMs(state.momentum);
+            state.chainCount = chained ? state.chainCount + 1 : 1;
+            if (chained) {
+              state.bonusDistance += JUMP_CHAIN_BONUS_DISTANCE;
+              events.push({ type: 'jump-chain', playerId: state.playerId, socketId: state.id, obstacleId: obs.id, obstacleType: obs.type, distance: state.distance, chainCount: state.chainCount });
+            }
+            state.lastRampJumpAtMs = nowMs;
+          }
         }
       }
       continue;
@@ -581,6 +684,7 @@ export function simulatePlayerTick(
       newX = resolved.x;
       newZ = resolved.z;
       damagePlayer(state, obs, Math.hypot(state.airVelocityX, state.airVelocityZ), events);
+      hitObstacleIds.add(obs.id);
       state.airVelocityX *= 0.18;
       state.airVelocityZ *= 0.18;
       state.jumpVelocityY = Math.min(state.jumpVelocityY, 0.5);
@@ -599,10 +703,52 @@ export function simulatePlayerTick(
     newX = resolved.x;
     newZ = resolved.z;
     damagePlayer(state, obs, state.speed, events);
+    hitObstacleIds.add(obs.id);
   }
 
   state.x = newX;
   state.z = newZ;
+
+  if (skillScoring && !state.isAirborne) {
+    for (const obs of obstacles) {
+      if (!NEAR_MISS_TYPES.has(obs.type)) continue;
+      if (hitObstacleIds.has(obs.id) || consumedPickupIds.has(obs.id)) continue;
+      // Fires once, exactly as the obstacle's z crosses from ahead to
+      // behind the player this tick - the player only ever moves forward,
+      // so a given obstacle can only cross once per run.
+      if (!(obs.z >= previousZ && obs.z < state.z)) continue;
+      const lateralGap = Math.abs(state.x - obs.x) - (PLAYER_HALF_W + obs.halfW);
+      if (lateralGap < 0 || lateralGap > NEAR_MISS_MARGIN) continue;
+      // 1 = grazed the edge of the obstacle, 0 = right at the edge of the
+      // near-miss margin - the closer the cut, the bigger the reward.
+      const closenessT = 1 - lateralGap / NEAR_MISS_MARGIN;
+      const speed01 = clamp(state.speed / BOOST_SPEED, 0, 1);
+      const bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+      state.bonusDistance += bonus;
+      events.push({ type: 'near-miss', playerId: state.playerId, socketId: state.id, obstacleId: obs.id, obstacleType: obs.type, distance: state.distance, bonus });
+    }
+  }
+
+  if (skillScoring && state.alive) {
+    const speed01 = clamp((state.speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
+    const momentumTarget = state.isAirborne ? state.momentum : speed01;
+    const momentumRate = momentumTarget > state.momentum ? MOMENTUM_BUILD_RATE : MOMENTUM_DECAY_RATE;
+    state.momentum = clamp(state.momentum + (momentumTarget - state.momentum) * clamp(momentumRate * dt, 0, 1), 0, 1);
+
+    state.cleanStreakSeconds += dt;
+
+    const distanceThisTick = Math.max(0, state.z - previousZ);
+    if (distanceThisTick > 0) {
+      if (state.momentum > MOMENTUM_BONUS_THRESHOLD) {
+        const momentumT = (state.momentum - MOMENTUM_BONUS_THRESHOLD) / (1 - MOMENTUM_BONUS_THRESHOLD);
+        state.bonusDistance += distanceThisTick * momentumT * MOMENTUM_MAX_BONUS_RATE;
+      }
+      const streakT = clamp(state.cleanStreakSeconds / CLEAN_STREAK_MAX_SECONDS, 0, 1);
+      if (streakT > 0) {
+        state.bonusDistance += distanceThisTick * streakT * CLEAN_STREAK_MAX_BONUS_RATE;
+      }
+    }
+  }
 
   if (state.isAirborne) {
     state.airTime += dt;
@@ -620,7 +766,7 @@ export function simulatePlayerTick(
     }
   }
 
-  state.distance = Math.max(0, state.z - state.startZ);
+  state.distance = Math.max(0, state.z - state.startZ) + state.bonusDistance;
   return events;
 }
 
@@ -642,6 +788,9 @@ export function applyPlayerCollision(a: PlayerSimState, b: PlayerSimState): SimE
   for (const state of [a, b]) {
     if (state.invincibilityRemaining > 0) continue;
     state.hp = Math.max(0, state.hp - 1);
+    state.chainCount = 0;
+    state.momentum = 0;
+    state.cleanStreakSeconds = 0;
     if (state.hp <= 0) {
       state.alive = false;
       state.finished = true;
@@ -671,21 +820,36 @@ export function getYetiConfig(settings: RoomSettings) {
   };
 }
 
-export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSettings, roomTimeMs: number, events: SimEvent[]) {
+export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSettings, roomTimeMs: number, events: SimEvent[], dt = 0, skillScoring = false) {
   if (!state.alive) return;
   if (settings.yetiStartMode === 'disabled') return;
   const config = getYetiConfig(settings);
   if (state.distance < config.triggerDistance) return;
 
   const activeSeconds = Math.max(0, roomTimeMs / 1000 - config.triggerDistance / Math.max(BASE_SPEED, state.speed));
-  if (activeSeconds > Math.max(8, config.captureAfterSeconds - state.distance / 220)) {
+  const captureThreshold = Math.max(8, config.captureAfterSeconds - state.distance / 220);
+  if (activeSeconds > captureThreshold) {
     state.alive = false;
     state.finished = true;
     state.deathKind = 'yeti';
     events.push({ type: 'yeti-capture', playerId: state.playerId, socketId: state.id, kind: 'yeti', distance: state.distance });
     events.push({ type: 'death', playerId: state.playerId, socketId: state.id, kind: 'yeti', distance: state.distance, hp: state.hp });
-  } else if (activeSeconds > Math.max(2, config.captureAfterSeconds * 0.55)) {
+    return;
+  }
+
+  if (activeSeconds > Math.max(2, config.captureAfterSeconds * 0.55)) {
     events.push({ type: 'yeti-warning', playerId: state.playerId, socketId: state.id, distance: state.distance });
+  }
+
+  // Danger bonus: rewards surviving deep in the chase instead of only
+  // punishing capture. Reuses the exact same activeSeconds/captureThreshold
+  // that decides real capture above, so it's fully authoritative - never a
+  // separate/guessable signal.
+  if (skillScoring && dt > 0) {
+    const dangerT = clamp(activeSeconds / captureThreshold, 0, 1);
+    if (dangerT > 0) {
+      state.bonusDistance += dt * dangerT * YETI_PROXIMITY_BONUS_RATE;
+    }
   }
 }
 
@@ -704,6 +868,10 @@ export function toSnapshotPlayer(state: PlayerSimState): RoomSnapshotPlayer {
     alive: state.alive,
     finished: state.finished,
     distance: state.distance,
+    bonusDistance: state.bonusDistance,
+    chainCount: state.chainCount,
+    momentum: state.momentum,
+    cleanStreakSeconds: state.cleanStreakSeconds,
     isAirborne: state.isAirborne,
     airborneFromRamp: state.airborneFromRamp,
     jumpVelocityY: state.jumpVelocityY,

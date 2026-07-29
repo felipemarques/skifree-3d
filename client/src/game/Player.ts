@@ -19,6 +19,30 @@ const STUCK_Z_THRESHOLD = 0.8;
 const DEATH_ANIMATION_DURATION = 1.75;
 const YETI_CAPTURE_ANIMATION_DURATION = 2.15;
 const DEATH_GROUND_CLEARANCE = 0.055;
+const LEAN_STRENGTH = 0.38;
+// Mirrors the near-miss/jump-chain skill scoring in shared/AuthoritativeSim.ts
+// so solo play means the same thing as the multiplayer lobby option.
+const NEAR_MISS_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree', 'npc', 'dog', 'bear']);
+const NEAR_MISS_MARGIN = 0.4;
+const NEAR_MISS_MIN_BONUS = 0.5;
+const NEAR_MISS_MAX_BONUS = 3;
+const JUMP_CHAIN_WINDOW_MS = 4500;
+const JUMP_CHAIN_BONUS_DISTANCE = 4;
+const MOMENTUM_BUILD_RATE = 0.6;
+const MOMENTUM_DECAY_RATE = 1.4;
+const MOMENTUM_BONUS_THRESHOLD = 0.5;
+const MOMENTUM_MAX_BONUS_RATE = 0.3;
+// Mirrors getChainWindowMs in shared/AuthoritativeSim.ts.
+const JUMP_CHAIN_MOMENTUM_WINDOW_BONUS = 0.6;
+const CLEAN_STREAK_MAX_SECONDS = 45;
+const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
+const YETI_PROXIMITY_BONUS_RATE = 3;
+const YETI_DANGER_RADIUS = 16;
+const LANDING_SQUASH_DURATION = 0.22;
+
+function getChainWindowMs(momentum) {
+  return JUMP_CHAIN_WINDOW_MS * (1 + THREE.MathUtils.clamp(momentum, 0, 1) * JUMP_CHAIN_MOMENTUM_WINDOW_BONUS);
+}
 
 function getDeathKindFromObstacle(type) {
   if (type === 'hole') return 'hole';
@@ -99,6 +123,9 @@ export class Player {
 
     this._leanTarget = 0;
     this._lean = 0;
+    this._lastLeanAngle = 0;
+    this._squashTimer = 0;
+    this._squashStrength = 0;
     this._jumpHeld = false;
     this._holeFallTimer = 0;
     this._holeFallDuration = 0.42;
@@ -109,12 +136,20 @@ export class Player {
     this._unstucking = false;
     this._unstuckTimer = 0;
 
+    this.bonusDistance = 0;
+    this._lastRampJumpAtMs = -Infinity;
+    this.chainCount = 0;
+    this.momentum = 0;
+    this.cleanStreakSeconds = 0;
+
     this.onHit = null;
     this.onDie = null;
     this.onJumpLand = null;
     this.onJumpStart = null;
     this.onUnstuck = null;
     this.onHeal = null;
+    this.onNearMiss = null;
+    this.onJumpChain = null;
   }
 
   get x() { return this.position.x; }
@@ -140,6 +175,11 @@ export class Player {
     });
   }
 
+  playLandingSquash(strength = 1) {
+    this._squashTimer = LANDING_SQUASH_DURATION;
+    this._squashStrength = THREE.MathUtils.clamp(strength, 0, 1.4);
+  }
+
   unstuck() {
     if (!this.isAlive) return;
 
@@ -158,6 +198,7 @@ export class Player {
     this._holeFallTimer = 0;
     this._stuckTimer = 0;
     this._lastZ = this.position.z;
+    this._lastLeanAngle = this.angle;
 
     this._unstucking = true;
     this._unstuckTimer = 0;
@@ -165,10 +206,16 @@ export class Player {
     if (this.onUnstuck) this.onUnstuck();
   }
 
-  update(dt, input, obstacles) {
+  update(dt, input, obstacles, skillScoring = false) {
     if (!this.isAlive) {
       this.updateDeathAnimation(dt);
       return;
+    }
+
+    const previousZ = this.position.z;
+
+    if (skillScoring && this.chainCount > 0 && performance.now() - this._lastRampJumpAtMs > getChainWindowMs(this.momentum)) {
+      this.chainCount = 0;
     }
 
     if (this._isInvincible) {
@@ -222,12 +269,22 @@ export class Player {
 
     let hitSomething = false;
     let hitContext = null;
+    const hitObstacles = skillScoring ? new Set() : null;
     for (const obs of obstacles) {
       if (obs.dead) continue;
 
       if (obs.type === 'ramp') {
         if (!this.isAirborne && this._collidesAABB(newX, newZ, obs)) {
+          const chained = skillScoring && (performance.now() - this._lastRampJumpAtMs <= getChainWindowMs(this.momentum));
           this._triggerJump(this._getRampJumpVelocity(), 'ramp');
+          if (skillScoring) {
+            this.chainCount = chained ? this.chainCount + 1 : 1;
+            if (chained) {
+              this.bonusDistance += JUMP_CHAIN_BONUS_DISTANCE;
+              if (this.onJumpChain) this.onJumpChain(JUMP_CHAIN_BONUS_DISTANCE, this.chainCount);
+            }
+            this._lastRampJumpAtMs = performance.now();
+          }
         }
         continue;
       }
@@ -256,6 +313,7 @@ export class Player {
           this.speed *= 0.35;
           hitSomething = true;
           hitContext = { type: obs.type, obstacle: obs, impactSpeed };
+          if (hitObstacles) hitObstacles.add(obs);
         }
         continue;
       }
@@ -283,11 +341,15 @@ export class Player {
         this.speed *= 0.35;
         hitSomething = true;
         hitContext = { type: obs.type, obstacle: obs, impactSpeed };
+        if (hitObstacles) hitObstacles.add(obs);
       }
     }
 
     if (hitSomething && !this._isInvincible) {
       this.hp = Math.max(0, this.hp - 1);
+      this.chainCount = 0;
+      this.momentum = 0;
+      this.cleanStreakSeconds = 0;
 
       if (this.hp <= 0) {
         this.isAlive = false;
@@ -299,12 +361,54 @@ export class Player {
         });
       } else {
         this.grantInvincibility(INVINCIBILITY_TIME);
-        if (this.onHit) this.onHit(this.hp);
+        if (this.onHit) this.onHit(this.hp, this._panFrom(hitContext?.obstacle?.x, newX));
       }
     }
 
     this.position.x = newX;
     this.position.z = newZ;
+
+    if (skillScoring && !this.isAirborne) {
+      for (const obs of obstacles) {
+        if (obs.dead) continue;
+        if (!NEAR_MISS_TYPES.has(obs.type)) continue;
+        if (hitObstacles && hitObstacles.has(obs)) continue;
+        // Fires once, exactly as the obstacle's z crosses from ahead to
+        // behind the player this frame - the player only ever moves
+        // forward, so a given obstacle can only cross once per run.
+        if (!(obs.z >= previousZ && obs.z < this.position.z)) continue;
+        const lateralGap = Math.abs(this.position.x - obs.x) - (this.halfW + obs.halfW);
+        if (lateralGap < 0 || lateralGap > NEAR_MISS_MARGIN) continue;
+        // 1 = grazed the edge of the obstacle, 0 = right at the edge of the
+        // near-miss margin - the closer the cut, the bigger the reward.
+        const closenessT = 1 - lateralGap / NEAR_MISS_MARGIN;
+        const speed01 = THREE.MathUtils.clamp(this.speed / BOOST_SPEED, 0, 1);
+        const bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+        this.bonusDistance += bonus;
+        if (this.onNearMiss) this.onNearMiss(bonus, this._panFrom(obs.x));
+      }
+    }
+
+    if (skillScoring && this.isAlive) {
+      const speed01 = THREE.MathUtils.clamp((this.speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
+      const momentumTarget = this.isAirborne ? this.momentum : speed01;
+      const momentumRate = momentumTarget > this.momentum ? MOMENTUM_BUILD_RATE : MOMENTUM_DECAY_RATE;
+      this.momentum = THREE.MathUtils.clamp(this.momentum + (momentumTarget - this.momentum) * THREE.MathUtils.clamp(momentumRate * dt, 0, 1), 0, 1);
+
+      this.cleanStreakSeconds += dt;
+
+      const distanceThisTick = Math.max(0, this.position.z - previousZ);
+      if (distanceThisTick > 0) {
+        if (this.momentum > MOMENTUM_BONUS_THRESHOLD) {
+          const momentumT = (this.momentum - MOMENTUM_BONUS_THRESHOLD) / (1 - MOMENTUM_BONUS_THRESHOLD);
+          this.bonusDistance += distanceThisTick * momentumT * MOMENTUM_MAX_BONUS_RATE;
+        }
+        const streakT = THREE.MathUtils.clamp(this.cleanStreakSeconds / CLEAN_STREAK_MAX_SECONDS, 0, 1);
+        if (streakT > 0) {
+          this.bonusDistance += distanceThisTick * streakT * CLEAN_STREAK_MAX_BONUS_RATE;
+        }
+      }
+    }
 
     if (this.isAirborne) {
       this.airTime += dt;
@@ -346,6 +450,17 @@ export class Player {
       }
     }
 
+    this.applyPresentation(dt, steer);
+  }
+
+  /**
+   * Mesh sync + lean/squash/limb-animation only — no physics. Called from
+   * the tail of update() for solo/legacy play, and driven directly from
+   * Game.ts during authoritative multiplayer (where movement comes from the
+   * shared sim instead of update() above), so both modes get the same
+   * presentation juice off the same code path.
+   */
+  applyPresentation(dt, steer = 0) {
     this.mesh.position.copy(this.position);
     this.mesh.rotation.y = -this.angle;
     this.mesh.rotation.x = 0;
@@ -356,18 +471,38 @@ export class Player {
       this.mesh.position.y = Math.max(0.035, this.mesh.position.y - fall * 0.06);
       this.mesh.rotation.x = -fall * 0.22;
       this.mesh.scale.set(1 - fall * 0.08, 1 - fall * 0.18, 1 - fall * 0.08);
+    } else if (this._squashTimer > 0) {
+      this._squashTimer = Math.max(0, this._squashTimer - dt);
+      const squashPhase = Math.sin((this._squashTimer / LANDING_SQUASH_DURATION) * Math.PI);
+      const squash = squashPhase * this._squashStrength;
+      this.mesh.scale.set(1 + squash * 0.32, 1 - squash * 0.4, 1 + squash * 0.32);
     } else {
       this.mesh.scale.setScalar(1);
     }
 
-    this._leanTarget = -steer * 0.3;
-    this._lean = THREE.MathUtils.lerp(this._lean, this._leanTarget, 8 * dt);
+    const leanSteer = this.isAirborne ? 0 : steer;
+
+    // Lean tracks how fast the heading is actually changing, not just how
+    // hard the input is held — a sustained turn saturates at the angle
+    // clamp and stops changing, so leaning purely off raw input would keep
+    // the body banked at max the whole time even while travelling straight.
+    // A little raw-input weight is blended in so the lean still reacts the
+    // instant a key is pressed instead of waiting for the angle to move.
+    const angularVelocity = dt > 0
+      ? THREE.MathUtils.clamp((this.angle - (this._lastLeanAngle ?? this.angle)) / dt, -6, 6)
+      : 0;
+    this._lastLeanAngle = this.angle;
+    const turnRate = Math.max(0.5, settings.get('keyTurnSpeed') || 1.8);
+    const carve = this.isAirborne ? 0 : THREE.MathUtils.clamp(angularVelocity / turnRate, -1, 1);
+
+    this._leanTarget = -(carve * 0.7 + leanSteer * 0.3) * LEAN_STRENGTH;
+    this._lean = THREE.MathUtils.lerp(this._lean, this._leanTarget, 10 * dt);
     this.mesh.rotation.z = this._lean;
 
     updateSkierAnimation(this.mesh, {
       dt,
       speed: this.speed,
-      steer,
+      steer: leanSteer,
       airborne: this.isAirborne,
       airTime: this.airTime,
     });
@@ -558,10 +693,15 @@ export class Player {
     }
   }
 
-  _collidesAABB(px, pz, obs) {
+  _panFrom(sourceX, listenerX = this.position.x) {
+    if (sourceX === undefined || sourceX === null) return 0;
+    return THREE.MathUtils.clamp((sourceX - listenerX) / 3, -1, 1);
+  }
+
+  _collidesAABB(px, pz, obs, padding = 0) {
     return (
-      Math.abs(px - obs.x) < (this.halfW + obs.halfW) &&
-      Math.abs(pz - obs.z) < (this.halfD + obs.halfD)
+      Math.abs(px - obs.x) < (this.halfW + obs.halfW + padding) &&
+      Math.abs(pz - obs.z) < (this.halfD + obs.halfD + padding)
     );
   }
 
@@ -596,6 +736,9 @@ export class Player {
     this.speed *= 0.35;
     this.position.x += (Math.sign(this.position.x - partnerMesh.position.x) || 1) * 0.45;
     this.hp = Math.max(0, this.hp - 1);
+    this.chainCount = 0;
+    this.momentum = 0;
+    this.cleanStreakSeconds = 0;
 
     if (this.hp <= 0) {
       this.isAlive = false;
@@ -607,7 +750,7 @@ export class Player {
       });
     } else {
       this.grantInvincibility(INVINCIBILITY_TIME);
-      if (this.onHit) this.onHit(this.hp);
+      if (this.onHit) this.onHit(this.hp, this._panFrom(partnerMesh?.position?.x));
     }
 
     return true;
@@ -620,6 +763,9 @@ export class Player {
     this.position.x = THREE.MathUtils.clamp(this.position.x + pushDir * 0.38, -55, 55);
     this.speed *= 0.58;
     this.hp = Math.max(0, this.hp - 1);
+    this.chainCount = 0;
+    this.momentum = 0;
+    this.cleanStreakSeconds = 0;
 
     if (this.hp <= 0) {
       this.isAlive = false;
@@ -630,7 +776,7 @@ export class Player {
       });
     } else {
       this.grantInvincibility(INVINCIBILITY_TIME);
-      if (this.onHit) this.onHit(this.hp);
+      if (this.onHit) this.onHit(this.hp, this._panFrom(context.projectileX));
     }
 
     return true;

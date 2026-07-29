@@ -18,6 +18,11 @@ const initialState: UiStoreState = {
     graphicsQuality: 'high',
     spawnShieldSeconds: 0,
     spectatorTarget: '',
+    chainCount: 0,
+    chainRemainingT: 0,
+    momentum: 0,
+    cleanStreakSeconds: 0,
+    yetiDangerT: 0,
   },
   gameMode: 'classic',
   room: {
@@ -33,6 +38,10 @@ const initialState: UiStoreState = {
   gameOver: {
     distance: 0,
     scores: [],
+    gameMode: 'classic',
+    difficulty: 'normal',
+    multiplayer: false,
+    ghostSaved: false,
   },
   playerList: [],
   yetiWarning: false,
@@ -42,6 +51,8 @@ const initialState: UiStoreState = {
   hitFlashKey: 0,
   healFlashKey: 0,
   landingFlashKey: 0,
+  nearMissFlashKey: 0,
+  jumpChainFlashKey: 0,
 };
 
 type Listener = () => void;

@@ -12,6 +12,8 @@
 // difficulty: 'easy' | 'normal' | 'hard' | 'extreme'
 // yetiStartMode: 'distance' | 'immediate' | 'disabled'
 // showFPS: bool
+// difficultyRamp: bool
+// skillScoring: bool
 
 const KEY = 'skifree3d_settings';
 
@@ -30,6 +32,8 @@ const DEFAULTS = {
   yetiStartMode: 'distance',
   showFPS: false,
   sfxVolume: 0.6,
+  difficultyRamp: false,
+  skillScoring: false,
 };
 
 export class Settings {

@@ -2,6 +2,7 @@ import type { UiStoreState } from '@/types/app';
 import { ControlsPanel } from './ControlsPanel';
 import { Hearts } from './Hearts';
 import { HitFlash } from './HitFlash';
+import { LowHealthVignette } from './LowHealthVignette';
 import { PlayerStatusPanel } from './PlayerStatusPanel';
 import { SpeedMeter } from './SpeedMeter';
 import { YetiRadar } from './YetiRadar';
@@ -16,7 +17,7 @@ export function GameHud({ state }: { state: UiStoreState }) {
         <div className="pointer-events-none fixed left-4 top-4 z-[60] w-[242px] max-sm:left-2.5 max-sm:top-2.5 max-sm:w-[min(230px,calc(100vw-20px))]">
           <div className="hud-glass grid gap-2.5 p-3">
             <Hearts hp={state.hud.hp} flashKey={state.healFlashKey + state.hitFlashKey} />
-            <SpeedMeter distance={state.hud.distance} speed={state.hud.speed} />
+            <SpeedMeter distance={state.hud.distance} speed={state.hud.speed} momentum={state.hud.momentum} />
             <div className="flex flex-wrap gap-2">
               <div className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide ${state.hud.isAirborne ? 'border-cyan-300/50 bg-blue-500/30 text-white' : 'border-white/15 bg-white/10 text-[#dceeff]'}`}>
                 {state.hud.isAirborne ? 'Air' : 'Ground'}
@@ -27,6 +28,25 @@ export function GameHud({ state }: { state: UiStoreState }) {
               {state.hud.spawnShieldSeconds > 0 && (
                 <div className="rounded-full border border-cyan-300/50 bg-blue-500/30 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-white shadow-[0_0_14px_rgba(121,231,255,0.2)]">
                   Shield {Math.ceil(state.hud.spawnShieldSeconds)}s
+                </div>
+              )}
+              {state.hud.chainCount >= 2 && (
+                <div className="relative overflow-hidden rounded-full border border-amber-300/50 bg-amber-500/10 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-amber-100 shadow-[0_0_14px_rgba(255,193,71,0.25)]">
+                  <div
+                    className="absolute inset-y-0 left-0 bg-amber-500/40 transition-[width] duration-150 ease-linear"
+                    style={{ width: `${Math.max(0, Math.min(100, state.hud.chainRemainingT * 100))}%` }}
+                  />
+                  <span className="relative">Chain x{state.hud.chainCount}</span>
+                </div>
+              )}
+              {state.hud.cleanStreakSeconds >= 5 && (
+                <div className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide ${state.hud.cleanStreakSeconds >= 45 ? 'border-emerald-300/60 bg-emerald-500/25 text-emerald-100 shadow-[0_0_14px_rgba(52,211,153,0.3)]' : 'border-white/15 bg-white/10 text-[#dceeff]'}`}>
+                  Clean Run {Math.floor(state.hud.cleanStreakSeconds)}s
+                </div>
+              )}
+              {state.hud.yetiDangerT > 0 && (
+                <div className="animate-pulse rounded-full border border-red-300/50 bg-red-600/25 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-red-100 shadow-[0_0_14px_rgba(255,90,90,0.3)]">
+                  Danger Bonus
                 </div>
               )}
               {state.hud.spectatorTarget && (
@@ -47,6 +67,7 @@ export function GameHud({ state }: { state: UiStoreState }) {
           YETI INBOUND
         </div>
       )}
+      <LowHealthVignette hp={state.hud.hp} active={showHud} />
       <HitFlash flashKey={state.hitFlashKey} />
     </>
   );

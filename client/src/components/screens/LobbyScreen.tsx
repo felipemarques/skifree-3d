@@ -1,5 +1,6 @@
 import { ArrowLeft, Play, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Select } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import type { GameController } from '@/app/gameController';
@@ -122,6 +123,14 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
                 </span>
               </span>
               <Slider disabled={locked} min={0} max={2} step={0.1} value={settings.obstacleVolume} onChange={event => update('obstacleVolume', Number(event.target.value))} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+              Difficulty Ramp
+              <Checkbox disabled={locked} checked={!!settings.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+              Skill Scoring
+              <Checkbox disabled={locked} checked={!!settings.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
             </label>
           </div>
         </div>

@@ -14,6 +14,7 @@ const VERT = /* glsl */`
   varying float vRidge;
   varying float vLight;
   varying float vRelZ;
+  varying vec3 vSnowNormal;
 
   float snowRelief(vec2 p) {
     return
@@ -38,6 +39,14 @@ const VERT = /* glsl */`
     float reliefX = snowRelief(worldBase.xz + vec2(1.4, 0.0)) - reliefBase;
     float reliefZ = snowRelief(worldBase.xz + vec2(0.0, 1.4)) - reliefBase;
     vLight = clamp(0.74 + reliefX * 0.42 - reliefZ * 0.28, 0.42, 1.08);
+
+    // Real surface normal from the height field's slope, so the fragment
+    // shader can light the relief against the actual scene sun direction
+    // instead of the vLight approximation above alone.
+    float dHdx = (reliefX * 0.78) / 1.4;
+    float dHdz = (reliefZ * 0.78) / 1.4 - 0.026;
+    vSnowNormal = normalize(vec3(-dHdx, 1.0, -dHdz));
+
     vVisualY = visualY;
     vRidge = relief;
     vRelZ = relZ;
@@ -47,11 +56,19 @@ const VERT = /* glsl */`
 `;
 
 const FRAG = /* glsl */`
+  uniform float uTime;
   varying vec3 vWorldPos;
   varying float vVisualY;
   varying float vRidge;
   varying float vLight;
   varying float vRelZ;
+  varying vec3 vSnowNormal;
+
+  float sparkleHash(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+  }
 
   void main() {
     vec3 shadowSnow = vec3(0.58, 0.70, 0.82);
@@ -67,6 +84,21 @@ const FRAG = /* glsl */`
     col = mix(col * 0.82, mix(col, midSnow, 0.28), softShade);
     col *= vLight;
 
+    // Real diffuse lighting from the height-field normal against the
+    // scene's actual sun direction (see Game.ts's DirectionalLight), layered
+    // on top of the vLight approximation above so the bumps read as
+    // physically dimensional rather than painted-on.
+    vec3 sunDir = normalize(vec3(-26.0, 56.0, 22.0));
+    float ndotl = clamp(dot(vSnowNormal, sunDir), 0.0, 1.0);
+    col *= mix(0.86, 1.14, ndotl);
+
+    vec3 viewDir = normalize(cameraPosition - vWorldPos);
+
+    // Fine per-pixel grain so close-up snow reads as granular/packed rather
+    // than a smooth gradient.
+    float grain = sparkleHash(floor(vWorldPos.xz * 46.0)) - 0.5;
+    col += grain * 0.035;
+
     float pathLine = smoothstep(0.47, 0.5, abs(fract(vWorldPos.x / 8.5) - 0.5) * 2.0);
     col = mix(col * 0.88, col, pathLine);
 
@@ -76,6 +108,26 @@ const FRAG = /* glsl */`
 
     float slopeDistance = 1.0 - smoothstep(20.0, 210.0, vRelZ);
     col = mix(col, brightSnow, 0.03 * slopeDistance);
+
+    // Hazy, blown-out-white horizon: far-ahead terrain washes toward bright
+    // snow (distance haze), and shallow viewing angles pick up an extra rim
+    // brighten (fresnel) the way sunlit snow does at a grazing look.
+    float farHaze = smoothstep(80.0, 220.0, vRelZ);
+    col = mix(col, vec3(0.95, 0.97, 1.0), farHaze * 0.22);
+    float fresnel = pow(1.0 - clamp(abs(viewDir.y), 0.0, 1.0), 2.2);
+    col = mix(col, vec3(0.92, 0.96, 1.0), fresnel * 0.06);
+
+    // Sparse, view-angle-weighted glints mimicking sunlight catching ice
+    // crystals - sparkle *positions* come from a per-cell hash so they're
+    // stable in world space, but a second hash keyed off cell + slow time
+    // makes them twinkle rather than sitting there as static dots.
+    vec2 sparkleCell = floor(vWorldPos.xz * 3.1);
+    float sparkleRnd = sparkleHash(sparkleCell);
+    float sparklePresence = step(0.978, sparkleRnd);
+    float grazing = pow(clamp(viewDir.y, 0.0, 1.0), 1.6);
+    float twinkle = sparkleHash(sparkleCell + floor(uTime * 5.0 + sparkleRnd * 37.0));
+    float sparkle = sparklePresence * grazing * smoothstep(0.15, 0.95, twinkle);
+    col += vec3(1.0, 0.99, 0.95) * sparkle * 0.55;
 
     gl_FragColor = vec4(col, 1.0);
   }

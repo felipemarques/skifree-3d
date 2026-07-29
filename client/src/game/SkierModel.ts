@@ -308,7 +308,9 @@ export function updateSkierAnimation(mesh, options = {}) {
     const side = ski.userData.side || 1;
     ski.position.y += airborne ? 0.075 : bob * 0.3;
     ski.rotation.x += airborne ? 0.18 : -speed01 * 0.035;
-    ski.rotation.y += side * steer * 0.055;
+    // No yaw offset: this sim has no slip/drift, travel direction is always
+    // exactly the current heading, so the skis should always point straight
+    // along the body's forward axis rather than toe away from it.
     ski.rotation.z += -side * steer * 0.035;
   }
 

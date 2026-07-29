@@ -97,10 +97,11 @@ export class AuthoritativeRoomRuntime {
         32,
         this.room.settings.obstacleVolume,
         this.consumedPickupIds,
+        this.room.settings.difficultyRamp,
       );
       const wasFinished = !!this.room.players.get(socketId)?.finished;
-      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs));
-      maybeApplyYetiCapture(state, this.room.settings, this.roomTimeMs, this.events);
+      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring));
+      maybeApplyYetiCapture(state, this.room.settings, this.roomTimeMs, this.events, SIM_DT, this.room.settings.skillScoring);
       this.room.updateAuthoritativePlayerState(socketId, state);
       if (!state.alive && !wasFinished) {
         this.room.markPlayerFinished(socketId, state.distance);

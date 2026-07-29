@@ -10,6 +10,8 @@ export interface RoomSettings {
   difficulty: Difficulty;
   yetiStartMode: YetiStartMode;
   obstacleVolume: number;
+  difficultyRamp?: boolean;
+  skillScoring?: boolean;
 }
 
 export interface GameSettings extends RoomSettings {
@@ -27,6 +29,7 @@ export interface PlayerStatus {
   name?: string;
   color?: string;
   distance?: number;
+  bonusDistance?: number;
   hp?: number;
   alive?: boolean;
   local?: boolean;
@@ -60,6 +63,11 @@ export interface HudState {
   graphicsQuality: GraphicsQuality | string;
   spawnShieldSeconds: number;
   spectatorTarget: string;
+  chainCount: number;
+  chainRemainingT: number;
+  momentum: number;
+  cleanStreakSeconds: number;
+  yetiDangerT: number;
 }
 
 export interface YetiThreat {
@@ -80,6 +88,34 @@ export interface RoomState {
 export interface GameOverState {
   distance: number;
   scores: PlayerStatus[];
+  gameMode: GameMode;
+  difficulty: Difficulty;
+  multiplayer: boolean;
+  ghostSaved: boolean;
+}
+
+export interface GhostKeyframe {
+  t: number;
+  x: number;
+  y: number;
+  z: number;
+  angle: number;
+  airborne: boolean;
+  speed: number;
+}
+
+export interface GhostRunRecord {
+  version: 1;
+  mode: GameMode;
+  difficulty: Difficulty;
+  seed: number;
+  obstacleVolume: number;
+  difficultyRamp: boolean;
+  skillScoring: boolean;
+  color: string;
+  distance: number;
+  recordedAt: number;
+  keyframes: GhostKeyframe[];
 }
 
 export interface UiAdapter {
@@ -88,7 +124,7 @@ export interface UiAdapter {
   showWaiting(roomId: string, players?: PlayerStatus[]): void;
   showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }): void;
   showPause(): void;
-  showGameOver(distance: number, scores?: PlayerStatus[]): void;
+  showGameOver(distance: number, scores?: PlayerStatus[], meta?: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved'>>): void;
   showRanking(entries?: RankingEntry[]): void;
   showRankingDetail(player: RankingPlayerSummary | null): void;
   updateHUD(distance: number, speed: number, hp: number, state?: Partial<HudState>): void;
@@ -102,6 +138,8 @@ export interface UiAdapter {
   showHitFeedback(): void;
   showLandingFeedback(): void;
   showHealFeedback(): void;
+  showNearMissFeedback(bonus?: number): void;
+  showJumpChainFeedback(bonus?: number, chainCount?: number): void;
   setError(message: string): void;
   clearError(): void;
 }
@@ -123,6 +161,8 @@ export interface UiStoreState {
   hitFlashKey: number;
   healFlashKey: number;
   landingFlashKey: number;
+  nearMissFlashKey: number;
+  jumpChainFlashKey: number;
 }
 
 export interface ControllerSnapshot {

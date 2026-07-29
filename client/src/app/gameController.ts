@@ -2,11 +2,13 @@ import * as THREE from 'three';
 import { Game } from '@/game/Game';
 import { MenuBackdrop } from '@/game/MenuBackdrop';
 import { SocketClient } from '@/net/SocketClient';
+import { ghostStore } from '@/utils/GhostStore';
 import { rankingStore } from '@/utils/RankingStore';
 import { settings } from '@/utils/Settings';
 import { DEFAULT_PLAYER_COLOR, sanitizePlayerColor } from '../../../shared/AuthoritativeSim';
 import type {
   ControllerSnapshot,
+  Difficulty,
   GameMode,
   GameSettings,
   PlayerStatus,
@@ -65,6 +67,8 @@ function normalizeRoomSettings(nextSettings: Partial<RoomSettings> = {}): RoomSe
       : 'normal',
     yetiStartMode,
     obstacleVolume: Number(nextSettings.obstacleVolume ?? 1),
+    difficultyRamp: !!nextSettings.difficultyRamp,
+    skillScoring: !!nextSettings.skillScoring,
   };
 }
 
@@ -161,6 +165,8 @@ export class GameController {
       gameMode: settings.get('gameMode'),
       difficulty: settings.get('difficulty'),
       yetiStartMode: settings.get('yetiStartMode'),
+      difficultyRamp: !!settings.get('difficultyRamp'),
+      skillScoring: !!settings.get('skillScoring'),
     };
   }
 
@@ -192,6 +198,26 @@ export class GameController {
       seed: randomSeed(),
       multiplayer: false,
       gameMode,
+    });
+  }
+
+  startGhostRace(mode: GameMode, difficulty: Difficulty) {
+    const ghost = ghostStore.getBest(mode, difficulty);
+    if (!ghost) return;
+    this.isMultiplayer = false;
+    this.socket.disconnect();
+    this.roomId = null;
+    this.roomSeed = null;
+    settings.set('gameMode', mode);
+    this.startGame({
+      seed: ghost.seed,
+      multiplayer: false,
+      gameMode: mode,
+      difficulty: ghost.difficulty,
+      obstacleVolume: ghost.obstacleVolume,
+      difficultyRamp: ghost.difficultyRamp,
+      skillScoring: ghost.skillScoring,
+      ghostRecord: ghost,
     });
   }
 
@@ -270,6 +296,8 @@ export class GameController {
     settings.set('gameMode', values.gameMode);
     settings.set('difficulty', values.difficulty);
     settings.set('yetiStartMode', values.yetiStartMode);
+    settings.set('difficultyRamp', !!values.difficultyRamp);
+    settings.set('skillScoring', !!values.skillScoring);
     this.currentGame?.audio?.setVolume(settings.get('sfxVolume'));
     this.closeSettings();
   }
@@ -370,6 +398,8 @@ export class GameController {
           difficulty: result.difficulty,
           date: Date.now(),
         });
+        const ghostSaved = result.ghostRecord ? ghostStore.trySave(result.ghostRecord) : false;
+        return { ghostSaved };
       },
     });
     this.currentGame.start();
@@ -452,6 +482,8 @@ export class GameController {
       difficulty: settings.get('difficulty'),
       yetiStartMode: settings.get('yetiStartMode'),
       obstacleVolume: Number(settings.get('obstacleVolume')),
+      difficultyRamp: false,
+      skillScoring: false,
     };
   }
 

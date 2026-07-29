@@ -1,5 +1,6 @@
 import type {
   GameMode,
+  GameOverState,
   HudState,
   PlayerStatus,
   RankingEntry,
@@ -18,6 +19,11 @@ const defaultHud: HudState = {
   graphicsQuality: 'high',
   spawnShieldSeconds: 0,
   spectatorTarget: '',
+  chainCount: 0,
+  chainRemainingT: 0,
+  momentum: 0,
+  cleanStreakSeconds: 0,
+  yetiDangerT: 0,
 };
 
 function asGameMode(value: string | undefined): GameMode {
@@ -78,14 +84,21 @@ export class ReactUiAdapter implements UiAdapter {
     this.store.set(state => ({ ...state, previousScreen: state.screen, screen: 'pause', error: '' }));
   }
 
-  showGameOver(distance: number, scores: PlayerStatus[] = []) {
+  showGameOver(distance: number, scores: PlayerStatus[] = [], meta: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved'>> = {}) {
     this.clearTransient();
     this.store.set(state => ({
       ...state,
       previousScreen: state.screen,
       screen: 'gameover',
       error: '',
-      gameOver: { distance, scores },
+      gameOver: {
+        distance,
+        scores,
+        gameMode: meta.gameMode ?? 'classic',
+        difficulty: meta.difficulty ?? 'normal',
+        multiplayer: !!meta.multiplayer,
+        ghostSaved: !!meta.ghostSaved,
+      },
       playerList: [],
       yetiWarning: false,
       yetiThreats: [],
@@ -166,6 +179,15 @@ export class ReactUiAdapter implements UiAdapter {
     this.flashControls('Health +1', 'healFlashKey', 850);
   }
 
+  showNearMissFeedback(bonus = 1.5) {
+    this.flashControls(`Near Miss +${bonus.toFixed(1)}m`, 'nearMissFlashKey', 700);
+  }
+
+  showJumpChainFeedback(bonus = 4, chainCount = 0) {
+    const label = chainCount >= 2 ? `Jump Chain x${chainCount} +${bonus.toFixed(0)}m` : `Jump Chain +${bonus.toFixed(0)}m`;
+    this.flashControls(label, 'jumpChainFlashKey', 900);
+  }
+
   setError(message: string) {
     window.clearTimeout(this.errorTimer);
     this.store.set({ error: message });
@@ -176,7 +198,7 @@ export class ReactUiAdapter implements UiAdapter {
     this.store.set({ error: '' });
   }
 
-  private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey', delay: number) {
+  private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey', delay: number) {
     window.clearTimeout(this.controlsTimer);
     this.store.set(state => ({
       ...state,

@@ -1,8 +1,16 @@
 const MAX_DISPLAY_SPEED_KMH = 105;
+// Mirrors MOMENTUM_BONUS_THRESHOLD/MOMENTUM_MAX_BONUS_RATE in
+// shared/AuthoritativeSim.ts and Player.ts - display only, doesn't affect
+// scoring, just needs to describe the same numbers the game actually uses.
+const MOMENTUM_BONUS_THRESHOLD = 0.5;
+const MOMENTUM_MAX_BONUS_RATE = 0.3;
 
-export function SpeedMeter({ distance, speed }: { distance: number; speed: number }) {
+export function SpeedMeter({ distance, speed, momentum = 0 }: { distance: number; speed: number; momentum?: number }) {
   const speedKmh = Math.round(speed * 3.6);
   const pct = Math.max(0, Math.min(100, (speedKmh / MAX_DISPLAY_SPEED_KMH) * 100));
+  const momentumPct = Math.max(0, Math.min(100, momentum * 100));
+  const momentumActive = momentum > MOMENTUM_BONUS_THRESHOLD;
+  const momentumMultiplier = 1 + Math.max(0, momentum - MOMENTUM_BONUS_THRESHOLD) / (1 - MOMENTUM_BONUS_THRESHOLD) * MOMENTUM_MAX_BONUS_RATE;
 
   return (
     <div className="grid gap-2">
@@ -18,6 +26,22 @@ export function SpeedMeter({ distance, speed }: { distance: number; speed: numbe
           style={{ width: `${pct}%` }}
         />
       </div>
+      {momentum > 0.02 && (
+        <div className="grid gap-1">
+          <div className="flex items-baseline justify-between gap-3 text-[10px] font-extrabold uppercase tracking-wide text-[#aab9cf]">
+            Momentum
+            <span className={momentumActive ? 'text-amber-300' : 'text-[#aab9cf]'}>
+              {momentumActive ? `Bonus x${momentumMultiplier.toFixed(2)}` : `${Math.round(momentumPct)}%`}
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-white/15">
+            <div
+              className={`h-full rounded-full transition-[width] duration-150 ${momentumActive ? 'bg-amber-300 shadow-[0_0_8px_rgba(255,193,71,0.6)]' : 'bg-white/40'}`}
+              style={{ width: `${momentumPct}%` }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

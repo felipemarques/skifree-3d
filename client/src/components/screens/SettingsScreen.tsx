@@ -92,6 +92,14 @@ export function SettingsScreen({ controller }: SettingsScreenProps) {
             <option value="disabled">No Yeti</option>
           </Select>
         ))}
+        <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+          Difficulty Ramp
+          <Checkbox checked={!!form.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
+        </label>
+        <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+          Skill Scoring
+          <Checkbox checked={!!form.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
+        </label>
       </div>
 
       <div className="grid grid-cols-2 gap-2">

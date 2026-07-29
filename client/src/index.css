@@ -113,6 +113,16 @@ select {
   animation: heart-pop 0.38s ease;
 }
 
+.low-hp-vignette-pulse {
+  background: radial-gradient(ellipse at center, rgba(200, 20, 20, 0) 55%, rgba(200, 20, 20, 0.28) 100%);
+  animation: low-hp-breathe 2.6s ease-in-out infinite;
+}
+
+@keyframes low-hp-breathe {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+
 @keyframes warning-pulse {
   from { opacity: 0.72; }
   to { opacity: 1; transform: translateX(-50%) scale(1.04); }

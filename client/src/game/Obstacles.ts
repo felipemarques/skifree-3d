@@ -1,11 +1,15 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
-import { generateGameplayChunk } from '../../../shared/AuthoritativeSim';
+import { generateGameplayChunk, getRampedHazardVolume, getRampedRampVolume } from '../../../shared/AuthoritativeSim';
 
 const CHUNK_SIZE = 80;
 const CHUNK_WIDTH = 120;
 const TRACK_LIMIT = CHUNK_WIDTH / 2 - 8;
+// Mirrors shared/AuthoritativeSim.ts's RAMP_LANES: ramps rotate through
+// lanes by chunk + spawn index instead of pure uniform-random x, so chaining
+// requires actually crossing the track rather than holding a line.
+const RAMP_LANES = [[-34, -14], [-9, 9], [14, 34]];
 const OBSTACLES_PER_CHUNK = 18;
 const NPC_SKIERS_PER_CHUNK = 2;
 const NPC_DOGS_PER_CHUNK = 1;
@@ -940,11 +944,12 @@ export class Obstacles {
     this.scene = scene;
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
     this.authoritativeSeed = options.authoritativeSeed ?? null;
+    this.difficultyRamp = !!options.difficultyRamp;
     this.chunks = new Map();
     this.active = [];
   }
 
-  generateChunk(chunkIndex, rng) {
+  generateChunk(chunkIndex, rng, chainBoost = false) {
     if (this.chunks.has(chunkIndex)) return;
     if (this.authoritativeSeed !== null && this.authoritativeSeed !== undefined) {
       this.generateAuthoritativeChunk(chunkIndex, rng);
@@ -954,10 +959,22 @@ export class Obstacles {
     const zBase = chunkIndex * CHUNK_SIZE;
     const group = new THREE.Group();
     const chunkObstacles = [];
+    // Only the hazard categories that also exist in the shared authoritative
+    // sim ramp with distance, so the "difficulty ramp" feature means the
+    // same thing in solo as it does in a multiplayer lobby; NPC/dog/bear are
+    // solo-exclusive extras and stay on the base volume.
+    const hazardVolume = getRampedHazardVolume(this.volume, chunkIndex, this.difficultyRamp);
+    // Solo-only: chunks not yet generated when the player has an active jump
+    // chain get more ramps, to help keep it going. Safe only because this
+    // chunk gets cached forever the moment it's generated (see chunks.has
+    // above) - a live signal like this can't safely drive the multiplayer
+    // authoritative path, which recomputes obstacles fresh every tick and
+    // must stay identical between server and every client.
+    const rampVolume = getRampedRampVolume(this.volume, chunkIndex, this.difficultyRamp) * (chainBoost ? 1.8 : 1);
     const counts = {
-      static: scaledCount(OBSTACLES_PER_CHUNK, this.volume),
-      ramps: scaledCount(RAMPS_PER_CHUNK, this.volume, 1),
-      holes: scaledCount(HOLES_PER_CHUNK, this.volume),
+      static: scaledCount(OBSTACLES_PER_CHUNK, hazardVolume),
+      ramps: scaledCount(RAMPS_PER_CHUNK, rampVolume, 1),
+      holes: scaledCount(HOLES_PER_CHUNK, hazardVolume),
       hearts: scaledCount(HEARTS_PER_CHUNK, Math.max(this.volume, 0.5), 1),
       npcSkiers: scaledCount(NPC_SKIERS_PER_CHUNK, this.volume),
       dogs: scaledCount(NPC_DOGS_PER_CHUNK, this.volume),
@@ -1052,7 +1069,8 @@ export class Obstacles {
     }
 
     for (let i = 0; i < counts.ramps; i++) {
-      spawnPlaced(() => makeRamp(rng), [-36, 36], [12, CHUNK_SIZE - 12], {
+      const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+      spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], {
         attempts: 18,
         padding: 1.1,
       });
@@ -1105,7 +1123,7 @@ export class Obstacles {
 
     const group = new THREE.Group();
     const chunkObstacles = [];
-    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set());
+    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp);
 
     const makeMesh = (type) => {
       if (type === 'tree') return makeTree(rng);

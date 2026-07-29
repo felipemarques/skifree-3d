@@ -55,6 +55,8 @@ export class AudioManager {
       this._stopped = false;
       this._buildWindLoop();
       this._buildSlideLoop();
+      this._buildTensionLoop();
+      this._buildAmbientLoop();
     } catch (e) {
       console.warn('[Audio] Web Audio API not available:', e);
     }
@@ -129,6 +131,75 @@ export class AudioManager {
     this._slideNode = src;
   }
 
+  // ── Yeti tension drone (continuous, fades in approaching trigger range) ──
+  _buildTensionLoop() {
+    const ctx = this._ctx;
+
+    const osc1 = ctx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.value = 42;
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.value = 63; // slight beating against osc1 for unease
+
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'lowpass';
+    filt.frequency.value = 200;
+
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+
+    osc1.connect(filt);
+    osc2.connect(filt);
+    filt.connect(gain);
+    gain.connect(this._masterGain || ctx.destination);
+    osc1.start();
+    osc2.start();
+
+    this._tensionOsc1 = osc1;
+    this._tensionOsc2 = osc2;
+    this._tensionGain = gain;
+  }
+
+  /** intensity 0..1 - how close the player is to the yeti trigger threshold. */
+  updateTension(intensity) {
+    if (!this._ready || !this._tensionGain) return;
+    const target = (this._muted || this._stopped) ? 0 : Math.max(0, Math.min(1, intensity)) * 0.22;
+    this._tensionGain.gain.setTargetAtTime(target, this._ctx.currentTime, 0.6);
+  }
+
+  // ── Ambient pad (continuous, very low, brightens slightly with speed) ────
+  _buildAmbientLoop() {
+    const ctx = this._ctx;
+    const freqs = [130.81, 196.0, 261.63]; // C3, G3, C4 - open, calm-but-moody
+
+    this._ambientOscs = freqs.map((freq, i) => {
+      const osc = ctx.createOscillator();
+      osc.type = i === 1 ? 'triangle' : 'sine';
+      osc.frequency.value = freq;
+      osc.detune.value = (Math.random() - 0.5) * 6;
+      return osc;
+    });
+
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'lowpass';
+    filt.frequency.value = 500;
+
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+
+    for (const osc of this._ambientOscs) {
+      osc.connect(filt);
+      osc.start();
+    }
+    filt.connect(gain);
+    gain.connect(this._masterGain || ctx.destination);
+
+    this._ambientFilter = filt;
+    this._ambientGain = gain;
+  }
+
   // ── Per-frame update driven by game state ─────────────────────────────
   /**
    * @param {number} speed      - player speed m/s (0–28)
@@ -151,6 +222,12 @@ export class AudioManager {
     const turnNorm   = Math.min(Math.abs(turnAngle) / 1.32, 1); // 0..1
     const slideVol   = isAirborne ? 0 : turnNorm * turnNorm * 0.18 * speedNorm;
     this._slideGain.gain.setTargetAtTime(slideVol, now, 0.04);
+
+    // Ambient pad: always faintly present, brightens a little with speed.
+    if (this._ambientGain) {
+      this._ambientGain.gain.setTargetAtTime(0.05 + speedNorm * 0.03, now, 1.2);
+      this._ambientFilter.frequency.setTargetAtTime(400 + speedNorm * 900, now, 0.8);
+    }
   }
 
   // ── One-shot helpers ──────────────────────────────────────────────────
@@ -161,7 +238,17 @@ export class AudioManager {
     return g;
   }
 
-  _osc(type, freq, gainValue, when, duration) {
+  /** Stereo destination for a directional sound; pan is -1 (left) .. 1 (right). */
+  _panned(pan = 0) {
+    const dest = this._masterGain || this._ctx.destination;
+    if (!pan) return dest;
+    const panner = this._ctx.createStereoPanner();
+    panner.pan.value = Math.max(-1, Math.min(1, pan));
+    panner.connect(dest);
+    return panner;
+  }
+
+  _osc(type, freq, gainValue, when, duration, pan = 0) {
     if (!this._ready || this._muted) return;
     const ctx = this._ctx;
     const now = when ?? ctx.currentTime;
@@ -175,12 +262,12 @@ export class AudioManager {
     g.gain.exponentialRampToValueAtTime(0.001, now + duration);
 
     osc.connect(g);
-    g.connect(this._masterGain || ctx.destination);
+    g.connect(this._panned(pan));
     osc.start(now);
     osc.stop(now + duration + 0.05);
   }
 
-  _noise(gainValue, when, duration, filterFreq = 800, filterType = 'bandpass') {
+  _noise(gainValue, when, duration, filterFreq = 800, filterType = 'bandpass', pan = 0) {
     if (!this._ready || this._muted) return;
     const ctx    = this._ctx;
     const now    = when ?? ctx.currentTime;
@@ -202,22 +289,22 @@ export class AudioManager {
 
     src.connect(filt);
     filt.connect(g);
-    g.connect(this._masterGain || ctx.destination);
+    g.connect(this._panned(pan));
     src.start(now);
     src.stop(now + duration + 0.05);
   }
 
   // ── Public one-shot sounds ─────────────────────────────────────────────
 
-  playCollision() {
+  playCollision(pan = 0) {
     if (!this._ready || this._muted) return;
     const ctx = this._ctx;
     const now = ctx.currentTime;
     // Low thud
-    this._osc('sine',   60, 0.5, now,        0.18);
-    this._osc('sine',   80, 0.3, now + 0.01, 0.12);
+    this._osc('sine',   60, 0.5, now,        0.18, pan);
+    this._osc('sine',   80, 0.3, now + 0.01, 0.12, pan);
     // Snow spray burst
-    this._noise(0.35, now, 0.12, 600, 'bandpass');
+    this._noise(0.35, now, 0.12, 600, 'bandpass', pan);
   }
 
   playHeartLost() {
@@ -258,6 +345,37 @@ export class AudioManager {
     this._noise(0.2, now, 0.08, 400, 'bandpass');
   }
 
+  playNearMiss(pan = 0) {
+    if (!this._ready || this._muted) return;
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    // Quick, light "swish-ting" - kept low volume since this can fire often.
+    const osc        = ctx.createOscillator();
+    osc.type         = 'triangle';
+    osc.frequency.setValueAtTime(900, now);
+    osc.frequency.exponentialRampToValueAtTime(1500, now + 0.08);
+
+    const g      = ctx.createGain();
+    g.gain.setValueAtTime(0.14, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.13);
+
+    osc.connect(g);
+    g.connect(this._panned(pan));
+    osc.start(now);
+    osc.stop(now + 0.15);
+
+    this._noise(0.06, now, 0.06, 3000, 'highpass', pan);
+  }
+
+  playJumpChain() {
+    if (!this._ready || this._muted) return;
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    // Short ascending two-note chime for a chained ramp jump.
+    this._osc('sine', 520, 0.22, now, 0.12);
+    this._osc('sine', 720, 0.26, now + 0.08, 0.16);
+  }
+
   playBoost() {
     if (!this._ready || this._muted) return;
     const ctx = this._ctx;
@@ -278,7 +396,7 @@ export class AudioManager {
     osc.stop(now + 0.38);
   }
 
-  playYetiRoar() {
+  playYetiRoar(pan = 0) {
     if (!this._ready || this._muted) return;
     const ctx = this._ctx;
     const now = ctx.currentTime;
@@ -305,12 +423,12 @@ export class AudioManager {
     osc1.connect(filt);
     osc2.connect(filt);
     filt.connect(g);
-    g.connect(this._masterGain || ctx.destination);
+    g.connect(this._panned(pan));
     osc1.start(now); osc1.stop(now + 0.85);
     osc2.start(now); osc2.stop(now + 0.85);
 
     // Add noise layer
-    this._noise(0.3, now, 0.7, 180, 'bandpass');
+    this._noise(0.3, now, 0.7, 180, 'bandpass', pan);
   }
 
   playGameOver() {
@@ -352,6 +470,8 @@ export class AudioManager {
     const now = this._ctx.currentTime;
     if (this._windGain) this._windGain.gain.setTargetAtTime(0, now, 0.06);
     if (this._slideGain) this._slideGain.gain.setTargetAtTime(0, now, 0.04);
+    if (this._tensionGain) this._tensionGain.gain.setTargetAtTime(0, now, 0.3);
+    if (this._ambientGain) this._ambientGain.gain.setTargetAtTime(0, now, 0.3);
   }
 
   /**
@@ -365,6 +485,8 @@ export class AudioManager {
     // Ramp wind and slide to silence instantly
     if (this._windGain)  this._windGain.gain.setTargetAtTime(0,  now, 0.04);
     if (this._slideGain) this._slideGain.gain.setTargetAtTime(0, now, 0.02);
+    if (this._tensionGain) this._tensionGain.gain.setTargetAtTime(0, now, 0.04);
+    if (this._ambientGain) this._ambientGain.gain.setTargetAtTime(0, now, 0.15);
 
     // Block updateContinuous from re-opening them
     this._stopped = true;
@@ -375,6 +497,9 @@ export class AudioManager {
     try {
       this._windNode?.stop();
       this._slideNode?.stop();
+      this._tensionOsc1?.stop();
+      this._tensionOsc2?.stop();
+      this._ambientOscs?.forEach(osc => osc.stop());
       this._ctx?.close();
     } catch (_) {}
     this._ready = false;
