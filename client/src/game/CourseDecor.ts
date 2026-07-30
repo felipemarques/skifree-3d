@@ -1,9 +1,26 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { SeededRandom } from '../utils/SeededRandom';
+import { getBiomeHueShiftAtZ } from './Biome';
+import { makeTree, makeRock } from './Obstacles';
 
 const CHUNK_SIZE = 80;
 const TRACK_EDGE = 54;
+// Border treeline band - fills the gap between the last on-track decor
+// (snow stakes end around x=51) and the terrain's rendered width, so the
+// sides of the run read as an actual forest edge instead of empty snow.
+// The chase camera trails the player by 10 units and looks mostly forward
+// (see Camera.ts), which gives it a fairly narrow horizontal field of view
+// at short range - anything placed much past x~50 has already left frame
+// by the time the player draws level with it, so it never registers as
+// "enclosing" no matter how many are placed further out. INNER_MIN starts
+// tight against the track (overlapping the existing non-colliding snow
+// stakes at 43-51) specifically so trees stay in view all the way to
+// close range; MID/OUTER add depth further back.
+const INNER_MIN = 40;
+const INNER_MAX = 58;
+const MID_MAX = 80;
+const BORDER_MAX = 108;
 
 function disposeGroup(group) {
   group.traverse(obj => {
@@ -95,6 +112,16 @@ function makeGate(rng) {
   return group;
 }
 
+function makeEdgeMark(rng) {
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.5, 0.42),
+    new THREE.MeshStandardMaterial({ color: 0xff9a3d, roughness: 0.55, side: THREE.DoubleSide }),
+  );
+  mesh.rotation.x = -Math.PI / 2;
+  mesh.rotation.z = rng.range(-0.08, 0.08);
+  return mesh;
+}
+
 function makeSnowStake(rng) {
   const group = new THREE.Group();
   const stake = new THREE.Mesh(
@@ -166,6 +193,51 @@ export class CourseDecor {
           side * rng.range(43, 51),
           zBase + rng.range(8, CHUNK_SIZE - 8),
         );
+      }
+    }
+
+    // Ground-level trail-edge marks - flat dashes laid right at the
+    // playable width's boundary (Obstacles.ts's TRACK_LIMIT=52) so the run
+    // has a clear, unmissable edge regardless of terrain shading. The
+    // shader's own corduroy edge band (SnowTerrain.ts) reads too subtly on
+    // its own, so these are the primary edge marker.
+    const markSpacing = this.quality === 'high' ? 6 : 10;
+    for (const side of [-1, 1]) {
+      for (let z = 3; z < CHUNK_SIZE; z += markSpacing) {
+        addDecor(
+          makeEdgeMark(rng),
+          side * (52 + rng.range(-1, 1)),
+          zBase + z + rng.range(-0.8, 0.8),
+          0.02,
+        );
+      }
+    }
+
+    // Border treeline - purely decorative filler beyond the track so the
+    // sides of the run aren't bare snow, and (via the INNER tier) close
+    // enough to actually stay in view as the player passes. Reuses
+    // Obstacles.ts's tree/rock factories for visual continuity with the
+    // on-track props, but these never join any collision array.
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(zBase);
+    const innerCount = this.quality === 'high' ? 14 : 6;
+    const midCount = this.quality === 'high' ? 7 : 3;
+    const outerCount = this.quality === 'high' ? 4 : 2;
+    const makeFiller = () => (rng.next() < 0.72 ? makeTree(rng, treeHueShift) : makeRock(rng, rockHueShift));
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < innerCount; i++) {
+        const x = side * rng.range(INNER_MIN, INNER_MAX);
+        const z = zBase + rng.range(2, CHUNK_SIZE - 2);
+        addDecor(makeFiller(), x, z);
+      }
+      for (let i = 0; i < midCount; i++) {
+        const x = side * rng.range(INNER_MAX, MID_MAX);
+        const z = zBase + rng.range(3, CHUNK_SIZE - 3);
+        addDecor(makeFiller(), x, z);
+      }
+      for (let i = 0; i < outerCount; i++) {
+        const x = side * rng.range(MID_MAX, BORDER_MAX);
+        const z = zBase + rng.range(4, CHUNK_SIZE - 4);
+        addDecor(makeFiller(), x, z);
       }
     }
 

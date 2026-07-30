@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
 import { generateGameplayChunk, getRampedHazardVolume, getRampedRampVolume } from '../../../shared/AuthoritativeSim';
+import { getBiomeHueShiftAtZ } from './Biome';
 
 const CHUNK_SIZE = 80;
 const CHUNK_WIDTH = 120;
@@ -23,6 +24,10 @@ const NPC_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock', 'bea
 const ANIMAL_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock']);
 const NPC_KNOCKDOWN_DURATION = 2.2;
 const SPAWN_PADDING = 0.75;
+// In a full blizzard, obstacles beyond this z-distance are hidden entirely
+// (not just fogged) so nothing pops through via a shadow, specular hit, or
+// any other fog-blend edge case - matches the fog's own z-distance framing.
+const BLIZZARD_VISIBILITY_RADIUS = 22;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -222,7 +227,7 @@ function resetAnimalPart(obj) {
   obj.rotation.copy(obj.userData.restRotation);
 }
 
-function makeTree(rng) {
+export function makeTree(rng, hueShift = 0) {
   const group = new THREE.Group();
 
   const trunkH = rng.range(0.55, 1.25);
@@ -237,7 +242,7 @@ function makeTree(rng) {
 
   const layers = rng.int(2, 4);
   const baseScale = rng.range(0.78, 1.45);
-  const greenHue = 0.32 + rng.range(-0.035, 0.025);
+  const greenHue = (((0.32 + rng.range(-0.035, 0.025) + hueShift) % 1) + 1) % 1;
   const snowMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.56, 0.32, rng.range(0.86, 0.94)),
     roughness: 0.82,
@@ -270,13 +275,14 @@ function makeTree(rng) {
   return markShadows(group);
 }
 
-function makeRock(rng) {
+export function makeRock(rng, hueShift = 0) {
   const group = new THREE.Group();
   const radius = rng.range(0.34, 0.82);
   const geo = new THREE.IcosahedronGeometry(radius, 0);
   geo.scale(1.15, rng.range(0.48, 0.75), 0.9);
+  const rockHue = (((0.6 + hueShift * 0.4) % 1) + 1) % 1;
   const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color().setHSL(0.6, 0.06, rng.range(0.34, 0.5)),
+    color: new THREE.Color().setHSL(rockHue, 0.06, rng.range(0.34, 0.5)),
     roughness: 0.84,
     metalness: 0.02,
   });
@@ -957,6 +963,7 @@ export class Obstacles {
     }
 
     const zBase = chunkIndex * CHUNK_SIZE;
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(zBase);
     const group = new THREE.Group();
     const chunkObstacles = [];
     // Only the hazard categories that also exist in the shared authoritative
@@ -1062,9 +1069,9 @@ export class Obstacles {
 
     for (let i = 0; i < counts.static; i++) {
       const r = rng.next();
-      if (r < 0.44) spawnPlaced(() => makeTree(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
+      if (r < 0.44) spawnPlaced(() => makeTree(rng, treeHueShift), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
       else if (r < 0.62) spawnPlaced(() => makeFallenTree(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else if (r < 0.8) spawnPlaced(() => makeRock(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
+      else if (r < 0.8) spawnPlaced(() => makeRock(rng, rockHueShift), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
       else spawnPlaced(() => makeStump(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
     }
 
@@ -1124,16 +1131,17 @@ export class Obstacles {
     const group = new THREE.Group();
     const chunkObstacles = [];
     const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp);
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(chunkIndex * CHUNK_SIZE);
 
     const makeMesh = (type) => {
-      if (type === 'tree') return makeTree(rng);
+      if (type === 'tree') return makeTree(rng, treeHueShift);
       if (type === 'fallen_tree') return makeFallenTree(rng);
-      if (type === 'rock') return makeRock(rng);
+      if (type === 'rock') return makeRock(rng, rockHueShift);
       if (type === 'stump') return makeStump(rng);
       if (type === 'ramp') return makeRamp(rng);
       if (type === 'hole') return makeHole(rng);
       if (type === 'heart') return makeHeartPickup(rng);
-      return makeRock(rng);
+      return makeRock(rng, rockHueShift);
     };
 
     for (const record of records) {
@@ -1190,10 +1198,11 @@ export class Obstacles {
     this.active.push(...chunkObstacles);
   }
 
-  update(dt, playerZ, groundYAt = null) {
+  update(dt, playerZ, groundYAt = null, blizzardT = 0) {
     const currentChunk = Math.floor(playerZ / CHUNK_SIZE);
     const now = performance.now() * 0.004;
     const blockers = this.getAvoidanceBlockers(playerZ, CHUNK_SIZE * 2.2);
+    const cullRadius = THREE.MathUtils.lerp(9999, BLIZZARD_VISIBILITY_RADIUS, THREE.MathUtils.clamp(blizzardT, 0, 1));
 
     for (const obs of this.active) {
       if (obs.dead) continue;
@@ -1335,6 +1344,7 @@ export class Obstacles {
         ? Math.sin((1 - obs.jumpTimer / Math.max(obs.jumpDuration, 0.001)) * Math.PI) * obs.jumpHeight
         : 0;
       obs.mesh.position.set(obs.x, groundY + obs.visualYOffset + bob + jumpLift, obs.z);
+      obs.mesh.visible = Math.abs(obs.z - playerZ) <= cullRadius;
     }
 
     for (const [idx, chunk] of this.chunks.entries()) {

@@ -23,6 +23,8 @@ const initialState: UiStoreState = {
     momentum: 0,
     cleanStreakSeconds: 0,
     yetiDangerT: 0,
+    iceGripT: 0,
+    blizzardT: 0,
   },
   gameMode: 'classic',
   room: {
@@ -42,6 +44,7 @@ const initialState: UiStoreState = {
     difficulty: 'normal',
     multiplayer: false,
     ghostSaved: false,
+    dailyKey: null,
   },
   playerList: [],
   yetiWarning: false,
@@ -53,6 +56,7 @@ const initialState: UiStoreState = {
   landingFlashKey: 0,
   nearMissFlashKey: 0,
   jumpChainFlashKey: 0,
+  unstuckFlashKey: 0,
 };
 
 type Listener = () => void;

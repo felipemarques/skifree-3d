@@ -9,6 +9,7 @@ import {
   createInitialPlayerState,
   createMultiplayerSpawnXs,
   getGameplayObstaclesNear,
+  getWeatherAtZ,
   maybeApplyYetiCapture,
   simulatePlayerTick,
   toSnapshotPlayer,
@@ -99,8 +100,9 @@ export class AuthoritativeRoomRuntime {
         this.consumedPickupIds,
         this.room.settings.difficultyRamp,
       );
+      const weather = getWeatherAtZ(this.room.seed, state.z);
       const wasFinished = !!this.room.players.get(socketId)?.finished;
-      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring));
+      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather));
       maybeApplyYetiCapture(state, this.room.settings, this.roomTimeMs, this.events, SIM_DT, this.room.settings.skillScoring);
       this.room.updateAuthoritativePlayerState(socketId, state);
       if (!state.alive && !wasFinished) {

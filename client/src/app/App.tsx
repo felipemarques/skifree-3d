@@ -8,7 +8,9 @@ import { LobbyScreen } from '@/components/screens/LobbyScreen';
 import { RankingScreen } from '@/components/screens/RankingScreen';
 import { GameOverScreen } from '@/components/screens/GameOverScreen';
 import { PauseScreen } from '@/components/screens/PauseScreen';
+import { HowToPlayScreen } from '@/components/screens/HowToPlayScreen';
 import { GameHud } from '@/components/hud/GameHud';
+import { settings } from '@/utils/Settings';
 import type { GameController } from './gameController';
 
 const defaultControllerSnapshot: ControllerSnapshot = {
@@ -29,6 +31,13 @@ export function App() {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const [controller, setController] = useState<GameController | null>(null);
   const [controllerSnapshot, setControllerSnapshot] = useState<ControllerSnapshot>(defaultControllerSnapshot);
+  const [showHowToPlay, setShowHowToPlay] = useState(false);
+
+  useEffect(() => {
+    if (state.screen !== 'title' || settings.get('hasSeenTutorial')) return;
+    settings.set('hasSeenTutorial', true);
+    setShowHowToPlay(true);
+  }, [state.screen]);
 
   useEffect(() => {
     if (!controller) return;
@@ -53,6 +62,7 @@ export function App() {
           controller={controller}
           playerName={controllerSnapshot.playerName}
           defaultGameMode={controller.getSettingsValues().gameMode}
+          onShowHowToPlay={() => setShowHowToPlay(true)}
         />
       )}
       {controller && state.screen === 'settings' && (
@@ -87,6 +97,8 @@ export function App() {
           {state.error}
         </div>
       )}
+
+      {showHowToPlay && <HowToPlayScreen onClose={() => setShowHowToPlay(false)} />}
     </>
   );
 }

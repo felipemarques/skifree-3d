@@ -34,6 +34,7 @@ const DEFAULTS = {
   sfxVolume: 0.6,
   difficultyRamp: false,
   skillScoring: false,
+  hasSeenTutorial: false,
 };
 
 export class Settings {

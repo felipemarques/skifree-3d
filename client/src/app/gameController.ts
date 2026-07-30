@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { Game } from '@/game/Game';
 import { MenuBackdrop } from '@/game/MenuBackdrop';
 import { SocketClient } from '@/net/SocketClient';
+import { getDailyKey, getDailySeed } from '@/utils/DailyChallenge';
 import { ghostStore } from '@/utils/GhostStore';
 import { rankingStore } from '@/utils/RankingStore';
 import { settings } from '@/utils/Settings';
@@ -221,6 +222,24 @@ export class GameController {
     });
   }
 
+  startDailyChallenge(mode: GameMode) {
+    this.isMultiplayer = false;
+    this.socket.disconnect();
+    this.roomId = null;
+    this.roomSeed = null;
+    settings.set('gameMode', mode);
+    this.startGame({
+      seed: getDailySeed(),
+      multiplayer: false,
+      gameMode: mode,
+      difficulty: 'normal',
+      obstacleVolume: 1,
+      difficultyRamp: true,
+      skillScoring: true,
+      dailyKey: getDailyKey(),
+    });
+  }
+
   createRoom(name: string, gameMode: GameMode) {
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
@@ -397,6 +416,7 @@ export class GameController {
           mode: getRankingMode(result),
           difficulty: result.difficulty,
           date: Date.now(),
+          dailyKey: result.dailyKey || undefined,
         });
         const ghostSaved = result.ghostRecord ? ghostStore.trySave(result.ghostRecord) : false;
         return { ghostSaved };

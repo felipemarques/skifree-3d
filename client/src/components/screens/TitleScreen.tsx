@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Ghost, Play, Save, Settings, Trophy, Users } from 'lucide-react';
+import { CalendarDays, Ghost, HelpCircle, Play, Save, Settings, Trophy, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
@@ -12,9 +12,10 @@ interface TitleScreenProps {
   controller: GameController;
   playerName: string;
   defaultGameMode: GameMode;
+  onShowHowToPlay: () => void;
 }
 
-export function TitleScreen({ controller, playerName, defaultGameMode }: TitleScreenProps) {
+export function TitleScreen({ controller, playerName, defaultGameMode, onShowHowToPlay }: TitleScreenProps) {
   const [name, setName] = useState(playerName);
   const [roomCode, setRoomCode] = useState('');
   const [gameMode, setGameMode] = useState<GameMode>(defaultGameMode || 'classic');
@@ -50,6 +51,10 @@ export function TitleScreen({ controller, playerName, defaultGameMode }: TitleSc
               Race Ghost
             </Button>
           )}
+          <Button variant="secondary" type="button" onClick={() => controller.startDailyChallenge(gameMode)}>
+            <CalendarDays className="h-4 w-4" />
+            Daily Challenge
+          </Button>
         </div>
       </Section>
 
@@ -80,6 +85,10 @@ export function TitleScreen({ controller, playerName, defaultGameMode }: TitleSc
         <Button variant="secondary" type="button" onClick={() => controller.openSettings('title')}>
           <Settings className="h-4 w-4" />
           Settings
+        </Button>
+        <Button variant="secondary" type="button" onClick={onShowHowToPlay}>
+          <HelpCircle className="h-4 w-4" />
+          How to Play
         </Button>
       </div>
     </ScreenFrame>

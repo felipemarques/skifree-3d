@@ -1,8 +1,11 @@
+import { useEffect, useState } from 'react';
 import { ArrowLeft, RotateCcw, Trophy } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import type { GameController } from '@/app/gameController';
 import type { RankingEntry, RankingPlayerSummary } from '@/types/app';
+import { getDailyKey } from '@/utils/DailyChallenge';
+import { rankingStore } from '@/utils/RankingStore';
 import { ScreenFrame } from './ScreenFrame';
 
 interface RankingScreenProps {
@@ -26,6 +29,21 @@ function dateText(value: number) {
 }
 
 export function RankingScreen({ controller, entries, detail }: RankingScreenProps) {
+  const [tab, setTab] = useState<'all' | 'today'>('all');
+  const [dailyEntries, setDailyEntries] = useState<RankingEntry[]>([]);
+  const mode = controller.getSettingsValues().gameMode;
+
+  useEffect(() => {
+    if (tab !== 'today') return;
+    let cancelled = false;
+    rankingStore.getDaily(mode, getDailyKey(), 20).then(result => {
+      if (!cancelled) setDailyEntries(result);
+    });
+    return () => { cancelled = true; };
+  }, [tab, mode]);
+
+  const displayedEntries = tab === 'today' ? dailyEntries : entries;
+
   return (
     <ScreenFrame panelClassName="text-center">
       <div className="grid gap-1 text-center">
@@ -37,10 +55,18 @@ export function RankingScreen({ controller, entries, detail }: RankingScreenProp
         <RankingDetail controller={controller} detail={detail} />
       ) : (
         <>
-          {!entries.length && <div className="my-4 text-sm text-[#aab9cf]">No runs recorded yet.</div>}
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant={tab === 'all' ? 'default' : 'secondary'} type="button" onClick={() => setTab('all')}>
+              All-Time
+            </Button>
+            <Button variant={tab === 'today' ? 'default' : 'secondary'} type="button" onClick={() => setTab('today')}>
+              Today
+            </Button>
+          </div>
+          {!displayedEntries.length && <div className="my-4 text-sm text-[#aab9cf]">No runs recorded yet.</div>}
           <ScrollArea className="max-h-[52vh]">
             <div className="grid gap-2 text-left">
-              {entries.map((entry, index) => (
+              {displayedEntries.map((entry, index) => (
                 <div key={`${entry.playerId}-${entry.distance}-${index}`} className="grid grid-cols-[32px_1fr_auto] items-center gap-2 rounded-lg border border-white/12 bg-white/[0.06] p-3">
                   <span className="text-center text-base font-black text-cyan-300">{index + 1}</span>
                   <button

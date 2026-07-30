@@ -68,6 +68,8 @@ export interface HudState {
   momentum: number;
   cleanStreakSeconds: number;
   yetiDangerT: number;
+  iceGripT: number;
+  blizzardT: number;
 }
 
 export interface YetiThreat {
@@ -92,6 +94,7 @@ export interface GameOverState {
   difficulty: Difficulty;
   multiplayer: boolean;
   ghostSaved: boolean;
+  dailyKey: string | null;
 }
 
 export interface GhostKeyframe {
@@ -124,7 +127,7 @@ export interface UiAdapter {
   showWaiting(roomId: string, players?: PlayerStatus[]): void;
   showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }): void;
   showPause(): void;
-  showGameOver(distance: number, scores?: PlayerStatus[], meta?: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved'>>): void;
+  showGameOver(distance: number, scores?: PlayerStatus[], meta?: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved' | 'dailyKey'>>): void;
   showRanking(entries?: RankingEntry[]): void;
   showRankingDetail(player: RankingPlayerSummary | null): void;
   updateHUD(distance: number, speed: number, hp: number, state?: Partial<HudState>): void;
@@ -140,6 +143,7 @@ export interface UiAdapter {
   showHealFeedback(): void;
   showNearMissFeedback(bonus?: number): void;
   showJumpChainFeedback(bonus?: number, chainCount?: number): void;
+  showUnstuckFeedback(): void;
   setError(message: string): void;
   clearError(): void;
 }
@@ -163,6 +167,7 @@ export interface UiStoreState {
   landingFlashKey: number;
   nearMissFlashKey: number;
   jumpChainFlashKey: number;
+  unstuckFlashKey: number;
 }
 
 export interface ControllerSnapshot {

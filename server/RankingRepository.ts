@@ -17,8 +17,9 @@ function normalizeScore(input = {}) {
   const mode = VALID_MODES.has(input.mode) ? input.mode : 'classic';
   const difficulty = String(input.difficulty || 'normal').trim().slice(0, MAX_DIFFICULTY_LENGTH) || 'normal';
   const createdAt = Number(input.date || input.createdAt) || Date.now();
+  const dailyKey = input.dailyKey ? String(input.dailyKey).trim().slice(0, 10) : null;
 
-  return { playerId, name, distance, mode, difficulty, createdAt };
+  return { playerId, name, distance, mode, difficulty, createdAt, dailyKey };
 }
 
 function mapRow(row) {
@@ -51,6 +52,7 @@ class RankingRepository {
       )
     `)
       .then(() => this._ensurePlayerIdColumn())
+      .then(() => this._ensureDailyKeyColumn())
       .then(() => this._run(`
       CREATE INDEX IF NOT EXISTS idx_rankings_distance_created_at
       ON rankings(distance DESC, created_at ASC)
@@ -101,6 +103,13 @@ class RankingRepository {
     `);
   }
 
+  async _ensureDailyKeyColumn() {
+    const columns = await this._all('PRAGMA table_info(rankings)');
+    if (!columns.some(col => col.name === 'daily_key')) {
+      await this._run('ALTER TABLE rankings ADD COLUMN daily_key TEXT');
+    }
+  }
+
   async add(input) {
     await this.ready;
     const score = normalizeScore(input);
@@ -108,10 +117,10 @@ class RankingRepository {
 
     const result = await this._run(
       `
-        INSERT INTO rankings (player_id, name, distance, mode, difficulty, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO rankings (player_id, name, distance, mode, difficulty, created_at, daily_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
-      [score.playerId, score.name, score.distance, score.mode, score.difficulty, score.createdAt],
+      [score.playerId, score.name, score.distance, score.mode, score.difficulty, score.createdAt, score.dailyKey],
     );
 
     return { id: result.lastID, ...score, date: score.createdAt };
@@ -148,6 +157,45 @@ class RankingRepository {
         LIMIT ?
       `,
       [safeLimit],
+    );
+    return rows.map(mapRow);
+  }
+
+  async listDaily(mode, dailyKey, limit = 10) {
+    await this.ready;
+    const safeMode = VALID_MODES.has(mode) ? mode : 'classic';
+    const safeDailyKey = String(dailyKey || '').trim().slice(0, 10);
+    if (!safeDailyKey) return [];
+    const safeLimit = Math.max(1, Math.min(100, Math.round(Number(limit) || 10)));
+    const rows = await this._all(
+      `
+        SELECT
+          r.id,
+          r.player_id,
+          r.name,
+          r.distance,
+          r.mode,
+          r.difficulty,
+          r.created_at,
+          c.run_count
+        FROM rankings r
+        JOIN (
+          SELECT player_id, COUNT(*) AS run_count, MAX(distance) AS best_distance
+          FROM rankings
+          WHERE daily_key = ? AND mode = ?
+          GROUP BY player_id
+        ) c ON c.player_id = r.player_id AND c.best_distance = r.distance
+        WHERE r.daily_key = ? AND r.mode = ? AND r.id = (
+          SELECT r2.id
+          FROM rankings r2
+          WHERE r2.player_id = r.player_id AND r2.daily_key = ? AND r2.mode = ?
+          ORDER BY r2.distance DESC, r2.created_at ASC, r2.id ASC
+          LIMIT 1
+        )
+        ORDER BY r.distance DESC, r.created_at ASC
+        LIMIT ?
+      `,
+      [safeDailyKey, safeMode, safeDailyKey, safeMode, safeDailyKey, safeMode, safeLimit],
     );
     return rows.map(mapRow);
   }

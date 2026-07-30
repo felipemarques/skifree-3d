@@ -31,6 +31,7 @@ function normalizeEntry(entry) {
     date: Number(entry.date) || Date.now(),
     runCount: Math.max(1, Math.round(Number(entry.runCount || entry.run_count) || 1)),
     bestDistance: Math.max(0, Math.round(Number(entry.bestDistance || entry.best_distance || entry.distance) || 0)),
+    dailyKey: entry.dailyKey ? String(entry.dailyKey).slice(0, 10) : null,
   };
 }
 
@@ -145,6 +146,18 @@ export class RankingStore {
     }
 
     return this.getTop();
+  }
+
+  async getDaily(mode, dailyKey, limit = 10) {
+    try {
+      const res = await fetch(`${API_URL}?mode=${encodeURIComponent(mode)}&dailyKey=${encodeURIComponent(dailyKey)}&limit=${encodeURIComponent(limit)}`);
+      if (!res.ok) throw new Error(`Ranking API failed with ${res.status}`);
+      const payload = await res.json();
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+      return entries.map(normalizeEntry);
+    } catch (e) {
+      return [];
+    }
   }
 
   async clearRemote() {

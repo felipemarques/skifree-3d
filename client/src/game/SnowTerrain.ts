@@ -2,25 +2,31 @@
 import * as THREE from 'three';
 
 const CHUNK_SIZE = 80;
-const CHUNK_WIDTH = 120;
-const SEGMENTS_X = 58;
+// Wide enough to cover the decorative border treeline and landmarks (out to
+// ~x=108) with real ground underneath - previously 120 (+-60), which left
+// everything placed past the track a visible void with nothing rendered
+// beneath it.
+const CHUNK_WIDTH = 240;
+const SEGMENTS_X = 116;
 const SEGMENTS_Z = 42;
 
 const VERT = /* glsl */`
   uniform float uTime;
   uniform vec2 uAnchor;
+  uniform float uReliefMult;
   varying vec3 vWorldPos;
   varying float vVisualY;
   varying float vRidge;
-  varying float vLight;
   varying float vRelZ;
   varying vec3 vSnowNormal;
 
   float snowRelief(vec2 p) {
     return
-      sin(p.x * 0.08 + p.y * 0.045) * 0.42 +
-      sin(p.x * 0.19 - p.y * 0.033) * 0.22 +
-      sin(p.x * 0.48 + p.y * 0.17) * 0.07;
+      sin(p.x * 0.08 + p.y * 0.045) * 1.1 +
+      sin(p.x * 0.19 - p.y * 0.033) * 0.6 +
+      sin(p.x * 0.48 + p.y * 0.17) * 0.22 +
+      sin(p.x * 0.9 - p.y * 0.55) * 0.09 +
+      sin(p.x * 0.022 + p.y * 0.014) * 2.6 * uReliefMult;
   }
 
   void main() {
@@ -38,11 +44,9 @@ const VERT = /* glsl */`
 
     float reliefX = snowRelief(worldBase.xz + vec2(1.4, 0.0)) - reliefBase;
     float reliefZ = snowRelief(worldBase.xz + vec2(0.0, 1.4)) - reliefBase;
-    vLight = clamp(0.74 + reliefX * 0.42 - reliefZ * 0.28, 0.42, 1.08);
 
     // Real surface normal from the height field's slope, so the fragment
-    // shader can light the relief against the actual scene sun direction
-    // instead of the vLight approximation above alone.
+    // shader can light the relief against the actual scene sun direction.
     float dHdx = (reliefX * 0.78) / 1.4;
     float dHdz = (reliefZ * 0.78) / 1.4 - 0.026;
     vSnowNormal = normalize(vec3(-dHdx, 1.0, -dHdz));
@@ -56,78 +60,56 @@ const VERT = /* glsl */`
 `;
 
 const FRAG = /* glsl */`
-  uniform float uTime;
+  uniform vec3 uBiomeTint;
   varying vec3 vWorldPos;
   varying float vVisualY;
   varying float vRidge;
-  varying float vLight;
   varying float vRelZ;
   varying vec3 vSnowNormal;
 
-  float sparkleHash(vec2 p) {
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
-  }
-
   void main() {
-    vec3 shadowSnow = vec3(0.58, 0.70, 0.82);
-    vec3 midSnow = vec3(0.78, 0.86, 0.92);
-    vec3 brightSnow = vec3(0.93, 0.96, 0.98);
+    // Calmer, closer to MenuBackdrop.ts's clean two-tone terrain look -
+    // most of the busier per-pixel detail (grain, sparkle twinkle,
+    // cross-hatch shading, glints, fresnel rim) that had piled up here over
+    // several passes has been dropped in favor of one real lighting term.
+    vec3 shadowSnow = vec3(0.62, 0.74, 0.84);
+    vec3 brightSnow = vec3(0.92, 0.97, 1.0);
 
     float heightMix = smoothstep(-0.6, 0.75, vRidge);
     vec3 col = mix(shadowSnow, brightSnow, heightMix);
 
-    float cross = sin(vWorldPos.x * 0.18 + vWorldPos.z * 0.055) * 0.5 + 0.5;
-    float longBands = sin(vWorldPos.z * 0.12 + vWorldPos.x * 0.025) * 0.5 + 0.5;
-    float softShade = smoothstep(0.18, 0.82, cross * 0.65 + longBands * 0.35);
-    col = mix(col * 0.82, mix(col, midSnow, 0.28), softShade);
-    col *= vLight;
-
     // Real diffuse lighting from the height-field normal against the
-    // scene's actual sun direction (see Game.ts's DirectionalLight), layered
-    // on top of the vLight approximation above so the bumps read as
-    // physically dimensional rather than painted-on.
+    // scene's actual sun direction, so the (now much bumpier) relief still
+    // reads as physically dimensional despite the subtler palette.
     vec3 sunDir = normalize(vec3(-26.0, 56.0, 22.0));
     float ndotl = clamp(dot(vSnowNormal, sunDir), 0.0, 1.0);
-    col *= mix(0.86, 1.14, ndotl);
+    col *= mix(0.88, 1.08, ndotl);
 
-    vec3 viewDir = normalize(cameraPosition - vWorldPos);
+    // Faint groomed-corduroy lane stripes running the full width of the
+    // trail - very low color contrast (barely-there shading) but a crisp,
+    // narrow transition at each line rather than a soft blurred gradient,
+    // so the division between stripes still reads clearly up close.
+    float laneG = fract(vWorldPos.x / 8.5);
+    float laneDist = abs(laneG - 0.5) * 2.0;
+    float laneLine = smoothstep(0.486, 0.5, laneDist);
+    col = mix(col, col * 0.95, laneLine);
 
-    // Fine per-pixel grain so close-up snow reads as granular/packed rather
-    // than a smooth gradient.
-    float grain = sparkleHash(floor(vWorldPos.xz * 46.0)) - 0.5;
-    col += grain * 0.035;
+    // Groomed trail edges - a calmer, distinctly packed strip right at the
+    // playable width's boundary (Obstacles.ts's TRACK_LIMIT=52) with a
+    // faint corduroy groove pattern, so the run reads as a marked trail
+    // rather than open, edgeless snowfield.
+    float ax = abs(vWorldPos.x);
+    float edgeBand = smoothstep(46.0, 50.0, ax) - smoothstep(54.0, 59.0, ax);
+    float corduroy = sin(vWorldPos.z * 2.2) * 0.5 + 0.5;
+    vec3 edgeColor = mix(vec3(0.74, 0.82, 0.9), vec3(0.86, 0.91, 0.96), corduroy);
+    col = mix(col, edgeColor, edgeBand * 0.5);
 
-    float pathLine = smoothstep(0.47, 0.5, abs(fract(vWorldPos.x / 8.5) - 0.5) * 2.0);
-    col = mix(col * 0.88, col, pathLine);
+    // Soft distance haze so far-ahead terrain washes gently toward the
+    // sky/fog tone instead of staying sharply saturated at the draw limit.
+    float farHaze = smoothstep(90.0, 220.0, vRelZ);
+    col = mix(col, vec3(0.95, 0.97, 1.0), farHaze * 0.2);
 
-    float centerTrack = 1.0 - smoothstep(10.0, 34.0, abs(vWorldPos.x));
-    float sideGlint = smoothstep(0.68, 1.0, sin(vWorldPos.z * 0.24 + abs(vWorldPos.x) * 0.08) * 0.5 + 0.5);
-    col = mix(col, vec3(0.86, 0.93, 0.98), centerTrack * sideGlint * 0.07);
-
-    float slopeDistance = 1.0 - smoothstep(20.0, 210.0, vRelZ);
-    col = mix(col, brightSnow, 0.03 * slopeDistance);
-
-    // Hazy, blown-out-white horizon: far-ahead terrain washes toward bright
-    // snow (distance haze), and shallow viewing angles pick up an extra rim
-    // brighten (fresnel) the way sunlit snow does at a grazing look.
-    float farHaze = smoothstep(80.0, 220.0, vRelZ);
-    col = mix(col, vec3(0.95, 0.97, 1.0), farHaze * 0.22);
-    float fresnel = pow(1.0 - clamp(abs(viewDir.y), 0.0, 1.0), 2.2);
-    col = mix(col, vec3(0.92, 0.96, 1.0), fresnel * 0.06);
-
-    // Sparse, view-angle-weighted glints mimicking sunlight catching ice
-    // crystals - sparkle *positions* come from a per-cell hash so they're
-    // stable in world space, but a second hash keyed off cell + slow time
-    // makes them twinkle rather than sitting there as static dots.
-    vec2 sparkleCell = floor(vWorldPos.xz * 3.1);
-    float sparkleRnd = sparkleHash(sparkleCell);
-    float sparklePresence = step(0.978, sparkleRnd);
-    float grazing = pow(clamp(viewDir.y, 0.0, 1.0), 1.6);
-    float twinkle = sparkleHash(sparkleCell + floor(uTime * 5.0 + sparkleRnd * 37.0));
-    float sparkle = sparklePresence * grazing * smoothstep(0.15, 0.95, twinkle);
-    col += vec3(1.0, 0.99, 0.95) * sparkle * 0.55;
+    col *= uBiomeTint;
 
     gl_FragColor = vec4(col, 1.0);
   }
@@ -142,6 +124,8 @@ export class SnowTerrain {
       uniforms: {
         uTime: { value: 0 },
         uAnchor: { value: new THREE.Vector2(0, 0) },
+        uBiomeTint: { value: new THREE.Color(1, 1, 1) },
+        uReliefMult: { value: 1 },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
@@ -162,6 +146,14 @@ export class SnowTerrain {
     group.userData.chunkIndex = chunkIndex;
     this.scene.add(group);
     return group;
+  }
+
+  setBiomeTint(color) {
+    this._material.uniforms.uBiomeTint.value.copy(color);
+  }
+
+  setReliefMult(mult) {
+    this._material.uniforms.uReliefMult.value = mult;
   }
 
   update(playerZ, elapsed = 0, anchorX = 0) {

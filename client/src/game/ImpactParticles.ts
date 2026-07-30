@@ -19,6 +19,7 @@ export class ImpactParticles {
     this._velocities = new Float32Array(maxParticles * 3);
     this._life = new Float32Array(maxParticles);
     this._groundY = new Float32Array(maxParticles);
+    this._gravityScale = new Float32Array(maxParticles);
 
     for (let i = 0; i < maxParticles; i++) {
       this._positions[i * 3 + 1] = -9999;
@@ -51,6 +52,8 @@ export class ImpactParticles {
     const upBias = options.upBias ?? 1.6;
     const life = options.life ?? 0.4;
     const groundY = options.groundY ?? 0;
+    const gravityScale = options.gravityScale ?? 1;
+    const drift = options.drift ?? null;
 
     for (let n = 0; n < count; n++) {
       const i = this._cursor;
@@ -58,9 +61,9 @@ export class ImpactParticles {
 
       const angle = Math.random() * Math.PI * 2;
       const radial = Math.random() * speed * spread;
-      this._velocities[i * 3] = Math.cos(angle) * radial;
-      this._velocities[i * 3 + 1] = Math.random() * speed * upBias;
-      this._velocities[i * 3 + 2] = Math.sin(angle) * radial;
+      this._velocities[i * 3] = Math.cos(angle) * radial + (drift ? drift.x || 0 : 0);
+      this._velocities[i * 3 + 1] = Math.random() * speed * upBias + (drift ? drift.y || 0 : 0);
+      this._velocities[i * 3 + 2] = Math.sin(angle) * radial + (drift ? drift.z || 0 : 0);
 
       this._positions[i * 3] = x;
       this._positions[i * 3 + 1] = y;
@@ -72,6 +75,7 @@ export class ImpactParticles {
 
       this._life[i] = life * (0.7 + Math.random() * 0.6);
       this._groundY[i] = groundY;
+      this._gravityScale[i] = gravityScale;
     }
 
     this.geometry.attributes.color.needsUpdate = true;
@@ -84,7 +88,7 @@ export class ImpactParticles {
       anyAlive = true;
       this._life[i] -= dt;
 
-      const vy = this._velocities[i * 3 + 1] - GRAVITY * dt;
+      const vy = this._velocities[i * 3 + 1] - GRAVITY * this._gravityScale[i] * dt;
       this._velocities[i * 3 + 1] = vy;
       this._positions[i * 3] += this._velocities[i * 3] * dt;
       this._positions[i * 3 + 1] += vy * dt;

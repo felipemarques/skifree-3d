@@ -42,6 +42,9 @@ export function GameOverScreen({ controller, gameOver }: { controller: GameContr
       {gameOver.ghostSaved && (
         <div className="text-xs font-bold text-cyan-300">New ghost record saved!</div>
       )}
+      {gameOver.dailyKey && (
+        <div className="text-xs font-bold text-amber-300">Today's Challenge Run</div>
+      )}
       {ghost && (
         <Button type="button" onClick={() => controller.startGhostRace(gameOver.gameMode, gameOver.difficulty)}>
           <Ghost className="h-4 w-4" />

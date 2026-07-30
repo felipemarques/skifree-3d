@@ -15,7 +15,14 @@ const INVINCIBILITY_TIME = 1.8;
 const HIT_BLINK_RATE = 0.08;
 const UNSTUCK_PUSH = 5.0;
 const STUCK_DETECT_TIME = 2.2;
-const STUCK_Z_THRESHOLD = 0.8;
+// Relative, not absolute: "stuck" means actual forward progress is far
+// below what the player's own current speed/heading implies (i.e.
+// something is physically blocking them), not just moving slowly on
+// purpose - full brake + a sharp turn legitimately converges to well under
+// 1 unit/s of forward speed, which a flat threshold used to misread as
+// stuck and yank the player forward with no explanation.
+const STUCK_Z_RATIO_THRESHOLD = 0.35;
+const STUCK_MIN_EXPECTED_SPEED = 0.5;
 const DEATH_ANIMATION_DURATION = 1.75;
 const YETI_CAPTURE_ANIMATION_DURATION = 2.15;
 const DEATH_GROUND_CLEARANCE = 0.055;
@@ -39,6 +46,10 @@ const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
 const YETI_PROXIMITY_BONUS_RATE = 3;
 const YETI_DANGER_RADIUS = 16;
 const LANDING_SQUASH_DURATION = 0.22;
+// Mirrors WeatherAtZ's default in shared/AuthoritativeSim.ts - Game.ts computes
+// the actual weather (getWeatherAtZ) once per frame and passes it in, since
+// solo has no separate prediction/replay step that could diverge.
+const DEFAULT_WEATHER = { grip: 1, fogIntensity: 0, snowIntensity: 0 };
 
 function getChainWindowMs(momentum) {
   return JUMP_CHAIN_WINDOW_MS * (1 + THREE.MathUtils.clamp(momentum, 0, 1) * JUMP_CHAIN_MOMENTUM_WINDOW_BONUS);
@@ -206,7 +217,7 @@ export class Player {
     if (this.onUnstuck) this.onUnstuck();
   }
 
-  update(dt, input, obstacles, skillScoring = false) {
+  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER) {
     if (!this.isAlive) {
       this.updateDeathAnimation(dt);
       return;
@@ -236,7 +247,7 @@ export class Player {
     if (!this.isAirborne) {
       const turnSpeed = settings.get('keyTurnSpeed');
       this.angle = THREE.MathUtils.clamp(
-        this.angle + steer * turnSpeed * dt,
+        this.angle + steer * turnSpeed * weather.grip * dt,
         -Math.PI * 0.42,
         Math.PI * 0.42,
       );
@@ -252,7 +263,7 @@ export class Player {
 
       const lateralFactor = Math.cos(this.angle);
       const penalisedTarget = targetSpeed * Math.max(lateralFactor, 0.28);
-      this.speed = THREE.MathUtils.lerp(this.speed, penalisedTarget, Math.min(1, 10 * dt));
+      this.speed = THREE.MathUtils.lerp(this.speed, penalisedTarget, Math.min(1, 10 * dt * weather.grip));
     }
 
     const jumpPressed = input.jump;
@@ -434,7 +445,13 @@ export class Player {
     const zDelta = Math.abs(this.position.z - this._lastZ);
     this._lastZ = this.position.z;
 
-    if (zDelta / Math.max(dt, 0.001) < STUCK_Z_THRESHOLD) {
+    const expectedZSpeed = Math.abs(Math.cos(this.angle) * this.speed);
+    const actualZSpeed = zDelta / Math.max(dt, 0.001);
+    const isObstructed = !this.isAirborne
+      && expectedZSpeed > STUCK_MIN_EXPECTED_SPEED
+      && actualZSpeed / expectedZSpeed < STUCK_Z_RATIO_THRESHOLD;
+
+    if (isObstructed) {
       this._stuckTimer += dt;
       if (this._stuckTimer >= STUCK_DETECT_TIME) this.unstuck();
     } else {

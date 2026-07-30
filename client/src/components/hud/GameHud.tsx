@@ -49,6 +49,16 @@ export function GameHud({ state }: { state: UiStoreState }) {
                   Danger Bonus
                 </div>
               )}
+              {state.hud.iceGripT > 0.15 && (
+                <div className="rounded-full border border-cyan-200/50 bg-cyan-500/15 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-cyan-100 shadow-[0_0_14px_rgba(165,243,252,0.25)]">
+                  Icy
+                </div>
+              )}
+              {state.hud.blizzardT > 0.3 && (
+                <div className="rounded-full border border-slate-200/40 bg-slate-400/15 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-slate-100">
+                  Blizzard
+                </div>
+              )}
               {state.hud.spectatorTarget && (
                 <div className="max-w-full rounded-full border border-yellow-300/40 bg-yellow-300/15 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-yellow-100">
                   Viewing {state.hud.spectatorTarget}

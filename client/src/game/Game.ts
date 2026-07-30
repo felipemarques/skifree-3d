@@ -18,6 +18,11 @@ import { SkyBg } from './SkyBg';
 import { HorizonMountains } from './HorizonMountains';
 import { PostFX } from './PostFX';
 import { CourseDecor } from './CourseDecor';
+import { Wildlife } from './Wildlife';
+import { Landmarks } from './Landmarks';
+import { Aurora } from './Aurora';
+import { StormWall } from './StormWall';
+import { createBiomeBlendTarget, getBiomeAtZ, getDominantBiome } from './Biome';
 import { settings } from '../utils/Settings';
 import { getVisualTerrainY } from './VisualTerrain';
 import {
@@ -30,9 +35,11 @@ import {
   createInitialPlayerState,
   getChainWindowMs,
   getGameplayObstaclesNear,
+  getWeatherAtZ,
   getYetiConfig,
   sanitizePlayerColor,
   simulatePlayerTick,
+  WEATHER_ZONE_LENGTH,
 } from '../../../shared/AuthoritativeSim';
 
 const CHUNK_SIZE = 80;
@@ -47,6 +54,22 @@ const HITSTOP_TIME_SCALE = 0.05;
 const YETI_DANGER_RADIUS = 16;
 const YETI_PROXIMITY_BONUS_RATE = 3;
 const GHOST_SAMPLE_INTERVAL_S = 0.12;
+// How far ahead of an upcoming blizzard zone the StormWall visual starts
+// fading in - see _updateStormWall.
+const STORM_WALL_LOOKAHEAD = 280;
+const STORM_WALL_MAX_OPACITY = 0.62;
+// Slow, one-directional time-of-day drift toward a warm "golden hour" tint,
+// purely cosmetic - a full day/night cycle doesn't make sense for a run
+// that's minutes long, but a long run slowly warming/dimming does. Capped
+// well under 1 so biome identity (forest green, cliffs orange) never fully
+// disappears under it.
+const DAY_DRIFT_SECONDS = 900;
+const DAY_DRIFT_MAX_STRENGTH = 0.55;
+const GOLDEN_HOUR = {
+  skyTop: new THREE.Color(0x3a2f52), skyHorizon: new THREE.Color(0xf2895a), skyGround: new THREE.Color(0xffd9a0),
+  fogColor: new THREE.Color(0xf0a878), sunColor: new THREE.Color(0xffb066),
+  hemiSky: new THREE.Color(0xf5c9a0), hemiGround: new THREE.Color(0x5a4560),
+};
 const DEV_REMOTE_HALF_W = 0.35;
 const DEV_REMOTE_HALF_D = 0.55;
 const DEV_HITBOX_COLORS = {
@@ -86,11 +109,17 @@ function getFogDistances(useHighGraphics, fogLevel) {
 
   const near = baseNear + lighter * 78 - heavier * 32;
   const far = baseFar + lighter * 92 - heavier * 50;
+  return { near: Math.max(30, near), far: Math.max(near + 80, far) };
+}
 
-  return {
-    near: Math.max(30, near),
-    far: Math.max(near + 80, far),
-  };
+// FogExp2's density has no explicit near/far, just a continuous falloff -
+// derive a density from a target "far" distance so tuning stays in the
+// same intuitive units as before, while getting exponential's more natural,
+// genuinely volumetric-reading falloff (thin close up, thick further out,
+// no hard linear ramp) instead of Fog's flat linear gradient. k=2.1 puts
+// ~99% opacity right around the target far distance.
+function fogDensityFromFar(far) {
+  return 2.1 / Math.max(1, far);
 }
 
 function colorToNumber(color) {
@@ -111,12 +140,14 @@ export class Game {
     this._lastTime = 0;
     this._hitstopRemaining = 0;
     this._yetiDangerT = 0;
+    this._yetiTriggerAtElapsedS = -1;
     this._chainRemainingT = 0;
     this._netTimer = 0;
     this._animFrame = null;
     this._scores = new Map();
     this._ghostRecording = !this.options.multiplayer ? { keyframes: [], sampleTimer: 0 } : null;
     this._pendingGhostSaved = false;
+    this.dailyKey = this.options.dailyKey || null;
     this._gameOverSent = false;
     this._finalGameOverShown = false;
     this._gameOverDistance = 0;
@@ -127,6 +158,7 @@ export class Game {
     this._fireHeld = false;
     this._throwCooldown = 0;
     this._yetiWasNear = false;
+    this._lastWeatherKind = 'clear';
     this._spawnProtectionRemaining = this.options.multiplayer
       ? MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS
       : 0;
@@ -348,7 +380,12 @@ export class Game {
     const fogColor = 0xaec7dc;
     const fog = getFogDistances(this._useHighGraphics, this.fogLevel);
     this.scene.background = new THREE.Color(fogColor);
-    this.scene.fog = new THREE.Fog(fogColor, fog.near, fog.far);
+    // Exponential fog reads as a real medium the further you look into it -
+    // dense/blizzard weather leans hard on this (see _updateWeatherVisuals).
+    this.scene.fog = new THREE.FogExp2(fogColor, fogDensityFromFar(fog.far));
+    this._baseFogFar = fog.far;
+    this._baseFogColor = new THREE.Color(fogColor);
+    this._blizzardFogColor = new THREE.Color(0xeef2f5);
     
     // Camera
     this.threeCamera = new THREE.PerspectiveCamera(
@@ -371,12 +408,34 @@ export class Game {
     sun.shadow.camera.bottom = -60;
     sun.shadow.bias = -0.00025;
     this.scene.add(sun);
+    this.sun = sun;
+    this.hemi = hemi;
+    // "_fixed*" are the true, one-time graphics-quality-scaled originals.
+    // "_base*" (also used by _updateWeatherVisuals) are the current
+    // biome-resting values, overwritten every frame by _updateBiomeVisuals
+    // before weather blends further from them toward its blizzard target.
+    this._fixedBaseSunIntensity = sun.intensity;
+    this._fixedBaseHemiIntensity = hemi.intensity;
+    this._baseSunIntensity = sun.intensity;
+    this._baseHemiIntensity = hemi.intensity;
+    this._biomeBlend = createBiomeBlendTarget();
+    this._currentBiome = 'forest';
+    this._biomeReliefMult = 1;
 
     if (this._useHighGraphics) {
       this.sky = new SkyBg(this.scene);
       this.mountains = new HorizonMountains(this.scene, fogColor);
       this.postFx = new PostFX(this.renderer, this.scene, this.threeCamera);
+      this.wildlife = new Wildlife(this.scene);
+      this.landmarks = new Landmarks(this.scene, this.options.seed || 12345, this.graphicsQuality);
+      this.aurora = new Aurora(this.scene);
     }
+    // Not gated behind _useHighGraphics like the above - a single cheap
+    // plane, and seeing an oncoming blizzard is a readability/fairness cue
+    // as much as atmosphere, so it shouldn't be low-quality-only missing.
+    this.stormWall = new StormWall(this.scene);
+    this._breathHeadPos = new THREE.Vector3();
+    this._breathTimer = 2;
     
     // Subsystems
     const seed = this.options.seed || 12345;
@@ -427,6 +486,7 @@ export class Game {
       this.ui.showJumpChainFeedback(bonus, chainCount);
       this.audio.playJumpChain();
     };
+    this.player.onUnstuck = () => this.ui.showUnstuckFeedback();
     this.player.onJumpStart = () => this.audio.playJump();
     this.player.onJumpLand = airSeconds => {
       this.audio.playLand();
@@ -633,6 +693,29 @@ export class Game {
     return clamp(dx / 8, -1, 1);
   }
 
+  /** Occasional breath-fog puff near the player's head, more often when cold. */
+  _updateBreathFog(dt, weather) {
+    if (!this.player.isAlive) return;
+    this._breathTimer -= dt;
+    if (this._breathTimer > 0) return;
+    const cold = this._currentBiome !== 'forest' || weather.fogIntensity > 0.3 || weather.grip < 0.9;
+    this._breathTimer = cold ? (1.0 + Math.random()) : (2.5 + Math.random() * 2.5);
+    const head = this.player.mesh.userData.skierParts?.head;
+    if (!head) return;
+    head.getWorldPosition(this._breathHeadPos);
+    this.impactParticles.burst(this._breathHeadPos.x, this._breathHeadPos.y, this._breathHeadPos.z, {
+      count: 3,
+      color: [1, 1, 1],
+      speed: 0.35,
+      spread: 0.12,
+      upBias: 2.0,
+      life: 0.85,
+      groundY: this._breathHeadPos.y - 5,
+      gravityScale: 0.15,
+      drift: { x: 0, y: 0.18, z: -0.35 },
+    });
+  }
+
   /** Periodic snow spray kicked up while carving hard on the ground. */
   _updateSkiSpray(dt, mesh, speed, isAirborne, groundYAt) {
     if (!mesh) return;
@@ -650,6 +733,111 @@ export class Game {
       life: 0.32,
       groundY,
     });
+  }
+
+  /**
+   * Purely cosmetic - slowly evolves the world's palette/lighting with
+   * distance (pine forest -> open alpine -> dusk cliffs). Must run before
+   * _updateWeatherVisuals each frame: it rewrites the "resting" baseline
+   * (_baseFogColor/_baseSunIntensity/_baseHemiIntensity) that weather then
+   * blends further from toward its own blizzard target that same frame.
+   */
+  _updateBiomeVisuals(z) {
+    const biome = getBiomeAtZ(z, this._biomeBlend);
+
+    // Slow time-of-day drift toward golden hour, layered on top of the
+    // biome-resolved colors before anything below reads them - see
+    // DAY_DRIFT_SECONDS/DAY_DRIFT_MAX_STRENGTH. `biome` is scratch state
+    // recomputed fresh every frame, so mutating it further here is safe.
+    const driftT = clamp(this._elapsedSeconds / DAY_DRIFT_SECONDS, 0, 1) * DAY_DRIFT_MAX_STRENGTH;
+    if (driftT > 0) {
+      biome.skyTop.lerp(GOLDEN_HOUR.skyTop, driftT);
+      biome.skyHorizon.lerp(GOLDEN_HOUR.skyHorizon, driftT);
+      biome.skyGround.lerp(GOLDEN_HOUR.skyGround, driftT);
+      biome.fogColor.lerp(GOLDEN_HOUR.fogColor, driftT);
+      biome.sunColor.lerp(GOLDEN_HOUR.sunColor, driftT);
+      biome.hemiSky.lerp(GOLDEN_HOUR.hemiSky, driftT);
+      biome.hemiGround.lerp(GOLDEN_HOUR.hemiGround, driftT);
+    }
+
+    this._baseFogColor.copy(biome.fogColor);
+    this._baseSunIntensity = this._fixedBaseSunIntensity * biome.sunIntensityMult;
+    this._baseHemiIntensity = this._fixedBaseHemiIntensity;
+    this.sun.color.copy(biome.sunColor);
+    this.hemi.color.copy(biome.hemiSky);
+    this.hemi.groundColor.copy(biome.hemiGround);
+    this.sky?.setColors(biome.skyTop, biome.skyHorizon, biome.skyGround);
+    this.mountains?.setBiomeTint(biome.mountainTint, biome.mountainTintT);
+    this.terrain?.setBiomeTint?.(biome.snowTint);
+    this.terrain?.setReliefMult?.(biome.terrainReliefMult);
+    this.aurora?.setIntensity(biome.auroraIntensity);
+    this._biomeReliefMult = biome.terrainReliefMult;
+    this._currentBiome = getDominantBiome(z);
+  }
+
+  /** Purely cosmetic - tweens fog/snow toward the current weather zone's targets. */
+  _updateWeatherVisuals(dt, weather) {
+    if (!this.scene.fog) return;
+    const blend = clamp(2.5 * dt, 0, 1);
+    // Absolute (not just relative) cap so a blizzard is a real whiteout
+    // regardless of the player's fogLevel/graphics settings - a straight
+    // percentage cut of an already-far base distance barely reads.
+    const targetFar = THREE.MathUtils.lerp(this._baseFogFar, Math.min(this._baseFogFar, 20), weather.fogIntensity);
+    const targetDensity = fogDensityFromFar(targetFar);
+    this.scene.fog.density = THREE.MathUtils.lerp(this.scene.fog.density, targetDensity, blend);
+    if (!this._weatherColorTarget) this._weatherColorTarget = new THREE.Color();
+    this._weatherColorTarget.lerpColors(this._baseFogColor, this._blizzardFogColor, weather.fogIntensity);
+    this.scene.fog.color.lerp(this._weatherColorTarget, blend);
+    if (this.scene.background?.isColor) this.scene.background.lerp(this._weatherColorTarget, blend);
+    this.snow?.setIntensity(weather.snowIntensity);
+
+    // Fog alone still lets a shadow an obstacle casts on the ground read as
+    // a dark tell against the whited-out snow before the obstacle itself is
+    // legible - even dimmed, a shadow edge still shows as contrast against
+    // a uniformly bright field. Softening the sun buys a smooth-looking
+    // transition; actually dropping the shadow map once deep in the storm
+    // is what removes the tell for good.
+    if (this.sun) {
+      const targetSun = THREE.MathUtils.lerp(this._baseSunIntensity, this._baseSunIntensity * 0.15, weather.fogIntensity);
+      this.sun.intensity = THREE.MathUtils.lerp(this.sun.intensity, targetSun, blend);
+      this.sun.castShadow = weather.fogIntensity < 0.6;
+    }
+    if (this.hemi) {
+      const targetHemi = THREE.MathUtils.lerp(this._baseHemiIntensity, this._baseHemiIntensity * 1.25, weather.fogIntensity);
+      this.hemi.intensity = THREE.MathUtils.lerp(this.hemi.intensity, targetHemi, blend);
+    }
+
+    const kind = weather.fogIntensity > 0.5 ? 'blizzard' : (weather.grip < 0.7 ? 'icy' : 'clear');
+    if (kind !== this._lastWeatherKind) {
+      if (kind !== 'clear') this.audio.playWeatherShift(kind);
+      this._lastWeatherKind = kind;
+    }
+  }
+
+  /**
+   * Looks ahead to the next deterministic weather zone (see shared
+   * getWeatherAtZ/WEATHER_ZONE_LENGTH) and, if it's a blizzard, parks the
+   * StormWall visual at that boundary and fades it in over the approach so
+   * the storm is visible coming from a distance rather than only appearing
+   * once the player is already inside the fog/snow ramp.
+   */
+  _updateStormWall(z, weather, baseY) {
+    if (!this.stormWall) return;
+    const zoneIndex = Math.floor(z / WEATHER_ZONE_LENGTH);
+    const nextZoneStart = (zoneIndex + 1) * WEATHER_ZONE_LENGTH;
+    const nextWeather = getWeatherAtZ(this.seed, nextZoneStart + WEATHER_ZONE_LENGTH * 0.5);
+
+    // Hide once already inside real fog (the wall would be redundant/behind
+    // the camera by then) or if the upcoming zone isn't a blizzard at all.
+    if (nextWeather.fogIntensity <= 0.5 || weather.fogIntensity > 0.35) {
+      this.stormWall.setOpacity(0);
+      return;
+    }
+
+    const distanceToWall = nextZoneStart - z;
+    const t = clamp(1 - distanceToWall / STORM_WALL_LOOKAHEAD, 0, 1);
+    this.stormWall.setPosition(nextZoneStart, baseY);
+    this.stormWall.setOpacity(t * STORM_WALL_MAX_OPACITY);
   }
 
   /** Fades in a low tension drone as the player nears the yeti trigger range. */
@@ -689,12 +877,13 @@ export class Game {
   }
 
   /**
-   * Multiplayer only: display-side estimate of the same danger window the
+   * Multiplayer only: display-side estimate of the same danger gap the
    * server actually scores from (see maybeApplyYetiCapture) - cosmetic only,
-   * the real bonusDistance always comes from the server snapshot. Reuses
-   * the exported getYetiConfig so the numbers can't drift from the real
-   * formula, but elapsed time here is the client's own clock, not the
-   * server's roomTimeMs, so treat this as an approximation for the meter.
+   * the real bonusDistance/capture always comes from the server snapshot.
+   * Reuses the exported getYetiConfig so the chase speed can't drift from
+   * the real formula, but the trigger timestamp here is the client's own
+   * elapsed-time clock, not the server's roomTimeMs, so treat this as an
+   * approximation for the meter.
    */
   _updateYetiDangerDisplay(distance, speed) {
     if (!this.skillScoring || this.yetiStartMode === 'disabled') {
@@ -704,11 +893,16 @@ export class Game {
     const config = getYetiConfig(this.roomSettings);
     if (distance < config.triggerDistance) {
       this._yetiDangerT = 0;
+      this._yetiTriggerAtElapsedS = -1;
       return;
     }
-    const activeSeconds = Math.max(0, this._elapsedSeconds - config.triggerDistance / Math.max(BASE_SPEED, speed));
-    const captureThreshold = Math.max(8, config.captureAfterSeconds - distance / 220);
-    this._yetiDangerT = clamp(activeSeconds / captureThreshold, 0, 1);
+    if (this._yetiTriggerAtElapsedS < 0) {
+      this._yetiTriggerAtElapsedS = this._elapsedSeconds;
+    }
+    const elapsedSinceTrigger = Math.max(0, this._elapsedSeconds - this._yetiTriggerAtElapsedS);
+    const yetiDistance = config.triggerDistance + config.chaseSpeed * elapsedSinceTrigger;
+    const gap = distance - yetiDistance;
+    this._yetiDangerT = clamp(1 - gap / 100, 0, 1);
   }
 
   /** 1 = chain just extended, 0 = window about to expire and reset it. */
@@ -748,7 +942,7 @@ export class Game {
       const spectator = this.options.multiplayer ? this._getBestAliveRemotePlayer() : null;
       const focusPos = spectator?.rp?.mesh?.position || this.player.position;
       const visualGroundY = this._useHighGraphics
-        ? (x, z) => getVisualTerrainY(x, z, focusPos.x, focusPos.z)
+        ? (x, z) => getVisualTerrainY(x, z, focusPos.x, focusPos.z, this._biomeReliefMult)
         : null;
       this.player.updateDeathAnimation(dt, visualGroundY);
 
@@ -761,6 +955,7 @@ export class Game {
       this.camera.update(dt, this.player.mesh, Math.max(this.player.speed, 4));
       this.sky?.update(this.threeCamera.position);
       this.mountains?.update(this.threeCamera.position);
+    this.aurora?.update(dt, this.threeCamera.position);
       this.snow.update(dt, this.threeCamera.position, Math.max(this.player.speed, 4));
       this.audio.updateContinuous(0, 0, false);
       return;
@@ -782,14 +977,19 @@ export class Game {
 
     this._elapsedSeconds = (performance.now() - this._startTime) / 1000;
     const visualGroundY = this._useHighGraphics
-      ? (x, z) => getVisualTerrainY(x, z, this.player.position.x, this.player.position.z)
+      ? (x, z) => getVisualTerrainY(x, z, this.player.position.x, this.player.position.z, this._biomeReliefMult)
       : null;
     
     // Get nearby obstacles for collision
     const nearby = this.obstacles.getObstaclesNear(pz, 25);
     
     // Update player
-    this.player.update(dt, this.input, nearby, this.skillScoring);
+    this._updateBiomeVisuals(pz);
+    const weather = getWeatherAtZ(this.seed, pz);
+    this._updateWeatherVisuals(dt, weather);
+    this.stormWall?.update(dt);
+    this._updateStormWall(pz, weather, this.player.position.y);
+    this.player.update(dt, this.input, nearby, this.skillScoring, weather);
     if (this._ghostRecording) {
       this._ghostRecording.sampleTimer += dt;
       if (this._ghostRecording.sampleTimer >= GHOST_SAMPLE_INTERVAL_S) {
@@ -836,8 +1036,9 @@ export class Game {
     
     // Update subsystems
     this.terrain.update(pz, this._elapsedSeconds, this.player.position.x);
-    this.obstacles.update(dt, pz, visualGroundY);
+    this.obstacles.update(dt, pz, visualGroundY, weather.fogIntensity);
     this.courseDecor.update(dt, pz, visualGroundY);
+    this.landmarks?.update(dt, pz, visualGroundY);
     this.yeti.update(
       dt,
       this.player.position,
@@ -856,16 +1057,25 @@ export class Game {
     this._updateYetiTension(distance);
     this._updateYetiDangerBonus(dt);
     this.camera.update(dt, this.player.mesh, this.player.speed);
+    this.postFx?.update(this.player.speed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
+    this.aurora?.update(dt, this.threeCamera.position);
+    this.wildlife?.update(dt, this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, this.player.speed);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
+    this._updateBreathFog(dt, weather);
+    this.audio.updateWeatherFoley(dt, weather);
     this.impactParticles.update(dt);
+    this._updateChainRemainingSolo();
     this.audio.updateContinuous(this.player.speed, this.player.angle, this.player.isAirborne);
+    this.audio.updateMusic(dt, this.player.speed, this._yetiDangerT, this._chainRemainingT);
+    const ambientCue = this.audio.updateAmbient(dt, this._currentBiome);
+    if (ambientCue === 'bird') this.wildlife?.spawnForestBird(this.threeCamera.position);
+    else if (ambientCue === 'echo') this.wildlife?.spawnEagle(this.threeCamera.position);
 
     // HUD
-    this._updateChainRemainingSolo();
     this.ui.updateHUD(distance, this.player.speed, this.player.hp, {
       isAirborne: this.player.isAirborne,
       graphicsQuality: this.graphicsQuality,
@@ -875,6 +1085,8 @@ export class Game {
       momentum: this.player.momentum || 0,
       cleanStreakSeconds: this.player.cleanStreakSeconds || 0,
       yetiDangerT: this._yetiDangerT || 0,
+      iceGripT: 1 - weather.grip,
+      blizzardT: weather.fogIntensity,
     });
     
     // Update remote players
@@ -941,7 +1153,7 @@ export class Game {
 
     this._elapsedSeconds = (performance.now() - this._startTime) / 1000;
     const visualGroundY = this._useHighGraphics
-      ? (x, z) => getVisualTerrainY(x, z, focusX, focusZ)
+      ? (x, z) => getVisualTerrainY(x, z, focusX, focusZ, this._biomeReliefMult)
       : null;
 
     if (focusState.alive) {
@@ -984,23 +1196,41 @@ export class Game {
       this.player.updateDeathAnimation(dt, visualGroundY);
     }
 
+    // Read-only for rendering - the canonical, physics-affecting weather call
+    // already happened inside _simulatePredictedAuthoritativeTick above.
+    this._updateBiomeVisuals(focusZ);
+    const weather = getWeatherAtZ(this.seed, focusZ);
+    this._updateWeatherVisuals(dt, weather);
+    this.stormWall?.update(dt);
+    this._updateStormWall(focusZ, weather, focusMesh.position.y);
+
     this.terrain.update(focusMesh.position.z, this._elapsedSeconds, focusMesh.position.x);
-    this.obstacles.update(dt, focusMesh.position.z, visualGroundY);
+    this.obstacles.update(dt, focusMesh.position.z, visualGroundY, weather.fogIntensity);
     this.courseDecor.update(dt, focusMesh.position.z, visualGroundY);
+    this.landmarks?.update(dt, focusMesh.position.z, visualGroundY);
     this.camera.update(dt, focusMesh, focusSpeed);
+    this.postFx?.update(focusSpeed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
+    this.aurora?.update(dt, this.threeCamera.position);
+    this.wildlife?.update(dt, this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, focusSpeed);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
+    this._updateBreathFog(dt, weather);
+    this.audio.updateWeatherFoley(dt, weather);
     this.impactParticles.update(dt);
+    this._updateChainRemainingAuthoritative();
     this.audio.updateContinuous(focusState.alive ? focusState.speed : 0, this.player.angle, this.player.isAirborne);
+    this.audio.updateMusic(dt, focusState.alive ? focusState.speed : 0, this._yetiDangerT, this._chainRemainingT);
+    const ambientCue = this.audio.updateAmbient(dt, this._currentBiome);
+    if (ambientCue === 'bird') this.wildlife?.spawnForestBird(this.threeCamera.position);
+    else if (ambientCue === 'echo') this.wildlife?.spawnEagle(this.threeCamera.position);
 
     for (const [, rp] of this.remotePlayers) {
       rp.update(dt, visualGroundY);
     }
 
-    this._updateChainRemainingAuthoritative();
     this.ui.updateHUD(focusState.distance, focusState.speed, focusState.hp, {
       isAirborne: focusState.isAirborne,
       graphicsQuality: this.graphicsQuality,
@@ -1011,6 +1241,8 @@ export class Game {
       momentum: focusState.momentum || 0,
       cleanStreakSeconds: focusState.cleanStreakSeconds || 0,
       yetiDangerT: this._yetiDangerT || 0,
+      iceGripT: 1 - weather.grip,
+      blizzardT: weather.fogIntensity,
     });
     this.ui.updatePlayerList(this._getScoreList());
     if (performance.now() - this._authLastYetiWarning > 1000) {
@@ -1032,8 +1264,9 @@ export class Game {
       consumedPickupIds,
       this.difficultyRamp,
     );
+    const weather = getWeatherAtZ(this.seed, state.z);
     const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
-    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring);
+    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather);
     if (officiallyAliveBeforePrediction && state.alive === false) {
       state.alive = true;
       state.finished = false;
@@ -1304,6 +1537,8 @@ export class Game {
       } else if (event.type === 'yeti-capture') {
         this._authLastYetiWarning = performance.now();
         this.ui.showYetiWarning(true);
+      } else if (event.type === 'unstuck') {
+        this.ui.showUnstuckFeedback();
       }
     }
 
@@ -1380,6 +1615,7 @@ export class Game {
         difficulty: this.difficulty,
         multiplayer: !!this.options.multiplayer,
         ghostSaved: this._pendingGhostSaved,
+        dailyKey: this.dailyKey,
       });
     }, delayMs);
   }
@@ -1416,6 +1652,7 @@ export class Game {
     this.camera.update(dt, focusMesh, focusSpeed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
+    this.aurora?.update(dt, this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, focusSpeed);
     this.audio.updateContinuous(0, 0, false);
     this.ui.showYetiWarning(false);
@@ -1430,6 +1667,8 @@ export class Game {
       momentum: 0,
       cleanStreakSeconds: 0,
       yetiDangerT: 0,
+      iceGripT: 0,
+      blizzardT: 0,
     });
     this.ui.updatePlayerList(this._getScoreList());
 
@@ -1701,6 +1940,7 @@ export class Game {
       playerName: this.options.playerName || 'Skier',
       difficulty: this.difficulty,
       ghostRecord,
+      dailyKey: this.dailyKey,
     });
     this._pendingGhostSaved = !!runResult?.ghostSaved;
 
@@ -1751,6 +1991,10 @@ export class Game {
     this.sky?.dispose();
     this.mountains?.dispose();
     this.postFx?.dispose();
+    this.wildlife?.dispose();
+    this.aurora?.dispose();
+    this.stormWall?.dispose();
+    this.landmarks?.dispose();
     for (const p of this.projectiles) {
       this.scene.remove(p.mesh);
       p.mesh.geometry.dispose();

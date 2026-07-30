@@ -148,7 +148,10 @@ app.use('/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
 
 app.get('/api/rankings', async (req, res, next) => {
   try {
-    const entries = await rankings.list(req.query.limit);
+    const { dailyKey, mode, limit } = req.query;
+    const entries = dailyKey
+      ? await rankings.listDaily(mode, dailyKey, limit)
+      : await rankings.list(limit);
     res.json({ entries });
   } catch (err) {
     next(err);

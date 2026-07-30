@@ -24,6 +24,8 @@ const defaultHud: HudState = {
   momentum: 0,
   cleanStreakSeconds: 0,
   yetiDangerT: 0,
+  iceGripT: 0,
+  blizzardT: 0,
 };
 
 function asGameMode(value: string | undefined): GameMode {
@@ -84,7 +86,7 @@ export class ReactUiAdapter implements UiAdapter {
     this.store.set(state => ({ ...state, previousScreen: state.screen, screen: 'pause', error: '' }));
   }
 
-  showGameOver(distance: number, scores: PlayerStatus[] = [], meta: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved'>> = {}) {
+  showGameOver(distance: number, scores: PlayerStatus[] = [], meta: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved' | 'dailyKey'>> = {}) {
     this.clearTransient();
     this.store.set(state => ({
       ...state,
@@ -98,6 +100,7 @@ export class ReactUiAdapter implements UiAdapter {
         difficulty: meta.difficulty ?? 'normal',
         multiplayer: !!meta.multiplayer,
         ghostSaved: !!meta.ghostSaved,
+        dailyKey: meta.dailyKey ?? null,
       },
       playerList: [],
       yetiWarning: false,
@@ -188,6 +191,10 @@ export class ReactUiAdapter implements UiAdapter {
     this.flashControls(label, 'jumpChainFlashKey', 900);
   }
 
+  showUnstuckFeedback() {
+    this.flashControls('Freed from obstacle', 'unstuckFlashKey', 1100);
+  }
+
   setError(message: string) {
     window.clearTimeout(this.errorTimer);
     this.store.set({ error: message });
@@ -198,7 +205,7 @@ export class ReactUiAdapter implements UiAdapter {
     this.store.set({ error: '' });
   }
 
-  private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey', delay: number) {
+  private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey' | 'unstuckFlashKey', delay: number) {
     window.clearTimeout(this.controlsTimer);
     this.store.set(state => ({
       ...state,

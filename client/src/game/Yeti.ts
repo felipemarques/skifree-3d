@@ -123,6 +123,10 @@ const YETI_CAPTURE_DIST = 1.5;
 const YETI_HALF_W = 0.75;
 const YETI_HALF_D = 0.75;
 const YETI_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock']);
+// baseSpeed must stay below the player's absolute max speed (BOOST_SPEED =
+// 28, see Player.ts/shared/AuthoritativeSim.ts) or the yeti is guaranteed to
+// catch up no matter how the player plays - extreme was previously 29,
+// literally faster than the player can ever go, making it inescapable.
 const DIFFICULTY_PRESETS = {
   easy: {
     triggerDistance: 2600,
@@ -138,13 +142,13 @@ const DIFFICULTY_PRESETS = {
   },
   hard: {
     triggerDistance: 1400,
-    baseSpeed: 25,
+    baseSpeed: 24,
     multiplyInterval: 5.5,
     maxYetis: 7,
   },
   extreme: {
     triggerDistance: 850,
-    baseSpeed: 29,
+    baseSpeed: 26,
     multiplyInterval: 3.8,
     maxYetis: 9,
   },

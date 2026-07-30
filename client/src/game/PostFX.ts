@@ -13,6 +13,13 @@ import { OutputPass }      from 'three/addons/postprocessing/OutputPass.js';
 //   strength  : 0.12  - very subtle glow
 //   radius    : 0.18  - tight spread
 //   threshold : 1.02  - avoid blooming the snowfield
+//
+// Depth-of-field (BokehPass) and a speed-based radial blur were tried here
+// and pulled back out - even tuned down until visually near-invisible, they
+// still hurt play (BokehPass renders a full extra scene depth pass every
+// frame regardless of how subtle its output is tuned to be, and the radial
+// blur read as disorienting during boost). Not reintroducing either without
+// being able to actually see/profile the result.
 // ──────────────────────────────────────────────────────────────────────────
 
 export class PostFX {
@@ -41,6 +48,9 @@ export class PostFX {
     const outputPass = new OutputPass();
     this.composer.addPass(outputPass);
   }
+
+  /** No-op now that speed blur has been removed - kept so Game.ts's existing call sites don't need changes. */
+  update() {}
 
   /** Replace `renderer.render(...)` in the game loop. */
   render() {

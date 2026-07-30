@@ -14,6 +14,17 @@ export const PLAYER_TURN_RATE = 1.8;
 export const PLAYER_MAX_TURN_ANGLE = Math.PI * 0.42;
 export const INVINCIBILITY_TIME = 1.8;
 export const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
+// Anti-softlock: "stuck" means actual forward progress is far below what
+// the player's own current speed/heading implies (i.e. something is
+// physically blocking them - wedged against obstacles), not just moving
+// slowly on purpose. A flat z-speed floor would misread deliberate slow
+// play (full brake + a sharp turn legitimately converges to well under
+// 1 unit/s) as stuck - see client Player.ts's matching solo logic, which
+// this mirrors so both modes agree on what "stuck" means.
+const STUCK_Z_RATIO_THRESHOLD = 0.35;
+const STUCK_MIN_EXPECTED_SPEED = 0.5;
+const STUCK_DETECT_TIME = 2.2;
+const UNSTUCK_PUSH = 5.0;
 export const PLAYER_COLOR_OPTIONS = [
   { value: '#2979ff', label: 'Blue' },
   { value: '#4caf50', label: 'Green' },
@@ -219,11 +230,13 @@ export interface PlayerSimState {
   cleanStreakSeconds: number;
   lastProcessedInputSeq: number;
   lastInputAtMs: number;
+  yetiTriggerAtMs: number;
+  stuckTimer: number;
   deathKind?: string;
 }
 
 export interface SimEvent {
-  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain';
+  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -414,6 +427,50 @@ export function getRampedRampVolume(baseVolume: number, chunkIndex: number, diff
   return clamp(baseVolume * (1 + rampT * 0.6), 0, 2);
 }
 
+// Deterministic mid-run "course variety" - periodic weather zones along z,
+// pure function of (seed, z) so server and every client's prediction land
+// on bit-identical physics. grip < 1 is a real steering/speed penalty
+// (see simulatePlayerTick); fogIntensity/snowIntensity are render-only.
+// Exported (read-only, purely additive) so the client can compute the
+// upcoming zone boundary for the storm-wall warning visual (Game.ts) -
+// doesn't change any simulation behavior, just exposes the same period
+// getWeatherAtZ already uses internally.
+export const WEATHER_ZONE_LENGTH = 480;
+const WEATHER_TRANSITION_LENGTH = 80;
+const WEATHER_ICE_GRIP = 0.22;
+
+export interface WeatherAtZ {
+  grip: number;
+  fogIntensity: number;
+  snowIntensity: number;
+}
+
+const CLEAR_WEATHER: WeatherAtZ = { grip: 1, fogIntensity: 0, snowIntensity: 0 };
+
+function weatherZoneDescriptor(seed: number, zoneIndex: number): WeatherAtZ {
+  // Every run's first zone is always clear - otherwise ~45% of runs would
+  // start mid-fade into blizzard/ice before the player has any warning.
+  if (zoneIndex <= 0) return CLEAR_WEATHER;
+  const roll = new SimRandom((seed + zoneIndex * 104729) >>> 0).next();
+  if (roll < 0.55) return CLEAR_WEATHER;
+  if (roll < 0.80) return { grip: 1, fogIntensity: 1, snowIntensity: 1 };
+  return { grip: WEATHER_ICE_GRIP, fogIntensity: 0, snowIntensity: 0.15 };
+}
+
+export function getWeatherAtZ(seed: number, z: number): WeatherAtZ {
+  const zoneIndex = Math.floor(z / WEATHER_ZONE_LENGTH);
+  const localZ = z - zoneIndex * WEATHER_ZONE_LENGTH;
+  const current = weatherZoneDescriptor(seed, zoneIndex);
+  if (zoneIndex <= 0 || localZ >= WEATHER_TRANSITION_LENGTH) return current;
+  const previous = weatherZoneDescriptor(seed, zoneIndex - 1);
+  const t = smoothstep(localZ / WEATHER_TRANSITION_LENGTH);
+  return {
+    grip: lerp(previous.grip, current.grip, t),
+    fogIntensity: lerp(previous.fogIntensity, current.fogIntensity, t),
+    snowIntensity: lerp(previous.snowIntensity, current.snowIntensity, t),
+  };
+}
+
 export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false) {
   const rng = new SimRandom((seed + chunkIndex * 7919) >>> 0);
   const zBase = chunkIndex * CHUNK_SIZE;
@@ -525,6 +582,8 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     cleanStreakSeconds: 0,
     lastProcessedInputSeq: 0,
     lastInputAtMs: 0,
+    yetiTriggerAtMs: -1,
+    stuckTimer: 0,
   };
 }
 
@@ -607,6 +666,7 @@ export function simulatePlayerTick(
   consumedPickupIds: Set<string>,
   nowMs: number,
   skillScoring = false,
+  weather: WeatherAtZ = CLEAR_WEATHER,
 ): SimEvent[] {
   const events: SimEvent[] = [];
   if (!state.alive) return events;
@@ -626,12 +686,12 @@ export function simulatePlayerTick(
 
   const steer = state.isAirborne ? 0 : cleanInput.lateralAxis;
   if (!state.isAirborne) {
-    state.angle = clamp(state.angle + steer * PLAYER_TURN_RATE * dt, -PLAYER_MAX_TURN_ANGLE, PLAYER_MAX_TURN_ANGLE);
+    state.angle = clamp(state.angle + steer * PLAYER_TURN_RATE * weather.grip * dt, -PLAYER_MAX_TURN_ANGLE, PLAYER_MAX_TURN_ANGLE);
     let targetSpeed = BASE_SPEED;
     if (cleanInput.boost) targetSpeed = BOOST_SPEED;
     if (cleanInput.brake) targetSpeed = MIN_SPEED;
     const penalisedTarget = targetSpeed * Math.max(Math.cos(state.angle), 0.28);
-    state.speed = lerp(state.speed, penalisedTarget, Math.min(1, 10 * dt));
+    state.speed = lerp(state.speed, penalisedTarget, Math.min(1, 10 * dt * weather.grip));
   }
 
   if (cleanInput.jumpPressed && !state.jumpHeld) {
@@ -704,6 +764,34 @@ export function simulatePlayerTick(
     newZ = resolved.z;
     damagePlayer(state, obs, state.speed, events);
     hitObstacleIds.add(obs.id);
+  }
+
+  // Anti-softlock (see STUCK_Z_RATIO_THRESHOLD's comment) - mirrors client
+  // Player.ts's solo logic so a wedged multiplayer player gets the same
+  // rescue solo already had, instead of being stuck with no recovery.
+  const expectedZSpeed = Math.abs(Math.cos(state.angle) * state.speed);
+  const actualZSpeed = Math.abs(newZ - previousZ) / Math.max(dt, 0.001);
+  const isObstructed = !state.isAirborne
+    && expectedZSpeed > STUCK_MIN_EXPECTED_SPEED
+    && actualZSpeed / expectedZSpeed < STUCK_Z_RATIO_THRESHOLD;
+
+  if (isObstructed) {
+    state.stuckTimer += dt;
+    if (state.stuckTimer >= STUCK_DETECT_TIME) {
+      newZ += UNSTUCK_PUSH;
+      state.angle = 0;
+      state.speed = BASE_SPEED;
+      state.isAirborne = false;
+      state.airborneFromRamp = false;
+      state.jumpVelocityY = 0;
+      state.airVelocityX = 0;
+      state.airVelocityZ = 0;
+      state.airTime = 0;
+      state.stuckTimer = 0;
+      events.push({ type: 'unstuck', playerId: state.playerId, socketId: state.id, distance: state.distance });
+    }
+  } else {
+    state.stuckTimer = 0;
   }
 
   state.x = newX;
@@ -805,17 +893,36 @@ export function applyPlayerCollision(a: PlayerSimState, b: PlayerSimState): SimE
   return events;
 }
 
+// Chase speed the yeti implicitly closes distance at once triggered, in the
+// same units as PlayerSimState.distance (world-Z units/second) - mirrors
+// Yeti.ts's DIFFICULTY_PRESETS.baseSpeed (solo's real 3D chase speed) so
+// both modes agree on how fast the yeti actually is, and each value stays
+// below BOOST_SPEED (28) so a player sustaining near-max speed can always
+// keep the gap growing. Previously multiplayer had no speed-based escape at
+// all - just a hard elapsed-time countdown from the moment distance crossed
+// triggerDistance that nothing the player did afterward could affect,
+// making capture purely a matter of time regardless of skill.
+const YETI_CHASE_SPEED: Record<Difficulty, number> = {
+  easy: 19,
+  normal: 22,
+  hard: 24,
+  extreme: 26,
+};
+// Gap (world-Z units) within which the danger meter/warning ramps up.
+const YETI_DANGER_GAP_WINDOW = 100;
+
 export function getYetiConfig(settings: RoomSettings) {
   const difficulty = settings.difficulty || 'normal';
   const configs = {
-    easy: { triggerDistance: 2600, captureAfterSeconds: 72 },
-    normal: { triggerDistance: 2000, captureAfterSeconds: 56 },
-    hard: { triggerDistance: 1300, captureAfterSeconds: 38 },
-    extreme: { triggerDistance: 550, captureAfterSeconds: 24 },
-  } as Record<Difficulty, { triggerDistance: number; captureAfterSeconds: number }>;
+    easy: { triggerDistance: 2600 },
+    normal: { triggerDistance: 2000 },
+    hard: { triggerDistance: 1300 },
+    extreme: { triggerDistance: 550 },
+  } as Record<Difficulty, { triggerDistance: number }>;
   const config = configs[difficulty] || configs.normal;
   return {
     ...config,
+    chaseSpeed: YETI_CHASE_SPEED[difficulty] || YETI_CHASE_SPEED.normal,
     triggerDistance: settings.yetiStartMode === 'immediate' ? 0 : config.triggerDistance,
   };
 }
@@ -824,11 +931,23 @@ export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSetti
   if (!state.alive) return;
   if (settings.yetiStartMode === 'disabled') return;
   const config = getYetiConfig(settings);
-  if (state.distance < config.triggerDistance) return;
+  if (state.distance < config.triggerDistance) {
+    state.yetiTriggerAtMs = -1;
+    return;
+  }
+  if (state.yetiTriggerAtMs < 0) state.yetiTriggerAtMs = roomTimeMs;
 
-  const activeSeconds = Math.max(0, roomTimeMs / 1000 - config.triggerDistance / Math.max(BASE_SPEED, state.speed));
-  const captureThreshold = Math.max(8, config.captureAfterSeconds - state.distance / 220);
-  if (activeSeconds > captureThreshold) {
+  // The yeti's implicit chase position: it starts right at the trigger line
+  // and advances at a fixed speed from the moment of trigger. The player is
+  // only caught once their actual (real, obstacle-slowed) distance falls
+  // behind that line - sustaining speed above chaseSpeed keeps the gap
+  // growing forever, exactly like solo's real chase, rather than a fixed
+  // timer nothing the player does can affect.
+  const elapsedSinceTrigger = Math.max(0, (roomTimeMs - state.yetiTriggerAtMs) / 1000);
+  const yetiDistance = config.triggerDistance + config.chaseSpeed * elapsedSinceTrigger;
+  const gap = state.distance - yetiDistance;
+
+  if (gap <= 0) {
     state.alive = false;
     state.finished = true;
     state.deathKind = 'yeti';
@@ -837,16 +956,15 @@ export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSetti
     return;
   }
 
-  if (activeSeconds > Math.max(2, config.captureAfterSeconds * 0.55)) {
+  const dangerT = clamp(1 - gap / YETI_DANGER_GAP_WINDOW, 0, 1);
+  if (dangerT > 0.55) {
     events.push({ type: 'yeti-warning', playerId: state.playerId, socketId: state.id, distance: state.distance });
   }
 
-  // Danger bonus: rewards surviving deep in the chase instead of only
-  // punishing capture. Reuses the exact same activeSeconds/captureThreshold
-  // that decides real capture above, so it's fully authoritative - never a
-  // separate/guessable signal.
+  // Danger bonus: rewards surviving with a small gap instead of only
+  // punishing capture. Reuses the exact same gap that decides real capture
+  // above, so it's fully authoritative - never a separate/guessable signal.
   if (skillScoring && dt > 0) {
-    const dangerT = clamp(activeSeconds / captureThreshold, 0, 1);
     if (dangerT > 0) {
       state.bonusDistance += dt * dangerT * YETI_PROXIMITY_BONUS_RATE;
     }

@@ -148,9 +148,15 @@ export class HorizonMountains {
     this.group = new THREE.Group();
     this._materials = [];
 
+    // Widths are sized so each ridge still spans the full horizontal field
+    // of view (with margin for ultrawide displays and camera yaw while
+    // turning) at its z-depth - at 260/225/190 wide the ridges only filled
+    // the center of the screen, leaving open sky at the edges that read as
+    // the world "floating" with no boundary. These peaks are purely a
+    // camera-relative backdrop (see update() below), never reachable.
     const layers = [
       {
-        width: 260,
+        width: 640,
         baseY: -6,
         height: 34,
         z: 185,
@@ -161,7 +167,7 @@ export class HorizonMountains {
         phase: 0.8,
       },
       {
-        width: 225,
+        width: 520,
         baseY: -8,
         height: 46,
         z: 150,
@@ -172,7 +178,7 @@ export class HorizonMountains {
         phase: 2.35,
       },
       {
-        width: 190,
+        width: 420,
         baseY: -10,
         height: 36,
         z: 118,
@@ -185,86 +191,130 @@ export class HorizonMountains {
     ];
 
     for (const layer of layers) {
-      const layerGroup = new THREE.Group();
-      const mat = new THREE.MeshBasicMaterial({
-        color: layer.color,
-        transparent: true,
-        opacity: layer.opacity,
-        depthWrite: false,
-        fog: true,
-      });
-      this._materials.push(mat);
-
-      const ridgeData = createRidgeGeometry({
-        width: layer.width,
-        baseY: layer.baseY,
-        height: layer.height,
-        segments: 42,
-        depth: layer.depth,
-        phase: layer.phase,
-      });
-      const ridge = new THREE.Mesh(ridgeData.geo, mat);
-      ridge.renderOrder = -4;
-      layerGroup.add(ridge);
-
-      const facets = createFacetGroup({
-        samples: ridgeData.samples,
-        baseY: layer.baseY,
-        color: layer.color,
-        opacity: layer.opacity * 0.42,
-        phase: layer.phase,
-      });
-      facets.group.renderOrder = -3;
-      layerGroup.add(facets.group);
-      this._materials.push(...facets.materials);
-
-      const caps = createSnowCaps({
-        samples: ridgeData.samples,
-        baseY: layer.baseY,
-        height: layer.height,
-        count: 10,
-        phase: layer.phase,
-      });
-      caps.group.renderOrder = -2;
-      layerGroup.add(caps.group);
-      this._materials.push(caps.material);
-
-      const footMat = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(layer.color).offsetHSL(0.01, -0.02, 0.08),
-        transparent: true,
-        opacity: layer.opacity * 0.48,
-        depthWrite: false,
-        fog: true,
-      });
-      const foothills = new THREE.Mesh(
-        createFoothills({
-          width: layer.width * 1.08,
-          baseY: layer.baseY - 2,
-          segments: 26,
-          depth: layer.depth,
-          phase: layer.phase * 1.7,
-        }),
-        footMat,
-      );
-      foothills.position.z = -2.6;
-      foothills.renderOrder = -1;
-      layerGroup.add(foothills);
-      this._materials.push(footMat);
-
+      const layerGroup = this._buildLayerGroup(layer);
       layerGroup.position.z = layer.z;
       layerGroup.userData.parallax = layer.parallax;
+      layerGroup.userData.baseX = 0;
       this.group.add(layerGroup);
+    }
+
+    // Side ranges - the forward layers above only ever sit dead ahead, so
+    // anything past the border treeline at the screen's edges (or visible
+    // while turning) was open sky. These reuse the exact same ridge/facet/
+    // cap/foothill builder rotated 90 degrees so its "width" axis runs
+    // along world Z (alongside the run) instead of world X, fixed far out
+    // to each side ("way outside of reach" - purely a backdrop, no
+    // collision) so the valley reads as enclosed from every angle, not
+    // just looking forward.
+    const sideLayers = [
+      { width: 1400, baseY: -9, height: 32, xOff: 300, depth: 10, color: 0x86a0b8, opacity: 0.4, phase: 1.6 },
+      { width: 1400, baseY: -11, height: 24, xOff: 420, depth: 8, color: 0xa8bdcf, opacity: 0.3, phase: 3.9 },
+    ];
+    for (const side of [-1, 1]) {
+      for (const layer of sideLayers) {
+        const layerGroup = this._buildLayerGroup(layer);
+        layerGroup.rotation.y = side * Math.PI / 2;
+        layerGroup.position.x = side * layer.xOff;
+        layerGroup.userData.parallax = 0;
+        layerGroup.userData.baseX = side * layer.xOff;
+        this.group.add(layerGroup);
+      }
+    }
+
+    // Each material's own construction-time color is preserved as its "rest"
+    // color, so biome tinting can blend relative to it (materials differ in
+    // shade per layer/depth for parallax cueing - there's no single absolute
+    // color to just overwrite them all with).
+    for (const mat of this._materials) {
+      mat.userData.baseColor = mat.color.clone();
     }
 
     this.group.position.y = 0;
     this.scene.add(this.group);
   }
 
+  _buildLayerGroup(layer) {
+    const layerGroup = new THREE.Group();
+    const mat = new THREE.MeshBasicMaterial({
+      color: layer.color,
+      transparent: true,
+      opacity: layer.opacity,
+      depthWrite: false,
+      fog: true,
+    });
+    this._materials.push(mat);
+
+    const ridgeData = createRidgeGeometry({
+      width: layer.width,
+      baseY: layer.baseY,
+      height: layer.height,
+      segments: 96,
+      depth: layer.depth,
+      phase: layer.phase,
+    });
+    const ridge = new THREE.Mesh(ridgeData.geo, mat);
+    ridge.renderOrder = -4;
+    layerGroup.add(ridge);
+
+    const facets = createFacetGroup({
+      samples: ridgeData.samples,
+      baseY: layer.baseY,
+      color: layer.color,
+      opacity: layer.opacity * 0.42,
+      phase: layer.phase,
+    });
+    facets.group.renderOrder = -3;
+    layerGroup.add(facets.group);
+    this._materials.push(...facets.materials);
+
+    const caps = createSnowCaps({
+      samples: ridgeData.samples,
+      baseY: layer.baseY,
+      height: layer.height,
+      count: 22,
+      phase: layer.phase,
+    });
+    caps.group.renderOrder = -2;
+    layerGroup.add(caps.group);
+    this._materials.push(caps.material);
+
+    const footMat = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(layer.color).offsetHSL(0.01, -0.02, 0.08),
+      transparent: true,
+      opacity: layer.opacity * 0.48,
+      depthWrite: false,
+      fog: true,
+    });
+    const foothills = new THREE.Mesh(
+      createFoothills({
+        width: layer.width * 1.08,
+        baseY: layer.baseY - 2,
+        segments: 60,
+        depth: layer.depth,
+        phase: layer.phase * 1.7,
+      }),
+      footMat,
+    );
+    foothills.position.z = -2.6;
+    foothills.renderOrder = -1;
+    layerGroup.add(foothills);
+    this._materials.push(footMat);
+
+    return layerGroup;
+  }
+
   update(cameraPos) {
     if (!cameraPos) return;
     this.group.position.z = cameraPos.z;
     for (const child of this.group.children) {
-      child.position.x = cameraPos.x * child.userData.parallax;
+      child.position.x = (child.userData.baseX || 0) + cameraPos.x * child.userData.parallax;
+    }
+  }
+
+  /** tintColor: THREE.Color; strength: 0 (unchanged) .. 1 (fully tintColor). */
+  setBiomeTint(tintColor, strength) {
+    for (const mat of this._materials) {
+      mat.color.copy(mat.userData.baseColor).lerp(tintColor, strength);
     }
   }
 

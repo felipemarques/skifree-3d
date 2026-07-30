@@ -8,6 +8,7 @@ import {
   createMultiplayerSpawnXs,
   generateGameplayChunk,
   getChainWindowMs,
+  getWeatherAtZ,
   getYetiConfig,
   maybeApplyYetiCapture,
   simulatePlayerTick,
@@ -249,28 +250,59 @@ simulatePlayerTick(marginalPlayer, {
 assert.ok(closePlayer.bonusDistance > 0 && marginalPlayer.bonusDistance > 0, 'both passes should be within the near-miss margin');
 assert.ok(closePlayer.bonusDistance > marginalPlayer.bonusDistance, 'a closer near-miss should award a bigger bonus than a marginal one');
 
-// --- Yeti proximity bonus: surviving in the danger window should accrue bonus distance ---
+// --- Yeti chase: a distance race from the trigger line, not a fixed timer ---
+// The yeti's implicit position starts at triggerDistance and advances at
+// config.chaseSpeed from the moment state.distance first crosses it
+// (state.yetiTriggerAtMs, set on first call past the trigger). Capture only
+// happens once the player's real distance falls behind that line.
 const dangerSettings = { gameMode: 'classic', difficulty: 'normal', yetiStartMode: 'distance', obstacleVolume: 1 };
 const dangerConfig = getYetiConfig(dangerSettings);
-// Derive roomTimeMs from the actual formula maybeApplyYetiCapture uses
-// (activeSeconds = roomTimeMs/1000 - triggerDistance/speed), landing just
-// under the real capture threshold instead of guessing a constant.
-const dangerDistance = dangerConfig.triggerDistance + 10;
-const dangerCaptureThreshold = Math.max(8, dangerConfig.captureAfterSeconds - dangerDistance / 220);
-const dangerSpeed = 14; // BASE_SPEED, matches createInitialPlayerState's default
-const dangerRoomTimeMs = (dangerConfig.triggerDistance / dangerSpeed + dangerCaptureThreshold * 0.9) * 1000;
+for (const difficulty of ['easy', 'normal', 'hard', 'extreme']) {
+  const speed = getYetiConfig({ ...dangerSettings, difficulty }).chaseSpeed;
+  assert.ok(speed < 28, `${difficulty}'s yeti chase speed (${speed}) must stay below the player's max speed (28) or it becomes impossible to outrun`);
+}
 
+// A small gap right at the moment of trigger (first tick past triggerDistance,
+// so elapsedSinceTrigger is 0 and gap = distance - triggerDistance exactly).
 const dangerPlayer = createInitialPlayerState('socket-l', 'Skier', 'player-l');
-dangerPlayer.distance = dangerDistance;
+dangerPlayer.distance = dangerConfig.triggerDistance + 30;
 const dangerEvents = [];
-maybeApplyYetiCapture(dangerPlayer, dangerSettings, dangerRoomTimeMs, dangerEvents, SIM_DT, true);
-assert.ok(dangerPlayer.alive, 'the danger bonus test should stay just under the actual capture threshold');
-assert.ok(dangerPlayer.bonusDistance > 0, 'surviving deep in the yeti danger window should accrue bonus distance');
+maybeApplyYetiCapture(dangerPlayer, dangerSettings, 50000, dangerEvents, SIM_DT, true);
+assert.ok(dangerPlayer.alive, 'a 30-unit gap at the moment of trigger should not be an instant capture');
+assert.ok(dangerPlayer.bonusDistance > 0, 'surviving with a small gap in the yeti danger window should accrue bonus distance');
 
 const noBonusWithoutSkillScoring = createInitialPlayerState('socket-m', 'Skier', 'player-m');
-noBonusWithoutSkillScoring.distance = dangerDistance;
-maybeApplyYetiCapture(noBonusWithoutSkillScoring, dangerSettings, dangerRoomTimeMs, [], SIM_DT, false);
+noBonusWithoutSkillScoring.distance = dangerConfig.triggerDistance + 30;
+maybeApplyYetiCapture(noBonusWithoutSkillScoring, dangerSettings, 50000, [], SIM_DT, false);
 assert.equal(noBonusWithoutSkillScoring.bonusDistance, 0, 'the yeti danger bonus must not apply when skill scoring is disabled');
+
+// --- Yeti chase: falling behind the chase line must actually capture ---
+const caughtPlayer = createInitialPlayerState('socket-n', 'Skier', 'player-n');
+caughtPlayer.distance = dangerConfig.triggerDistance; // trigger right now, at t=0
+const caughtEvents = [];
+maybeApplyYetiCapture(caughtPlayer, dangerSettings, 100000, caughtEvents, SIM_DT, true);
+// 20 real seconds later the player has barely moved (well under chaseSpeed) -
+// the yeti's implicit line has advanced ~20*chaseSpeed units past them.
+caughtPlayer.distance += 5;
+maybeApplyYetiCapture(caughtPlayer, dangerSettings, 100000 + 20000, caughtEvents, SIM_DT, true);
+assert.equal(caughtPlayer.alive, false, 'falling far behind the chase line must capture the player');
+assert.ok(caughtEvents.some(e => e.type === 'yeti-capture'), 'a real capture must emit a yeti-capture event');
+
+// --- Yeti chase: this is the bug fix under test - sustained speed above
+// chaseSpeed must let the player escape indefinitely, unlike the old fixed
+// elapsed-time countdown that captured everyone eventually regardless of
+// skill. Simulate 60 real seconds of gaining distance faster than the yeti. ---
+const escapingPlayer = createInitialPlayerState('socket-o', 'Skier', 'player-o');
+escapingPlayer.distance = dangerConfig.triggerDistance + 1; // just past the line, not exactly on it (gap=0 would be an instant capture)
+const escapeSpeed = dangerConfig.chaseSpeed + 2; // sustained, comfortably above chase speed
+let escapeRoomTimeMs = 0;
+maybeApplyYetiCapture(escapingPlayer, dangerSettings, escapeRoomTimeMs, [], SIM_DT, false);
+for (let i = 0; i < 60 / SIM_DT; i++) {
+  escapeRoomTimeMs += SIM_DT * 1000;
+  escapingPlayer.distance += escapeSpeed * SIM_DT;
+  maybeApplyYetiCapture(escapingPlayer, dangerSettings, escapeRoomTimeMs, [], SIM_DT, false);
+}
+assert.equal(escapingPlayer.alive, true, 'sustaining speed above the yeti chase speed must let the player escape, not just delay a guaranteed capture');
 
 // --- Ramp lane rotation: consecutive ramps in a chunk should not share a lane ---
 const laneChunk = generateGameplayChunk(999, 3, 2, new Set(), false);
@@ -286,6 +318,51 @@ assert.notEqual(laneOf(rampsInChunk[0].x), laneOf(rampsInChunk[1].x), 'consecuti
 assert.doesNotThrow(
   () => generateGameplayChunk(999, -3, 2, new Set(), false),
   'ramp lane lookup must not throw for negative chunk indices',
+);
+
+// --- Weather zones: deterministic, always-clear run start, real grip penalty ---
+const weatherSeed = 777;
+const weatherZ = 5000;
+assert.deepEqual(
+  getWeatherAtZ(weatherSeed, weatherZ),
+  getWeatherAtZ(weatherSeed, weatherZ),
+  'getWeatherAtZ must be a pure deterministic function of (seed, z)',
+);
+
+for (const seed of [1, 42, 999999]) {
+  for (let z = 0; z < 480; z += 47) {
+    assert.equal(getWeatherAtZ(seed, z).grip, 1, 'the first weather zone of a run must always be clear (fairness fix)');
+  }
+}
+
+// Scan forward for a seed/z landing deep (past the transition band) in an
+// icy zone, rather than hand-picking one blind.
+const grippySeed = 2024;
+let icyZ = null;
+for (let z = 500; z < 30000; z += 5) {
+  const w = getWeatherAtZ(grippySeed, z);
+  if (w.grip < 0.9 && getWeatherAtZ(grippySeed, z + 60).grip < 0.9) {
+    icyZ = z;
+    break;
+  }
+}
+assert.ok(icyZ !== null, 'test setup should find an icy weather zone within the scanned range');
+
+const clearWeather = getWeatherAtZ(grippySeed, 0); // zone 0 is always clear
+const icyWeather = getWeatherAtZ(grippySeed, icyZ);
+assert.ok(icyWeather.grip < clearWeather.grip, 'an icy zone must have lower grip than a clear zone');
+
+const iceTickPlayer = createInitialPlayerState('socket-n', 'Skier', 'player-n');
+iceTickPlayer.z = icyZ;
+const clearTickPlayer = createInitialPlayerState('socket-o', 'Skier', 'player-o');
+clearTickPlayer.z = icyZ; // same z - only the weather passed in differs
+
+const steerInput = { seq: 1, clientTime: 0, lateralAxis: 1, boost: false, brake: false, jumpPressed: false };
+simulatePlayerTick(iceTickPlayer, steerInput, SIM_DT, [], new Set(), 0, false, icyWeather);
+simulatePlayerTick(clearTickPlayer, steerInput, SIM_DT, [], new Set(), 0, false, clearWeather);
+assert.ok(
+  Math.abs(iceTickPlayer.angle) < Math.abs(clearTickPlayer.angle),
+  'reduced grip on an icy zone must produce a slower steering response than the same input on clear ground',
 );
 
 console.log('Authoritative simulation checks passed.');

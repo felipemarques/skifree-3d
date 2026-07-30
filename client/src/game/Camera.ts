@@ -18,6 +18,7 @@ export class GameCamera {
     this._shakeIntensity = 0;
     this._baseFov = camera.fov;
     this._fov = camera.fov;
+    this._speed01 = 0;
   }
 
   /** Short decaying positional shake — landings, collisions, boost kick. */
@@ -71,6 +72,7 @@ export class GameCamera {
     // Widen slightly at speed for a sense of velocity, same trick as a
     // dolly zoom - purely cosmetic, no effect on gameplay framing logic.
     const speed01 = THREE.MathUtils.clamp((playerSpeed || 0) / FOV_MAX_SPEED, 0, 1);
+    this._speed01 = speed01;
     const targetFov = this._baseFov + speed01 * FOV_WIDEN_DEGREES;
     this._fov = THREE.MathUtils.lerp(this._fov, targetFov, Math.min(1, FOV_SMOOTHING_RATE * dt));
     if (Math.abs(this.camera.fov - this._fov) > 0.01) {
