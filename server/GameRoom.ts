@@ -1,6 +1,6 @@
 // @ts-nocheck
 // GameRoom manages a single multiplayer room
-const { DEFAULT_PLAYER_COLOR, PLAYER_COLOR_OPTIONS, sanitizePlayerColor } = require('../shared/AuthoritativeSim');
+const { DEFAULT_PLAYER_COLOR, PLAYER_COLOR_OPTIONS, PLAYER_TURN_RATE, sanitizePlayerColor } = require('../shared/AuthoritativeSim');
 
 const ROOM_ID_LENGTH = 6;
 const DEFAULT_ROOM_SETTINGS = {
@@ -66,12 +66,13 @@ class GameRoom {
     this.createdAt = Date.now();
   }
 
-  addPlayer(socketId, name, playerId = socketId, playerColor = DEFAULT_PLAYER_COLOR) {
+  addPlayer(socketId, name, playerId = socketId, playerColor = DEFAULT_PLAYER_COLOR, turnRate = PLAYER_TURN_RATE) {
     this.players.set(socketId, {
       id: socketId,
       playerId: String(playerId || socketId).slice(0, 80),
       name: name || 'Skier',
       color: getAvailablePlayerColor(this.players, playerColor),
+      turnRate: Math.min(4, Math.max(0.5, Number(turnRate) || PLAYER_TURN_RATE)),
       distance: 0,
       state: null,
       authoritativeState: null,

@@ -18,6 +18,21 @@ const AURORA_FRAG = /* glsl */`
     return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5);
   }
 
+  // Green -> teal -> violet -> magenta, the classic aurora spread, instead
+  // of a flat two-tone mix - t drifts across the ribbon (position + time)
+  // so the whole palette sweeps through rather than sitting on one blend.
+  vec3 auroraPalette(float t) {
+    vec3 c0 = vec3(0.05, 0.95, 0.55);
+    vec3 c1 = vec3(0.15, 0.85, 0.85);
+    vec3 c2 = vec3(0.45, 0.35, 0.95);
+    vec3 c3 = vec3(0.95, 0.25, 0.75);
+    t = fract(t);
+    float seg = t * 3.0;
+    if (seg < 1.0) return mix(c0, c1, seg);
+    if (seg < 2.0) return mix(c1, c2, seg - 1.0);
+    return mix(c2, c3, seg - 2.0);
+  }
+
   void main() {
     // Band range tuned to where the sky is actually visible on screen, not
     // straight up - Camera.ts's chase cam tilts steeply down to keep the
@@ -39,7 +54,8 @@ const AURORA_FRAG = /* glsl */`
     float shimmer = hash(floor(vec2(vDir.x * 18.0, uTime * 0.6)));
     float alpha = clamp(band, 0.0, 1.0) * envelope * (0.55 + shimmer * 0.45) * uIntensity;
 
-    vec3 col = mix(vec3(0.1, 0.9, 0.55), vec3(0.55, 0.25, 0.85), clamp(band, 0.0, 1.0) * 0.6);
+    float hueT = clamp(band, 0.0, 1.0) * 0.55 + (vDir.y + 0.12) * 1.3 + uTime * 0.025;
+    vec3 col = auroraPalette(hueT);
     gl_FragColor = vec4(col * alpha, alpha);
   }
 `;

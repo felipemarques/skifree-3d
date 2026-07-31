@@ -14,6 +14,7 @@
 // showFPS: bool
 // difficultyRamp: bool
 // skillScoring: bool
+// touchControls: 'auto' | 'on' | 'off'
 
 const KEY = 'skifree3d_settings';
 
@@ -35,6 +36,7 @@ const DEFAULTS = {
   difficultyRamp: false,
   skillScoring: false,
   hasSeenTutorial: false,
+  touchControls: 'auto',
 };
 
 export class Settings {

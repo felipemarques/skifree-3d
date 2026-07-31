@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import type { GameController } from '@/app/gameController';
 import { Brand, ScreenFrame } from './ScreenFrame';
 
-export function PauseScreen({ controller }: { controller: GameController }) {
+export function PauseScreen({ controller, multiplayer = false }: { controller: GameController; multiplayer?: boolean }) {
   return (
     <ScreenFrame panelClassName="text-center">
       <Brand eyebrow="Paused" title="Run Paused" />
@@ -21,6 +21,12 @@ export function PauseScreen({ controller }: { controller: GameController }) {
           Main Menu
         </Button>
       </div>
+      {multiplayer && (
+        <p className="mx-auto mt-3 max-w-xs text-xs leading-relaxed text-amber-200/90">
+          Your run keeps going on the server while paused — the skier keeps
+          moving and can crash. Resume quickly.
+        </p>
+      )}
       <div className="text-sm text-[#aab9cf]">Press Esc to resume</div>
     </ScreenFrame>
   );

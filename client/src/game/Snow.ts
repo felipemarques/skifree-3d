@@ -23,7 +23,7 @@ function makeLayer(scene, config) {
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
   const mat = new THREE.PointsMaterial({
-    color: 0xffffff,
+    color: 0xcccccc,
     size: config.size,
     transparent: true,
     opacity: config.opacity,
@@ -54,7 +54,11 @@ export class SnowParticles {
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
     this._windPhase = Math.random() * Math.PI * 2;
     this.layers = [];
+    this._buildLayers();
+  }
 
+  _buildLayers() {
+    const scene = this.scene;
     if (this.quality === 'high') {
       this.layers.push(makeLayer(scene, {
         count: 1180 * this.volume,
@@ -137,6 +141,14 @@ export class SnowParticles {
         nearField: true,
       }));
     }
+  }
+
+  setVolume(volume) {
+    const next = clamp(Number(volume ?? 1), 0, 2);
+    if (next === this.volume) return;
+    this.volume = next;
+    this.dispose();
+    this._buildLayers();
   }
 
   setIntensity(t) {

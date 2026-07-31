@@ -2,12 +2,21 @@
 import { settings } from '../utils/Settings';
 
 /**
- * Input — reads keyboard and/or mouse depending on Settings.controlMode.
+ * Input — reads keyboard, mouse, and a virtual joystick depending on
+ * Settings.controlMode.
  *
  * controlMode:
  *   'keyboard' — only WASD/arrow keys steer; mouse is ignored completely.
  *   'mouse'    — only mouse controls direction and speed; keyboard ignored.
  *   'both'     — both active; keyboard overrides mouse when keys are pressed.
+ *
+ * Touch is a floating joystick (Joystick.tsx) rather than an absolute
+ * screen-position drag: it reports a normalized -1..1 vector relative to
+ * wherever the player's thumb first touched down, like a real analog
+ * stick, via setJoystickVector(). While the joystick is active it forces
+ * mouse-equivalent routing regardless of controlMode, so touch works even
+ * if the player's saved preference is 'keyboard' from a prior desktop
+ * session.
  */
 export class Input {
   constructor() {
@@ -17,17 +26,54 @@ export class Input {
     // Track whether any key was pressed this frame (to decide override in 'both' mode)
     this._anyKeyHeld = false;
 
+    this._touchJumpHeld = false;
+    this._joystickActive = false;
+    this._joystickX = 0; // -1 (left) .. 1 (right)
+    this._joystickY = 0; // -1 (pulled down/boost) .. 1 (pushed up/brake)
+
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onKeyUp   = this._onKeyUp.bind(this);
     this._onMouseMove = this._onMouseMove.bind(this);
     this._onMouseDown = this._onMouseDown.bind(this);
     this._onMouseUp = this._onMouseUp.bind(this);
+    this._onWindowBlur = this._onWindowBlur.bind(this);
+    this._onVisibilityChange = this._onVisibilityChange.bind(this);
 
     window.addEventListener('keydown',    this._onKeyDown);
     window.addEventListener('keyup',      this._onKeyUp);
     window.addEventListener('mousemove',  this._onMouseMove);
     window.addEventListener('mousedown',  this._onMouseDown);
     window.addEventListener('mouseup',    this._onMouseUp);
+    window.addEventListener('blur',       this._onWindowBlur);
+    document.addEventListener('visibilitychange', this._onVisibilityChange);
+  }
+
+  /**
+   * Window lost focus (alt-tab, click-out) — release every held input so
+   * returning to the tab doesn't resume with Space/Shift/WASD permanently
+   * stuck for the rest of the run (see C1 in todo/gameplay-scan.md).
+   */
+  _onWindowBlur() {
+    this.clearAllInput();
+  }
+
+  /**
+   * Tab went hidden — same release as blur. Mobile browsers don't fire
+   * `blur` reliably when the app is backgrounded, so visibilitychange is the
+   * backstop. Touch state is included: a thumb can lift mid-gesture and the
+   * pointercancel never reach the joystick/jump button.
+   */
+  _onVisibilityChange() {
+    if (document.hidden) this.clearAllInput();
+  }
+
+  clearAllInput() {
+    this.keys = {};
+    this._anyKeyHeld = false;
+    this._touchJumpHeld = false;
+    this._joystickActive = false;
+    this._joystickX = 0;
+    this._joystickY = 0;
   }
 
   _onKeyDown(e) {
@@ -58,6 +104,23 @@ export class Input {
     if (e.button === 0) this.keys.MouseLeft = false;
   }
 
+  /** Called by the on-screen jump button (TouchControls.tsx). */
+  setTouchJump(pressed) {
+    this._touchJumpHeld = !!pressed;
+  }
+
+  /**
+   * Called by the floating virtual joystick (Joystick.tsx) - x/y already
+   * normalized to -1..1 relative to the joystick's own center (wherever the
+   * thumb touched down), not absolute screen position. active=false on
+   * release resets to neutral and stops forcing mouse-equivalent routing.
+   */
+  setJoystickVector(x, y, active = true) {
+    this._joystickActive = !!active;
+    this._joystickX = active ? x : 0;
+    this._joystickY = active ? y : 0;
+  }
+
   isDown(code) {
     return !!this.keys[code];
   }
@@ -84,6 +147,22 @@ export class Input {
    * Respects controlMode and mouseSensitivity.
    */
   get lateralAxis() {
+    if (this._joystickActive) {
+      const sensitivity = settings.get('mouseSensitivity');
+      // Response curve, not a raw linear pass-through: Player.ts multiplies
+      // speed by cos(turn angle), floored at 0.28 - deliberately calibrated
+      // so pinning a hard turn costs most of your speed (max turn angle's
+      // cosine is ~0.25). A joystick invites holding a diagonal position in
+      // a way keyboard taps/mouse micro-movements don't, so a raw pass-
+      // through drifts the ski toward max-turn (and that speed floor) far
+      // more readily than intended. Curving it means small/moderate pushes
+      // turn gently - full deflection still reaches the exact same max as
+      // before, so nothing about the actual turn range changes.
+      const x = this._joystickX;
+      const curved = Math.sign(x) * Math.pow(Math.abs(x), 1.6);
+      return Math.max(-1, Math.min(1, curved * sensitivity));
+    }
+
     const mode = settings.get('controlMode');
     const sensitivity = settings.get('mouseSensitivity');
     const deadzone = settings.get('mouseDeadzone');
@@ -115,9 +194,18 @@ export class Input {
 
   /**
    * Speed modifier: null = natural, or a fraction 0…1 where 0=full brake, 1=full boost.
-   * Only meaningful when mouse is active.
+   * Only meaningful when mouse/joystick is active.
    */
   get mouseSpeedFraction() {
+    if (this._joystickActive) {
+      // Physical stick mapping only: +1 = pushed up (boost), -1 = pulled
+      // down (brake). invertMouseY is a mouse-only preference — applying it
+      // here flipped up=boost on touch (minor list: joystick invert leak).
+      const jy = this._joystickY;
+      if (Math.abs(jy) <= 0.05) return null; // small deadzone around center
+      return Math.max(0, Math.min(1, (1 + jy) / 2));
+    }
+
     const mode = settings.get('controlMode');
     const deadzone = settings.get('mouseDeadzone');
     const invertY = settings.get('invertMouseY');
@@ -154,7 +242,7 @@ export class Input {
   }
 
   get jump() {
-    return this.isDown('Space');
+    return this.isDown('Space') || this._touchJumpHeld;
   }
 
   get fire() {
@@ -187,5 +275,7 @@ export class Input {
     window.removeEventListener('mousemove', this._onMouseMove);
     window.removeEventListener('mousedown', this._onMouseDown);
     window.removeEventListener('mouseup',   this._onMouseUp);
+    window.removeEventListener('blur',      this._onWindowBlur);
+    document.removeEventListener('visibilitychange', this._onVisibilityChange);
   }
 }

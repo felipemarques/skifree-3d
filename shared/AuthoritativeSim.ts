@@ -198,6 +198,14 @@ export interface ObstacleRecord {
   halfW: number;
   halfD: number;
   chunkIndex: number;
+  /**
+   * Raw parameters the client needs to build a visual that matches this
+   * hitbox bit-for-bit. Only present for types whose extents can't be
+   * derived from halfW/halfD alone — fallen trees rotate the trunk, so the
+   * AABB is an angle-dependent mix of length and thickness. Other types
+   * (tree scale, rock radius, hole box) recover cleanly from halfW/halfD.
+   */
+  visual?: { length: number; radius: number; angle: number };
 }
 
 export interface PlayerSimState {
@@ -211,6 +219,12 @@ export interface PlayerSimState {
   startZ: number;
   angle: number;
   speed: number;
+  /**
+   * Per-player steering rate (rad/s), sent at join from the player's
+   * keyTurnSpeed setting so multiplayer steers like their solo runs
+   * (M4). Defaults to PLAYER_TURN_RATE.
+   */
+  turnRate: number;
   hp: number;
   alive: boolean;
   finished: boolean;
@@ -233,6 +247,14 @@ export interface PlayerSimState {
   yetiTriggerAtMs: number;
   stuckTimer: number;
   deathKind?: string;
+  // Obstacles this player has actually collided with, for the lifetime of
+  // this run - a collision pushes the player back out to just past the
+  // obstacle's edge (see resolveCollision), which on a later tick can land
+  // squarely inside NEAR_MISS_MARGIN once the z-crossing finally resolves.
+  // The near-miss loop's own per-tick hitObstacleIds only excludes the
+  // exact tick of the hit, so without this an obstacle you just crashed
+  // into can still pay out a "near miss" once you clear it.
+  hitObstacleHistory: Set<string>;
 }
 
 export interface SimEvent {
@@ -258,6 +280,7 @@ export interface RoomSnapshotPlayer {
   z: number;
   angle: number;
   speed: number;
+  turnRate?: number;
   hp: number;
   alive: boolean;
   finished: boolean;
@@ -369,6 +392,7 @@ function obstacleExtents(type: ObstacleType, rng: SimRandom) {
     return {
       halfW: Math.abs(Math.cos(angle)) * trunkHalf + Math.abs(Math.sin(angle)) * thickHalf,
       halfD: Math.abs(Math.sin(angle)) * trunkHalf + Math.abs(Math.cos(angle)) * thickHalf,
+      visual: { length, radius, angle },
     };
   }
   if (type === 'rock') {
@@ -377,7 +401,11 @@ function obstacleExtents(type: ObstacleType, rng: SimRandom) {
   }
   if (type === 'stump') return { halfW: 0.3, halfD: 0.3 };
   if (type === 'ramp') return { halfW: 1.85, halfD: 1.35 };
-  if (type === 'heart') return { halfW: 0.34, halfD: 0.34 };
+  // 0.46 matches the client's heart pickup visual (Obstacles.ts) so touching
+  // the rendered heart always collects it — was 0.34, which left a ring of
+  // "visually touching, not collecting" around every pickup in multiplayer.
+  // No rng draw is involved, so chunk layouts are bit-identical to before.
+  if (type === 'heart') return { halfW: 0.46, halfD: 0.46 };
 
   const variant = rng.next();
   if (variant < 0.38) {
@@ -396,9 +424,8 @@ function createObstacle(id: string, type: ObstacleType, chunkIndex: number, zBas
     type,
     x: rng.range(xRange[0], xRange[1]),
     z: zBase + rng.range(zRange[0], zRange[1]),
-    halfW: extents.halfW,
-    halfD: extents.halfD,
     chunkIndex,
+    ...extents,
   };
 }
 
@@ -550,7 +577,7 @@ export function createMultiplayerSpawnXs(seed: number, playerCount: number) {
   return lanes.map(x => clamp(x + rng.range(-MULTIPLAYER_SPAWN_JITTER, MULTIPLAYER_SPAWN_JITTER), -MULTIPLAYER_SPAWN_LIMIT, MULTIPLAYER_SPAWN_LIMIT));
 }
 
-export function createInitialPlayerState(id: string, name: string, playerId = id, spawn: Partial<Pick<PlayerSimState, 'x' | 'y' | 'z' | 'startZ' | 'color'>> = {}): PlayerSimState {
+export function createInitialPlayerState(id: string, name: string, playerId = id, spawn: Partial<Pick<PlayerSimState, 'x' | 'y' | 'z' | 'startZ' | 'color' | 'turnRate'>> = {}): PlayerSimState {
   const z = Number(spawn.z ?? 0) || 0;
   return {
     id,
@@ -563,6 +590,7 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     startZ: Number(spawn.startZ ?? z) || 0,
     angle: 0,
     speed: BASE_SPEED,
+    turnRate: clamp(Number(spawn.turnRate) || PLAYER_TURN_RATE, 0.5, 4),
     hp: MAX_HP,
     alive: true,
     finished: false,
@@ -584,6 +612,7 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     lastInputAtMs: 0,
     yetiTriggerAtMs: -1,
     stuckTimer: 0,
+    hitObstacleHistory: new Set(),
   };
 }
 
@@ -686,7 +715,7 @@ export function simulatePlayerTick(
 
   const steer = state.isAirborne ? 0 : cleanInput.lateralAxis;
   if (!state.isAirborne) {
-    state.angle = clamp(state.angle + steer * PLAYER_TURN_RATE * weather.grip * dt, -PLAYER_MAX_TURN_ANGLE, PLAYER_MAX_TURN_ANGLE);
+    state.angle = clamp(state.angle + steer * (state.turnRate ?? PLAYER_TURN_RATE) * weather.grip * dt, -PLAYER_MAX_TURN_ANGLE, PLAYER_MAX_TURN_ANGLE);
     let targetSpeed = BASE_SPEED;
     if (cleanInput.boost) targetSpeed = BOOST_SPEED;
     if (cleanInput.brake) targetSpeed = MIN_SPEED;
@@ -745,6 +774,7 @@ export function simulatePlayerTick(
       newZ = resolved.z;
       damagePlayer(state, obs, Math.hypot(state.airVelocityX, state.airVelocityZ), events);
       hitObstacleIds.add(obs.id);
+      state.hitObstacleHistory.add(obs.id);
       state.airVelocityX *= 0.18;
       state.airVelocityZ *= 0.18;
       state.jumpVelocityY = Math.min(state.jumpVelocityY, 0.5);
@@ -764,6 +794,7 @@ export function simulatePlayerTick(
     newZ = resolved.z;
     damagePlayer(state, obs, state.speed, events);
     hitObstacleIds.add(obs.id);
+    state.hitObstacleHistory.add(obs.id);
   }
 
   // Anti-softlock (see STUCK_Z_RATIO_THRESHOLD's comment) - mirrors client
@@ -800,7 +831,7 @@ export function simulatePlayerTick(
   if (skillScoring && !state.isAirborne) {
     for (const obs of obstacles) {
       if (!NEAR_MISS_TYPES.has(obs.type)) continue;
-      if (hitObstacleIds.has(obs.id) || consumedPickupIds.has(obs.id)) continue;
+      if (hitObstacleIds.has(obs.id) || consumedPickupIds.has(obs.id) || state.hitObstacleHistory.has(obs.id)) continue;
       // Fires once, exactly as the obstacle's z crosses from ahead to
       // behind the player this tick - the player only ever moves forward,
       // so a given obstacle can only cross once per run.
@@ -858,7 +889,33 @@ export function simulatePlayerTick(
   return events;
 }
 
-export function applyPlayerCollision(a: PlayerSimState, b: PlayerSimState): SimEvent[] {
+/**
+ * Pulls a shoved player out of any solid obstacle they now overlap, with no
+ * extra damage. The shove knockback is applied blindly along X, which can
+ * slam a player into a tree/hole they had no chance to avoid — the shove
+ * already cost HP, so stacking a second, unpreventable obstacle hit on top
+ * was the reported bug (minor list: shove re-resolution). aObstacles /
+ * bObstacles are each player's nearby gameplay obstacles at their own z,
+ * computed by the caller (the runtime tick) — pure and deterministic, so
+ * server-side state stays reproducible.
+ */
+function pullShoveVictimOutOfHazards(state: PlayerSimState, obstacles: ObstacleRecord[]) {
+  if (!state.alive) return;
+  for (const obs of obstacles) {
+    if (obs.type === 'heart' || obs.type === 'ramp') continue;
+    if (!collidesAABB(state.x, state.z, PLAYER_HALF_W, PLAYER_HALF_D, obs)) continue;
+    const resolved = resolveCollision(state.x, state.z, obs);
+    state.x = resolved.x;
+    state.z = resolved.z;
+  }
+}
+
+export function applyPlayerCollision(
+  a: PlayerSimState,
+  b: PlayerSimState,
+  aObstacles: ObstacleRecord[] = [],
+  bObstacles: ObstacleRecord[] = [],
+): SimEvent[] {
   const events: SimEvent[] = [];
   if (!a.alive || !b.alive || a.isAirborne || b.isAirborne) return events;
   if (a.invincibilityRemaining > 0 && b.invincibilityRemaining > 0) return events;
@@ -872,6 +929,9 @@ export function applyPlayerCollision(a: PlayerSimState, b: PlayerSimState): SimE
   b.x = clamp(b.x - side * 0.28, -55, 55);
   a.speed *= 0.55;
   b.speed *= 0.55;
+
+  pullShoveVictimOutOfHazards(a, aObstacles);
+  pullShoveVictimOutOfHazards(b, bObstacles);
 
   for (const state of [a, b]) {
     if (state.invincibilityRemaining > 0) continue;
@@ -916,8 +976,8 @@ export function getYetiConfig(settings: RoomSettings) {
   const configs = {
     easy: { triggerDistance: 2600 },
     normal: { triggerDistance: 2000 },
-    hard: { triggerDistance: 1300 },
-    extreme: { triggerDistance: 550 },
+    hard: { triggerDistance: 1400 },
+    extreme: { triggerDistance: 850 },
   } as Record<Difficulty, { triggerDistance: number }>;
   const config = configs[difficulty] || configs.normal;
   return {
@@ -982,6 +1042,7 @@ export function toSnapshotPlayer(state: PlayerSimState): RoomSnapshotPlayer {
     z: state.z,
     angle: state.angle,
     speed: state.speed,
+    turnRate: state.turnRate,
     hp: state.hp,
     alive: state.alive,
     finished: state.finished,

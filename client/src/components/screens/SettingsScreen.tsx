@@ -52,6 +52,13 @@ export function SettingsScreen({ controller }: SettingsScreenProps) {
             <option value="both">Both</option>
           </Select>
         ))}
+        {row('Touch Controls', (
+          <Select value={form.touchControls} onChange={event => update('touchControls', event.target.value as GameSettings['touchControls'])}>
+            <option value="auto">Auto-detect</option>
+            <option value="on">Always On</option>
+            <option value="off">Always Off</option>
+          </Select>
+        ))}
         {row('Mouse Sensitivity', (
           <Slider min={0.5} max={2} step={0.1} value={form.mouseSensitivity} onChange={event => update('mouseSensitivity', Number(event.target.value))} />
         ), Number(form.mouseSensitivity).toFixed(1))}
@@ -101,6 +108,10 @@ export function SettingsScreen({ controller }: SettingsScreenProps) {
           <Checkbox checked={!!form.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
         </label>
       </div>
+
+      <p className="text-center text-[11px] font-bold uppercase tracking-wide text-[#7d92ab]">
+        Fog &amp; snowfall apply immediately. Obstacles, graphics quality &amp; run rules apply from your next run.
+      </p>
 
       <div className="grid grid-cols-2 gap-2">
         <Button type="button" onClick={() => controller.saveSettingsForm(form)}>

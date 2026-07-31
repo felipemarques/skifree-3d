@@ -1,11 +1,16 @@
 import type { PlayerStatus } from '@/types/app';
 
-export function PlayerStatusPanel({ players }: { players: PlayerStatus[] }) {
+export function PlayerStatusPanel({ players, touchActive = false }: { players: PlayerStatus[]; touchActive?: boolean }) {
   if (!players || players.length <= 1) return null;
   const sorted = [...players].sort((a, b) => (b.distance || 0) - (a.distance || 0));
 
+  // On touch, stay top-right always - the bottom-relocation on narrow
+  // screens would otherwise land on top of the jump button/D-pad
+  // (TouchControls.tsx).
+  const positionClass = touchActive ? 'right-2.5 top-2.5' : 'right-4 top-4 max-sm:bottom-[150px] max-sm:right-2.5 max-sm:top-auto';
+
   return (
-    <div className="hud-glass pointer-events-none fixed right-4 top-4 z-[60] min-w-44 max-w-[min(280px,calc(100vw-40px))] p-3 text-right text-sm leading-normal text-[#dceeff] max-sm:bottom-[150px] max-sm:right-2.5 max-sm:top-auto">
+    <div className={`hud-glass pointer-events-none fixed z-[60] min-w-44 max-w-[min(280px,calc(100vw-40px))] p-3 text-right text-sm leading-normal text-[#dceeff] ${positionClass}`}>
       {sorted.map((player, index) => {
         const alive = player.alive !== false;
         return (

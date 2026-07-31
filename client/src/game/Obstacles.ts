@@ -27,7 +27,7 @@ const SPAWN_PADDING = 0.75;
 // In a full blizzard, obstacles beyond this z-distance are hidden entirely
 // (not just fogged) so nothing pops through via a shadow, specular hit, or
 // any other fog-blend edge case - matches the fog's own z-distance framing.
-const BLIZZARD_VISIBILITY_RADIUS = 22;
+const BLIZZARD_VISIBILITY_RADIUS = 50;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -227,7 +227,7 @@ function resetAnimalPart(obj) {
   obj.rotation.copy(obj.userData.restRotation);
 }
 
-export function makeTree(rng, hueShift = 0) {
+export function makeTree(rng, hueShift = 0, scale = null) {
   const group = new THREE.Group();
 
   const trunkH = rng.range(0.55, 1.25);
@@ -241,7 +241,10 @@ export function makeTree(rng, hueShift = 0) {
   group.add(trunk);
 
   const layers = rng.int(2, 4);
-  const baseScale = rng.range(0.78, 1.45);
+  // Authoritative-multiplayer override: scale comes from the sim record so
+  // the rendered tree is exactly as big as its hitbox (M2). Solo passes
+  // null and draws its own scale as before.
+  const baseScale = scale ?? rng.range(0.78, 1.45);
   const greenHue = (((0.32 + rng.range(-0.035, 0.025) + hueShift) % 1) + 1) % 1;
   const snowMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.56, 0.32, rng.range(0.86, 0.94)),
@@ -275,9 +278,9 @@ export function makeTree(rng, hueShift = 0) {
   return markShadows(group);
 }
 
-export function makeRock(rng, hueShift = 0) {
+export function makeRock(rng, hueShift = 0, radiusOverride = null) {
   const group = new THREE.Group();
-  const radius = rng.range(0.34, 0.82);
+  const radius = radiusOverride ?? rng.range(0.34, 0.82);
   const geo = new THREE.IcosahedronGeometry(radius, 0);
   geo.scale(1.15, rng.range(0.48, 0.75), 0.9);
   const rockHue = (((0.6 + hueShift * 0.4) % 1) + 1) % 1;
@@ -329,11 +332,15 @@ function makeStump(rng) {
   return markShadows(group);
 }
 
-function makeFallenTree(rng) {
+function makeFallenTree(rng, visual = null) {
   const group = new THREE.Group();
 
-  const length = rng.range(2.2, 4.2);
-  const radius = rng.range(0.16, 0.28);
+  // Authoritative-multiplayer override: the sim record carries the exact
+  // length/radius/angle that produced its hitbox (ObstacleRecord.visual), so
+  // the rendered trunk and its collision box match bit-for-bit (M2). Solo
+  // passes null and draws its own values as before.
+  const length = visual?.length ?? rng.range(2.2, 4.2);
+  const radius = visual?.radius ?? rng.range(0.16, 0.28);
   const barkMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.08, 0.48, rng.range(0.2, 0.32)),
     roughness: 0.92,
@@ -391,7 +398,7 @@ function makeFallenTree(rng) {
     group.add(branch);
   }
 
-  const angle = rng.range(0, Math.PI);
+  const angle = visual?.angle ?? rng.range(0, Math.PI);
   const trunkHalf = length * 0.52;
   const thickHalf = Math.max(0.42, radius * 2.2);
   group.rotation.y = angle;
@@ -549,7 +556,7 @@ function getRotatedExtents(points, angle) {
   return { halfW, halfD };
 }
 
-function makeHole(rng) {
+function makeHole(rng, fit = null) {
   const group = new THREE.Group();
 
   const variant = rng.next();
@@ -623,8 +630,23 @@ function makeHole(rng) {
     group.add(crack);
   }
 
-  const rotation = rng.range(0, Math.PI);
-  const extents = getRotatedExtents(outer, rotation);
+  // Authoritative-multiplayer override: the sim collides with an unrotated
+  // box sized from its own width/depth draws (record halfW/halfD), while the
+  // visual used to rotate freely — a player could straddle a rotated visual
+  // hole and not fall in (M2). When fitting a record, drop the rotation and
+  // non-uniformly scale the shape so its axis-aligned footprint is exactly
+  // the hitbox. Solo passes null and keeps the rotated, generously-sized
+  // visual whose own extents are used for solo collision (self-consistent).
+  let rotation = rng.range(0, Math.PI);
+  let extents = getRotatedExtents(outer, rotation);
+  if (fit) {
+    const unrotated = getRotatedExtents(outer, 0);
+    const sx = unrotated.halfW > 0 ? fit.halfW / unrotated.halfW : 1;
+    const sz = unrotated.halfD > 0 ? fit.halfD / unrotated.halfD : 1;
+    group.scale.set(sx, 1, sz);
+    rotation = 0;
+    extents = { halfW: fit.halfW, halfD: fit.halfD };
+  }
   group.rotation.y = rotation;
   group.userData.halfW = extents.halfW;
   group.userData.halfD = extents.halfD;
@@ -1133,19 +1155,27 @@ export class Obstacles {
     const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp);
     const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(chunkIndex * CHUNK_SIZE);
 
-    const makeMesh = (type) => {
-      if (type === 'tree') return makeTree(rng, treeHueShift);
-      if (type === 'fallen_tree') return makeFallenTree(rng);
-      if (type === 'rock') return makeRock(rng, rockHueShift);
+    // Meshes are built from the authoritative records' own extents so the
+    // rendered obstacle is exactly as big as its collision box (M2): tree
+    // scale and rock radius recover directly from halfW, fallen trees carry
+    // their raw length/radius/angle on the record (sim emits them since the
+    // rotated AABB can't be inverted), holes drop their random rotation and
+    // scale to the record box. Solo never passes a record, so its visuals
+    // and hitboxes stay self-consistent as before.
+    const makeMesh = (record) => {
+      const type = record.type;
+      if (type === 'tree') return makeTree(rng, treeHueShift, record.halfW / 0.72);
+      if (type === 'fallen_tree') return makeFallenTree(rng, record.visual || null);
+      if (type === 'rock') return makeRock(rng, rockHueShift, record.halfW / 0.95);
       if (type === 'stump') return makeStump(rng);
       if (type === 'ramp') return makeRamp(rng);
-      if (type === 'hole') return makeHole(rng);
+      if (type === 'hole') return makeHole(rng, { halfW: record.halfW, halfD: record.halfD });
       if (type === 'heart') return makeHeartPickup(rng);
       return makeRock(rng, rockHueShift);
     };
 
     for (const record of records) {
-      const mesh = makeMesh(record.type);
+      const mesh = makeMesh(record);
       mesh.position.set(record.x, 0, record.z);
       group.add(mesh);
       chunkObstacles.push({

@@ -34,6 +34,7 @@ function asGameMode(value: string | undefined): GameMode {
 
 export class ReactUiAdapter implements UiAdapter {
   private errorTimer = 0;
+  private noticeTimer = 0;
   private controlsTimer = 0;
 
   constructor(private store: UiStore) {}
@@ -203,6 +204,18 @@ export class ReactUiAdapter implements UiAdapter {
 
   clearError() {
     this.store.set({ error: '' });
+  }
+
+  /** Neutral/positive transient toast (e.g. "Name saved.") — deliberately
+   *  separate from the red error styling (minor list). */
+  setNotice(message: string) {
+    window.clearTimeout(this.noticeTimer);
+    this.store.set({ notice: message });
+    this.noticeTimer = window.setTimeout(() => this.clearNotice(), 3000);
+  }
+
+  clearNotice() {
+    this.store.set({ notice: '' });
   }
 
   private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey' | 'unstuckFlashKey', delay: number) {

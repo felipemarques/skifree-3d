@@ -33,6 +33,7 @@ import {
   PLAYER_TURN_RATE,
   PLAYER_MAX_TURN_ANGLE,
   createInitialPlayerState,
+  createMultiplayerSpawnXs,
   getChainWindowMs,
   getGameplayObstaclesNear,
   getWeatherAtZ,
@@ -58,6 +59,25 @@ const GHOST_SAMPLE_INTERVAL_S = 0.12;
 // fading in - see _updateStormWall.
 const STORM_WALL_LOOKAHEAD = 280;
 const STORM_WALL_MAX_OPACITY = 0.62;
+// Multiplayer snapshot watchdog (M11). Snapshots stream at SNAPSHOT_HZ (30/s)
+// over volatile emits, which the transport silently drops under congestion.
+// A multi-second drought with a live socket means the server's truth is
+// unreachable: the client would otherwise keep predicting from stale state
+// forever and reveal a crash that happened seconds ago. Warn once, then hand
+// the teardown to the controller (same path as a disconnect).
+const SNAPSHOT_WARNING_MS = 2000;
+const SNAPSHOT_TIMEOUT_MS = 5000;
+// Legacy (non-authoritative) multiplayer broadcasts player state at this
+// rate. Was referenced but never defined → `1 / undefined` = NaN, silently
+// disabling the path (minor list).
+const NET_UPDATE_HZ = 30;
+// Predicted death reveal: a local crash is hidden as "possibly alive" until
+// the next snapshot confirms it. If the snapshot is late (loss spike), that
+// hide-until-confirm becomes "dead but still skiing for the whole outage".
+// Reveal the predicted death locally after this short window instead; a
+// snapshot that disagrees (wrong prediction) revives the player on arrival
+// (minor list: RTT death reveal).
+const PREDICTED_DEATH_REVEAL_MS = 40;
 // Slow, one-directional time-of-day drift toward a warm "golden hour" tint,
 // purely cosmetic - a full day/night cycle doesn't make sense for a run
 // that's minutes long, but a long run slowly warming/dimming does. Capped
@@ -198,11 +218,14 @@ export class Game {
     this._authVisualAngleCorrection = 0;
     this._authLastReconciliationError = 0;
     this._authLastSnapshotAt = 0;
+    this._authSnapshotWarningFired = false;
+    this._authSnapshotTimeoutFired = false;
     this._netDebugEnabled = new URLSearchParams(window.location.search).get('netDebug') === '1';
     this._netDebugElement = null;
     this._spectatorTargetId = null;
     this._authLocalSnapshotAlive = true;
     this._authLocalDeathHandled = false;
+    this._predictedDeathRevealAt = 0;
     this._authConsumedPickupIds = new Set();
     this._authLastYetiWarning = 0;
     this._devModeEnabled = false;
@@ -220,6 +243,25 @@ export class Game {
 
     this._setup();
     this._createNetDebugOverlay();
+  }
+
+  /**
+   * Live-applies the cheap settings (fog density, snow volume) without
+   * rebuilding the run. Fog is picked up automatically by
+   * _updateWeatherVisuals, which re-derives the target density from
+   * _baseFogFar every frame. Everything else (graphics quality, lighting,
+   * obstacle layout, run rules) is baked at construction and applies from
+   * the next run.
+   */
+  applySettingsLive(values) {
+    if (values.fogLevel !== undefined) {
+      this.fogLevel = Number(values.fogLevel);
+      this._baseFogFar = getFogDistances(this._useHighGraphics, this.fogLevel).far;
+    }
+    if (values.snowVolume !== undefined) {
+      this.snowVolume = Number(values.snowVolume);
+      this.snow.setVolume(this.snowVolume);
+    }
   }
 
   _onDevModeKeydown(e) {
@@ -586,11 +628,25 @@ export class Game {
     }
 
     if (this._authoritativeMultiplayer) {
+      // Pre-seed the client-side sim on the same lane the server spawns the
+      // player (createMultiplayerSpawnXs is deterministic from seed +
+      // player count, and lane order matches the server's insertion order).
+      // Without this the client starts at x=0 and the first snapshot snaps
+      // sideways to the real lane (minor list: spawn snap).
+      const players = (this.options && Array.isArray(this.options.players)) ? this.options.players : [];
+      const ownId = this.socket?.id || 'local';
+      const ownIndex = Math.max(0, players.findIndex(p => p && (p.id === ownId || p.id === 'local')));
+      const spawnXs = createMultiplayerSpawnXs(this.seed, Math.max(1, players.length));
       this._authState = createInitialPlayerState(
         this.socket?.id || 'local',
         this.options.playerName || 'Skier',
         this.options.playerId || this.socket?.id || 'local',
-        { color: this.playerColor },
+        {
+          x: spawnXs[ownIndex] ?? 0,
+          z: 0,
+          startZ: 0,
+          color: this.playerColor,
+        },
       );
       this._authPreviousState = { ...this._authState };
     }
@@ -931,6 +987,19 @@ export class Game {
     if (!obs) return 0;
     return this._panForDx(obs.x - this.player.position.x);
   }
+
+  /**
+   * Camera environment (M12): terrain-height sampling for the floor clamp
+   * (high-graphics visual relief only — flat terrain never dips) and the
+   * nearby obstacle AABBs for pull-in avoidance. Closures stay fresh per
+   * frame so the camera sees the current chunk/relief.
+   */
+  _buildCameraEnv(visualGroundY, focusZ) {
+    return {
+      groundHeightAt: visualGroundY || undefined,
+      occluders: () => this.obstacles.getObstaclesNear(focusZ, 30),
+    };
+  }
   
   _update(dt) {
     if (this._authoritativeMultiplayer) {
@@ -952,7 +1021,7 @@ export class Game {
       }
 
       if (this.ghostPlayer) this.ghostPlayer.update(dt, performance.now() - this._startTime, visualGroundY);
-      this.camera.update(dt, this.player.mesh, Math.max(this.player.speed, 4));
+      this.camera.update(dt, this.player.mesh, Math.max(this.player.speed, 4), this._buildCameraEnv(visualGroundY, this.player.position.z));
       this.sky?.update(this.threeCamera.position);
       this.mountains?.update(this.threeCamera.position);
     this.aurora?.update(dt, this.threeCamera.position);
@@ -1056,7 +1125,7 @@ export class Game {
     this.ui.updateYetiRadar(yetiThreats);
     this._updateYetiTension(distance);
     this._updateYetiDangerBonus(dt);
-    this.camera.update(dt, this.player.mesh, this.player.speed);
+    this.camera.update(dt, this.player.mesh, this.player.speed, this._buildCameraEnv(visualGroundY, this.player.position.z));
     this.postFx?.update(this.player.speed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
@@ -1130,6 +1199,7 @@ export class Game {
 
   _updateAuthoritativeMultiplayer(dt) {
     if (!this._authState) return;
+    this._updateSnapshotWatchdog();
 
     const focusState = this._authState;
     const spectator = focusState.alive ? null : this._getBestAliveRemotePlayer();
@@ -1208,7 +1278,7 @@ export class Game {
     this.obstacles.update(dt, focusMesh.position.z, visualGroundY, weather.fogIntensity);
     this.courseDecor.update(dt, focusMesh.position.z, visualGroundY);
     this.landmarks?.update(dt, focusMesh.position.z, visualGroundY);
-    this.camera.update(dt, focusMesh, focusSpeed);
+    this.camera.update(dt, focusMesh, focusSpeed, this._buildCameraEnv(visualGroundY, focusZ));
     this.postFx?.update(focusSpeed);
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
@@ -1265,13 +1335,23 @@ export class Game {
       this.difficultyRamp,
     );
     const weather = getWeatherAtZ(this.seed, state.z);
+    if (state.alive) this._predictedDeathRevealAt = 0;
     const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
     simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather);
     if (officiallyAliveBeforePrediction && state.alive === false) {
-      state.alive = true;
-      state.finished = false;
-      state.hp = Math.max(1, state.hp || 1);
-      state.deathKind = undefined;
+      // Predicted death: hold the "possibly alive" facade only for a short
+      // window (long enough for an in-flight snapshot to override a wrong
+      // prediction), then reveal the crash locally instead of hiding it
+      // until the snapshot lands. Authoritative handling (scores, gameover)
+      // still waits for the snapshot via _authLocalDeathHandled.
+      const nowMs = performance.now();
+      if (!this._predictedDeathRevealAt) this._predictedDeathRevealAt = nowMs;
+      if (nowMs - this._predictedDeathRevealAt < PREDICTED_DEATH_REVEAL_MS) {
+        state.alive = true;
+        state.finished = false;
+        state.hp = Math.max(1, state.hp || 1);
+        state.deathKind = undefined;
+      }
     }
   }
 
@@ -1393,6 +1473,18 @@ export class Game {
     }
     this._authConsumedPickupIds = replayConsumed;
     return replayState;
+  }
+
+  _updateSnapshotWatchdog() {
+    if (!this._authHasReceivedSnapshot || this._authLocalSnapshotAlive === false) return;
+    const age = performance.now() - this._authLastSnapshotAt;
+    if (age >= SNAPSHOT_TIMEOUT_MS && !this._authSnapshotTimeoutFired) {
+      this._authSnapshotTimeoutFired = true;
+      this.options.onSnapshotTimeout?.();
+    } else if (age >= SNAPSHOT_WARNING_MS && !this._authSnapshotWarningFired) {
+      this._authSnapshotWarningFired = true;
+      this.ui.setError('Connection unstable — waiting for server…');
+    }
   }
 
   _onGameSnapshot(snapshot) {
@@ -1649,7 +1741,7 @@ export class Game {
     this.terrain.update(focusZ, this._elapsedSeconds, focusX);
     this.obstacles.update(dt, focusZ, visualGroundY);
     this.courseDecor.update(dt, focusZ, visualGroundY);
-    this.camera.update(dt, focusMesh, focusSpeed);
+    this.camera.update(dt, focusMesh, focusSpeed, this._buildCameraEnv(visualGroundY, focusZ));
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
     this.aurora?.update(dt, this.threeCamera.position);

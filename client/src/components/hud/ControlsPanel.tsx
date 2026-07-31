@@ -1,6 +1,20 @@
 import type { GameMode } from '@/types/app';
 
-export function ControlsPanel({ gameMode, notice }: { gameMode: GameMode; notice: string }) {
+export function ControlsPanel({ gameMode, notice, touchActive = false }: { gameMode: GameMode; notice: string; touchActive?: boolean }) {
+  // On touch, the on-screen D-pad/jump button (TouchControls.tsx) are the
+  // legend - showing keyboard/mouse hints (and sitting in the same
+  // bottom-left corner the D-pad now occupies) would just be confusing.
+  // Still surface `notice` (Health +1 / Near Miss / Jump Chain etc.) - that's
+  // live feedback, not a static key legend - just relocated out of the way.
+  if (touchActive) {
+    if (!notice) return null;
+    return (
+      <div className="hud-glass pointer-events-none fixed left-1/2 top-16 z-[60] -translate-x-1/2 px-3 py-1.5 text-center text-xs font-black text-white max-sm:top-14">
+        {notice}
+      </div>
+    );
+  }
+
   const items = [
     ['A / D', 'Turn'],
     ['W', 'Brake'],

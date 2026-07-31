@@ -107,6 +107,10 @@ export class GameController {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.86;
+    // The virtual joystick/jump button overlay (Joystick.tsx/TouchControls.tsx)
+    // capture their own touches directly, but a stray touch on this canvas
+    // itself (outside those elements) should still not scroll/zoom the page.
+    this.renderer.domElement.style.touchAction = 'none';
     host.appendChild(this.renderer.domElement);
 
     this.menuBackdrop = new MenuBackdrop(this.renderer);
@@ -114,6 +118,7 @@ export class GameController {
     window.addEventListener('keydown', this.handleShortcutKeys, { capture: true });
     window.addEventListener('keydown', this.handleEscape);
     window.addEventListener('resize', this.handleResize);
+    document.addEventListener('visibilitychange', this.handleVisibilityChange);
 
     rankingStore.syncFromServer(10);
     this.showTitleScreen();
@@ -149,6 +154,16 @@ export class GameController {
     return this.socket.id;
   }
 
+  /**
+   * Mode the last completed Daily Challenge ran under, or null. The ranking
+   * "Today" tab uses this so it keys off the daily run's mode instead of the
+   * player's current settings selection (minor list).
+   */
+  getLastDailyMode(): GameMode | null {
+    const gameOver = this.store.getSnapshot().gameOver;
+    return gameOver.dailyKey ? (gameOver.gameMode as GameMode) : null;
+  }
+
   getPlayerColor() {
     return this.playerColor;
   }
@@ -168,6 +183,7 @@ export class GameController {
       yetiStartMode: settings.get('yetiStartMode'),
       difficultyRamp: !!settings.get('difficultyRamp'),
       skillScoring: !!settings.get('skillScoring'),
+      touchControls: settings.get('touchControls'),
     };
   }
 
@@ -178,7 +194,7 @@ export class GameController {
     } catch (e) {
       // Ignore localStorage write failures.
     }
-    this.ui.setError('Name saved.');
+    this.ui.setNotice('Name saved.');
     this.emit();
     return this.playerName;
   }
@@ -244,7 +260,7 @@ export class GameController {
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
     this.roomSettings = this.getLocalRoomSettings(gameMode);
-    this.socket.createRoom(this.playerName, this.roomSettings, (rankingStore as any).playerId, this.playerColor);
+    this.socket.createRoom(this.playerName, this.roomSettings, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
     this.emit();
   }
 
@@ -256,7 +272,7 @@ export class GameController {
     }
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
-    this.socket.joinRoom(roomCode, this.playerName, (rankingStore as any).playerId, this.playerColor);
+    this.socket.joinRoom(roomCode, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
     this.emit();
   }
 
@@ -286,10 +302,17 @@ export class GameController {
   playAgain() {
     this.destroyCurrentGame();
     if (this.isMultiplayer && this.roomId) {
-      this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor);
-    } else {
-      this.startGame({ seed: randomSeed(), multiplayer: false, gameMode: settings.get('gameMode') });
+      this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
+      return;
     }
+    const gameOver = this.store.getSnapshot().gameOver;
+    if (gameOver?.dailyKey) {
+      // "Again" from a Daily Challenge replays the same daily (same
+      // seed/rules/key), not a fresh random seed (minor list).
+      this.startDailyChallenge(gameOver.gameMode || settings.get('gameMode'));
+      return;
+    }
+    this.startGame({ seed: randomSeed(), multiplayer: false, gameMode: settings.get('gameMode') });
   }
 
   mainMenu() {
@@ -317,6 +340,8 @@ export class GameController {
     settings.set('yetiStartMode', values.yetiStartMode);
     settings.set('difficultyRamp', !!values.difficultyRamp);
     settings.set('skillScoring', !!values.skillScoring);
+    settings.set('touchControls', values.touchControls);
+    this.currentGame?.applySettingsLive(values);
     this.currentGame?.audio?.setVolume(settings.get('sfxVolume'));
     this.closeSettings();
   }
@@ -374,6 +399,30 @@ export class GameController {
     this.emit();
   }
 
+  setTouchJump(pressed: boolean) {
+    this.currentGame?.input?.setTouchJump(pressed);
+  }
+
+  setJoystickVector(x: number, y: number, active: boolean) {
+    this.currentGame?.input?.setJoystickVector(x, y, active);
+  }
+
+  /**
+   * Freezes/unfreezes the simulation without touching the UI screen (unlike
+   * pauseCurrentGame/resumeCurrentGame, which navigate to the 'pause'
+   * screen). Used by OrientationGate to block a too-narrow portrait aspect
+   * without hiding itself the instant it triggers - a screen change to
+   * 'pause' would make OrientationGate's own `screen === 'game'` gate go
+   * false, disappearing itself and stranding the player on a blank pause
+   * screen. Both Game.pause()/resume() are already no-ops if called when
+   * already in the requested state, so this is safe to call redundantly.
+   */
+  setSimulationPaused(paused: boolean) {
+    if (!this.currentGame) return;
+    if (paused) this.currentGame.pause();
+    else this.currentGame.resume();
+  }
+
   updateRoomSettings(nextSettings: Partial<RoomSettings>) {
     if (!this.isRoomHost()) return;
     this.roomSettings = normalizeRoomSettings({ ...this.roomSettings, ...nextSettings });
@@ -392,6 +441,7 @@ export class GameController {
     window.removeEventListener('keydown', this.handleShortcutKeys, { capture: true } as any);
     window.removeEventListener('keydown', this.handleEscape);
     window.removeEventListener('resize', this.handleResize);
+    document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     this.renderer.domElement.remove();
     this.renderer.dispose();
   }
@@ -421,6 +471,7 @@ export class GameController {
         const ghostSaved = result.ghostRecord ? ghostStore.trySave(result.ghostRecord) : false;
         return { ghostSaved };
       },
+      onSnapshotTimeout: () => this.handleSnapshotTimeout(),
     });
     this.currentGame.start();
     this.emit();
@@ -449,6 +500,20 @@ export class GameController {
     if (!this.currentGame) return;
     this.currentGame.destroy();
     this.currentGame = null;
+    this.emit();
+  }
+
+  /**
+   * M11 snapshot watchdog: the socket is still connected but authoritative
+   * snapshots (volatile emits) have gone silent for SNAPSHOT_TIMEOUT_MS. The
+   * server has been driving a run off stale input that long, so the local
+   * run is untrustworthy — end it the same way a disconnect would.
+   */
+  private handleSnapshotTimeout() {
+    const screen = this.store.getSnapshot().screen;
+    if (screen === 'gameover') return; // already handled by the final snapshot path
+    this.leaveCurrentGameToMenu();
+    this.ui.setError('Connection lost — your run ended.');
     this.emit();
   }
 
@@ -594,10 +659,18 @@ export class GameController {
     });
 
     this.socket.on('room:error', ({ message }: any) => {
-      this.ui.setError(message);
-      if (!this.roomId && !this.currentGame) {
+      if (this.currentGame) {
+        // A room-level error mid-run (e.g. a rejoin attempt rejected after a
+        // connection blip) means the server-side run is unreachable — don't
+        // keep a zombie local run going (C2).
+        this.leaveCurrentGameToMenu();
+        this.ui.setError(message || 'Multiplayer run ended.');
+      } else if (!this.roomId) {
         this.isMultiplayer = false;
         this.socket.disconnect();
+        this.ui.setError(message);
+      } else {
+        this.ui.setError(message);
       }
       this.emit();
     });
@@ -616,19 +689,63 @@ export class GameController {
 
     this.socket.on('connect', () => {
       if (this.roomId && this.isMultiplayer) {
-        this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor);
+        this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
       }
+      this.emit();
+    });
+
+    this.socket.on('disconnect', () => {
+      if (!this.isMultiplayer) return;
+      const screen = this.store.getSnapshot().screen;
+
+      if (screen === 'gameover') {
+        // Run already finished — scores are final and the server already
+        // ranked it. Clear the room so "Again" doesn't try a doomed rejoin,
+        // and stay on the gameover screen with the results visible.
+        this.resetRoomState();
+        this.ui.setError('Disconnected from server.');
+        this.emit();
+        return;
+      }
+
+      // Mid-run or lobby: the server already marked us finished
+      // (deathKind 'disconnect') and stopped streaming snapshots. Without
+      // this the local prediction loop keeps reviving a run that no longer
+      // exists (C2 zombie run). End cleanly and land on the title screen.
+      this.leaveCurrentGameToMenu();
+      this.ui.setError(screen === 'lobby' ? 'Disconnected from server.' : 'Disconnected from server — your run ended.');
       this.emit();
     });
   }
 
   private handleShortcutKeys = (event: KeyboardEvent) => {
     if (!(event.ctrlKey || event.metaKey)) return;
+    // Typing in a name/room field keeps browser shortcuts working
+    // (Ctrl+W/Q/S/A/F and friends) — same exemption Game.ts's dev-mode
+    // guard already has (minor list: Ctrl-block inside text inputs).
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
     const key = String(event.key || '').toLowerCase();
     if (!blockedBrowserShortcutKeys.has(key)) return;
 
     event.preventDefault();
     event.stopImmediatePropagation();
+  };
+
+  /**
+   * Tab/window hidden mid-run (alt-tab, tab switch, minimize). The browser
+   * throttles the rAF loop to a stop either way, so the only question is
+   * whether the freeze is silent or explicit. Solo: pause into the pause
+   * screen instead of silently freezing. Multiplayer: the run keeps
+   * simulating on the server (inputs go stale and the skier drives straight
+   * after ~500ms), so the pause screen's multiplayer warning makes the risk
+   * explicit instead of silently handing back a dead run on return. No-op
+   * when nothing is running or the game already ended (pauseCurrentGame
+   * guards). See C1/M3 in todo/gameplay-scan.md.
+   */
+  private handleVisibilityChange = () => {
+    if (!document.hidden) return;
+    this.pauseCurrentGame();
   };
 
   private handleEscape = (event: KeyboardEvent) => {
@@ -638,7 +755,11 @@ export class GameController {
     const screen = this.store.getSnapshot().screen;
     if (this.currentGame._running) this.pauseCurrentGame();
     else if (this.settingsReturnMode === 'pause' && screen === 'settings') this.ui.showPause();
-    else this.resumeCurrentGame();
+    else if (screen === 'pause') this.resumeCurrentGame();
+    // Otherwise the sim is frozen with no pause screen showing (e.g. the
+    // OrientationGate rotation overlay freezes via setSimulationPaused and
+    // leaves the screen on 'game'). Esc must not resume a game the player
+    // can't see behind an overlay (M8).
   };
 
   private handleResize = () => {

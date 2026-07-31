@@ -1,22 +1,32 @@
 import type { UiStoreState } from '@/types/app';
+import type { GameController } from '@/app/gameController';
+import { isTouchActive } from '@/utils/touch';
 import { ControlsPanel } from './ControlsPanel';
 import { Hearts } from './Hearts';
 import { HitFlash } from './HitFlash';
 import { LowHealthVignette } from './LowHealthVignette';
+import { MuteButton } from './MuteButton';
+import { OrientationGate } from './OrientationGate';
 import { PlayerStatusPanel } from './PlayerStatusPanel';
 import { SpeedMeter } from './SpeedMeter';
+import { TouchControls } from './TouchControls';
 import { YetiRadar } from './YetiRadar';
 
-export function GameHud({ state }: { state: UiStoreState }) {
+export function GameHud({ state, controller }: { state: UiStoreState; controller: GameController | null }) {
   const showHud = state.screen === 'game' || state.screen === 'pause';
   const showControls = state.screen === 'game';
+  const touchActive = isTouchActive();
+  const cs = controller?.getSnapshot();
 
   return (
     <>
       {showHud && (
-        <div className="pointer-events-none fixed left-4 top-4 z-[60] w-[242px] max-sm:left-2.5 max-sm:top-2.5 max-sm:w-[min(230px,calc(100vw-20px))]">
+        <div className="hud-stat-wrapper pointer-events-none fixed left-4 top-4 z-[60] w-[242px] max-sm:left-2.5 max-sm:top-2.5 max-sm:w-[min(230px,calc(100vw-20px))]">
           <div className="hud-glass grid gap-2.5 p-3">
-            <Hearts hp={state.hud.hp} flashKey={state.healFlashKey + state.hitFlashKey} />
+            <div className="flex items-center justify-between gap-2">
+              <Hearts hp={state.hud.hp} flashKey={state.healFlashKey + state.hitFlashKey} />
+              <MuteButton visible={!!controller && !!cs?.muteVisible} muted={!!cs?.muted} onToggle={() => controller?.toggleMute()} className="h-8 w-8 bg-white/10" />
+            </div>
             <SpeedMeter distance={state.hud.distance} speed={state.hud.speed} momentum={state.hud.momentum} />
             <div className="flex flex-wrap gap-2">
               <div className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide ${state.hud.isAirborne ? 'border-cyan-300/50 bg-blue-500/30 text-white' : 'border-white/15 bg-white/10 text-[#dceeff]'}`}>
@@ -69,14 +79,16 @@ export function GameHud({ state }: { state: UiStoreState }) {
         </div>
       )}
 
-      {showControls && <ControlsPanel gameMode={state.gameMode} notice={state.controlsNotice} />}
-      {showHud && <PlayerStatusPanel players={state.playerList} />}
-      {showHud && <YetiRadar threats={state.yetiThreats} />}
+      {showControls && <ControlsPanel gameMode={state.gameMode} notice={state.controlsNotice} touchActive={touchActive} />}
+      {showHud && <PlayerStatusPanel players={state.playerList} touchActive={touchActive} />}
+      {showHud && <YetiRadar threats={state.yetiThreats} touchActive={touchActive} />}
       {state.yetiWarning && (
         <div className="yeti-warning-pulse pointer-events-none fixed left-1/2 top-4 z-[70] -translate-x-1/2 rounded-lg border border-red-300/50 bg-red-950/70 px-3.5 py-2 text-base font-black uppercase tracking-[0.08em] text-red-50 shadow-2xl backdrop-blur max-sm:top-2 max-sm:max-w-[calc(100vw-20px)] max-sm:text-sm">
           YETI INBOUND
         </div>
       )}
+      {showControls && touchActive && <TouchControls controller={controller} />}
+      <OrientationGate active={showControls && touchActive} controller={controller} />
       <LowHealthVignette hp={state.hud.hp} active={showHud} />
       <HitFlash flashKey={state.hitFlashKey} />
     </>

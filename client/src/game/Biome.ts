@@ -11,14 +11,14 @@ import * as THREE from 'three';
 const FOREST = {
   skyTop: 0x426b92, skyHorizon: 0xb6cada, skyGround: 0xd6e1e8, fogColor: 0xaec7dc,
   mountainTint: 0x9bb4c9, mountainTintT: 0, sunColor: 0xfffbec, sunIntensityMult: 1.0,
-  hemiSky: 0xdcedff, hemiGround: 0x8aa4bd, treeHueShift: 0, rockHueShift: 0, snowTint: 0xffffff,
+  hemiSky: 0xdcedff, hemiGround: 0x8aa4bd, treeHueShift: 0, rockHueShift: 0, snowTint: 0xcccccc,
   terrainReliefMult: 0.7, auroraIntensity: 0,
 };
 const ALPINE = {
   skyTop: 0x1c4a7a, skyHorizon: 0xdcebf5, skyGround: 0xf0f6fa, fogColor: 0xb8dcf0,
   mountainTint: 0xf2f8fc, mountainTintT: 0.65, sunColor: 0xfffef5, sunIntensityMult: 1.25,
-  hemiSky: 0xf5faff, hemiGround: 0xb8d4e8, treeHueShift: 0.07, rockHueShift: 0.05, snowTint: 0xe0f0ff,
-  terrainReliefMult: 1.0, auroraIntensity: 0,
+  hemiSky: 0xf5faff, hemiGround: 0xb8d4e8, treeHueShift: 0.07, rockHueShift: 0.05, snowTint: 0xaaffff,
+  terrainReliefMult: 1.0, auroraIntensity: 0.5,
 };
 const CLIFFS = {
   skyTop: 0x24203f, skyHorizon: 0xe8703a, skyGround: 0xf0a066, fogColor: 0xe0956a,

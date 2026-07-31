@@ -38,6 +38,12 @@ body,
 
 body {
   margin: 0;
+  /* Touch drags steer the ski (see Input.ts/gameController.ts's canvas
+     touch-action: none) - without this, mobile browsers still intercept
+     drags as pull-to-refresh or rubber-band scroll. */
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 canvas {
@@ -145,4 +151,27 @@ select {
     overflow-y: auto;
     padding: 18px;
   }
+}
+
+/* Landscape phones are short, not narrow - Tailwind's width-only max-sm:
+   breakpoints throughout the HUD (see GameHud.tsx etc.) don't fire on a
+   phone turned sideways, since landscape width is often well over 640px.
+   .is-compact-landscape is toggled by App.tsx from a height-based media
+   query; scaling the stat panel down (rather than rewriting every utility
+   class involved) is enough to stop it from overflowing/crowding a
+   350-430px-tall viewport. transform-origin keeps it anchored to its
+   normal top-left corner instead of shrinking toward the center. */
+.is-compact-landscape .hud-stat-wrapper {
+  transform: scale(0.78);
+  transform-origin: top left;
+}
+
+/* Every menu screen (Title, Settings, Lobby, GameOver, ...) renders through
+   ScreenFrame.tsx, which measures its own content and scales the panel
+   down to actually fit a short landscape viewport (no scrollbar - see
+   useFitScale there). overflow:hidden here is just a safety net for the
+   brief moment before that JS measurement runs on mount. */
+.is-compact-landscape .screen-backdrop {
+  padding: 12px;
+  overflow: hidden;
 }

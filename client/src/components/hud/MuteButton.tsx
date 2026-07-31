@@ -1,14 +1,24 @@
 import { Music, VolumeX } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
-export function MuteButton({ visible, muted, onToggle }: { visible: boolean; muted: boolean; onToggle(): void }) {
+export function MuteButton({
+  visible,
+  muted,
+  onToggle,
+  className = '',
+}: {
+  visible: boolean;
+  muted: boolean;
+  onToggle(): void;
+  className?: string;
+}) {
   if (!visible) return null;
   return (
     <Button
       type="button"
       size="icon"
       variant="secondary"
-      className="pointer-events-auto fixed right-4 top-4 z-[200] h-10 w-10 bg-slate-950/55 backdrop-blur max-sm:right-2.5 max-sm:top-2.5"
+      className={`pointer-events-auto h-10 w-10 bg-slate-950/55 backdrop-blur ${className}`}
       aria-label="Toggle sound"
       onClick={onToggle}
     >

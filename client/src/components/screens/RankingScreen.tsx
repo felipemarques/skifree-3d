@@ -31,16 +31,42 @@ function dateText(value: number) {
 export function RankingScreen({ controller, entries, detail }: RankingScreenProps) {
   const [tab, setTab] = useState<'all' | 'today'>('all');
   const [dailyEntries, setDailyEntries] = useState<RankingEntry[]>([]);
-  const mode = controller.getSettingsValues().gameMode;
+  const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyError, setDailyError] = useState(false);
+  const [dailyRetry, setDailyRetry] = useState(0);
+  const [confirmClear, setConfirmClear] = useState(false);
+  // Key the "Today" tab off the last Daily Challenge's pinned mode when one
+  // exists, not the player's live settings selection — the daily run locked
+  // the mode at start time, so changing the title-screen selection must not
+  // empty the tab (minor list).
+  const mode = controller.getLastDailyMode?.() ?? controller.getSettingsValues().gameMode;
 
   useEffect(() => {
     if (tab !== 'today') return;
     let cancelled = false;
-    rankingStore.getDaily(mode, getDailyKey(), 20).then(result => {
-      if (!cancelled) setDailyEntries(result);
-    });
+    setDailyLoading(true);
+    setDailyError(false);
+    rankingStore.getDaily(mode, getDailyKey(), 20)
+      .then(result => {
+        if (cancelled) return;
+        setDailyEntries(result);
+        setDailyLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDailyError(true);
+        setDailyLoading(false);
+      });
     return () => { cancelled = true; };
-  }, [tab, mode]);
+  }, [tab, mode, dailyRetry]);
+
+  // Auto-dismiss the "Confirm" arm of the Clear button so a stray second
+  // click after the window expires can't wipe the leaderboard.
+  useEffect(() => {
+    if (!confirmClear) return;
+    const timer = setTimeout(() => setConfirmClear(false), 3000);
+    return () => clearTimeout(timer);
+  }, [confirmClear]);
 
   const displayedEntries = tab === 'today' ? dailyEntries : entries;
 
@@ -63,7 +89,20 @@ export function RankingScreen({ controller, entries, detail }: RankingScreenProp
               Today
             </Button>
           </div>
-          {!displayedEntries.length && <div className="my-4 text-sm text-[#aab9cf]">No runs recorded yet.</div>}
+          {tab === 'today' && dailyError && (
+            <div className="my-4 grid gap-2">
+              <div className="text-sm text-red-300">Couldn't load today's runs — check your connection.</div>
+              <Button variant="secondary" type="button" onClick={() => setDailyRetry(n => n + 1)}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {tab === 'today' && dailyLoading && !dailyEntries.length && (
+            <div className="my-4 text-sm text-[#aab9cf]">Loading today's runs…</div>
+          )}
+          {!displayedEntries.length && !dailyError && !dailyLoading && (
+            <div className="my-4 text-sm text-[#aab9cf]">No runs recorded yet.</div>
+          )}
           <ScrollArea className="max-h-[52vh]">
             <div className="grid gap-2 text-left">
               {displayedEntries.map((entry, index) => (
@@ -92,9 +131,21 @@ export function RankingScreen({ controller, entries, detail }: RankingScreenProp
           <ArrowLeft className="h-4 w-4" />
           Back
         </Button>
-        <Button variant="secondary" type="button" onClick={() => controller.clearRanking()}>
+        <Button
+          variant="secondary"
+          type="button"
+          className={confirmClear ? 'border-red-400/60 text-red-200' : ''}
+          onClick={() => {
+            if (!confirmClear) {
+              setConfirmClear(true);
+              return;
+            }
+            setConfirmClear(false);
+            controller.clearRanking();
+          }}
+        >
           <RotateCcw className="h-4 w-4" />
-          Clear
+          {confirmClear ? 'Confirm' : 'Clear'}
         </Button>
       </div>
     </ScreenFrame>

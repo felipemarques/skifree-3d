@@ -1,11 +1,17 @@
 import type { YetiThreat } from '@/types/app';
 
-export function YetiRadar({ threats }: { threats: YetiThreat[] }) {
+export function YetiRadar({ threats, touchActive = false }: { threats: YetiThreat[]; touchActive?: boolean }) {
   if (!threats.length) return null;
   const maxDistance = 140;
 
+  // Shifted up out of the on-screen jump button's footprint (TouchControls.tsx
+  // anchors it to the same bottom-right corner).
+  const positionClass = touchActive
+    ? 'bottom-[116px] right-4 w-[118px]'
+    : 'bottom-4 right-4 w-[132px] max-sm:bottom-2.5 max-sm:right-2.5 max-sm:w-[118px]';
+
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[60] w-[132px] text-red-50 max-sm:bottom-2.5 max-sm:right-2.5 max-sm:w-[118px]">
+    <div className={`pointer-events-none fixed z-[60] text-red-50 ${positionClass}`}>
       <div className="hud-glass grid gap-1.5 border-red-300/40 bg-red-950/50 p-2">
         <div className="flex justify-between text-[10px] font-black uppercase tracking-wide text-red-200">
           <span>Yeti</span>

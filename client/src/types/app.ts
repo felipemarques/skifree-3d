@@ -22,6 +22,7 @@ export interface GameSettings extends RoomSettings {
   graphicsQuality: GraphicsQuality;
   fogLevel: number;
   snowVolume: number;
+  touchControls: 'auto' | 'on' | 'off';
 }
 
 export interface PlayerStatus {
@@ -146,6 +147,7 @@ export interface UiAdapter {
   showUnstuckFeedback(): void;
   setError(message: string): void;
   clearError(): void;
+  setNotice(message: string): void;
 }
 
 export interface UiStoreState {
@@ -162,6 +164,7 @@ export interface UiStoreState {
   yetiThreats: YetiThreat[];
   controlsNotice: string;
   error: string;
+  notice: string;
   hitFlashKey: number;
   healFlashKey: number;
   landingFlashKey: number;

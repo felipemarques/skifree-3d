@@ -208,14 +208,14 @@ io.on('connection', (socket) => {
   console.log(`[+] ${socket.id} connected`);
 
   // ---- Create Room ----
-  socket.on('room:create', ({ playerName, playerId, playerColor, settings }) => {
+  socket.on('room:create', ({ playerName, playerId, playerColor, settings, turnRate }) => {
     let roomId;
     // Ensure unique ID
     do { roomId = generateRoomId(); } while (rooms.has(roomId));
 
     const seed = Math.floor(Math.random() * 999999) + 1;
     const room = new GameRoom(roomId, seed, socket.id, sanitizeRoomSettings(settings));
-    room.addPlayer(socket.id, playerName, playerId, playerColor);
+    room.addPlayer(socket.id, playerName, playerId, playerColor, turnRate);
     rooms.set(roomId, room);
     playerRooms.set(socket.id, roomId);
 
@@ -232,7 +232,7 @@ io.on('connection', (socket) => {
   });
 
   // ---- Join Room ----
-  socket.on('room:join', ({ roomId, playerName, playerId, playerColor }) => {
+  socket.on('room:join', ({ roomId, playerName, playerId, playerColor, turnRate }) => {
     const room = rooms.get(roomId);
     const prevRoom = playerRooms.get(socket.id);
     if (!room) {
@@ -253,7 +253,7 @@ io.on('connection', (socket) => {
       _leaveRoom(socket, prevRoom);
     }
 
-    room.addPlayer(socket.id, playerName, playerId, playerColor);
+    room.addPlayer(socket.id, playerName, playerId, playerColor, turnRate);
     playerRooms.set(socket.id, roomId);
     socket.join(roomId);
 

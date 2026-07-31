@@ -51,6 +51,7 @@ const initialState: UiStoreState = {
   yetiThreats: [],
   controlsNotice: '',
   error: '',
+  notice: '',
   hitFlashKey: 0,
   healFlashKey: 0,
   landingFlashKey: 0,

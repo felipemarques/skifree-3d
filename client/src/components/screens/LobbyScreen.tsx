@@ -95,8 +95,13 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
               Game Mode
               <Select disabled={locked} value={settings.gameMode} onChange={event => update('gameMode', event.target.value as RoomSettings['gameMode'])}>
                 <option value="classic">Classic / Arcade</option>
-                <option value="sky_mario">Sky Mario</option>
+                <option value="sky_mario" disabled>Sky Mario (coming soon)</option>
               </Select>
+              {settings.gameMode === 'sky_mario' && (
+                <span className="text-[11px] font-bold uppercase tracking-wide text-amber-200/90">
+                  Sky Mario multiplayer isn't available yet — pick Classic to start.
+                </span>
+              )}
             </label>
             <label className="grid gap-2 text-sm font-bold text-[#dbeaff]">
               Difficulty

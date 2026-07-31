@@ -43,6 +43,7 @@ export class AuthoritativeRoomRuntime {
         z: 0,
         startZ: 0,
         color: player.color,
+        turnRate: player.turnRate,
       });
       this.players.set(socketId, state);
       this.inputBuffers.set(socketId, new OrderedInputBuffer());
@@ -89,6 +90,7 @@ export class AuthoritativeRoomRuntime {
     this.serverTick += 1;
     this.roomTimeMs += SIM_DT * 1000;
 
+    const obstaclesByPlayer = new Map();
     for (const [socketId, state] of this.players) {
       if (!this.room.players.has(socketId)) continue;
       const input = this.getInputForPlayer(socketId, state);
@@ -100,6 +102,7 @@ export class AuthoritativeRoomRuntime {
         this.consumedPickupIds,
         this.room.settings.difficultyRamp,
       );
+      obstaclesByPlayer.set(socketId, obstacles);
       const weather = getWeatherAtZ(this.room.seed, state.z);
       const wasFinished = !!this.room.players.get(socketId)?.finished;
       this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather));
@@ -122,7 +125,12 @@ export class AuthoritativeRoomRuntime {
     const states = Array.from(this.players.values()).filter(state => this.room.players.has(state.id));
     for (let i = 0; i < states.length; i++) {
       for (let j = i + 1; j < states.length; j++) {
-        const events = applyPlayerCollision(states[i], states[j]);
+        const events = applyPlayerCollision(
+          states[i],
+          states[j],
+          obstaclesByPlayer.get(states[i].id) ?? [],
+          obstaclesByPlayer.get(states[j].id) ?? [],
+        );
       if (events.length) {
         this.events.push(...events);
         for (const state of [states[i], states[j]]) {

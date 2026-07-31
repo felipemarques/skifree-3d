@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 
 const CHUNK_SIZE = 80;    // world units per chunk (Z axis)
-const CHUNK_WIDTH = 240;  // world units wide (X axis) - matches SnowTerrain.ts
+const CHUNK_WIDTH = 360;  // world units wide (X axis) - matches SnowTerrain.ts
 const SEGMENTS = 24;
 
 export class Terrain {

@@ -152,6 +152,14 @@ export class Player {
     this.chainCount = 0;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
+    // Obstacles actually collided with, for the run's lifetime - a
+    // collision pushes the player back out to just past the obstacle's
+    // edge (see _resolveCollision), which on a later frame can land
+    // squarely inside NEAR_MISS_MARGIN once the z-crossing finally
+    // resolves. hitObstacles below only excludes the exact frame of the
+    // hit, so without this an obstacle you just crashed into can still
+    // pay out a "near miss" once you clear it.
+    this._hitObstacleHistory = new Set();
 
     this.onHit = null;
     this.onDie = null;
@@ -325,6 +333,7 @@ export class Player {
           hitSomething = true;
           hitContext = { type: obs.type, obstacle: obs, impactSpeed };
           if (hitObstacles) hitObstacles.add(obs);
+          this._hitObstacleHistory.add(obs);
         }
         continue;
       }
@@ -353,6 +362,7 @@ export class Player {
         hitSomething = true;
         hitContext = { type: obs.type, obstacle: obs, impactSpeed };
         if (hitObstacles) hitObstacles.add(obs);
+        this._hitObstacleHistory.add(obs);
       }
     }
 
@@ -384,6 +394,7 @@ export class Player {
         if (obs.dead) continue;
         if (!NEAR_MISS_TYPES.has(obs.type)) continue;
         if (hitObstacles && hitObstacles.has(obs)) continue;
+        if (this._hitObstacleHistory.has(obs)) continue;
         // Fires once, exactly as the obstacle's z crosses from ahead to
         // behind the player this frame - the player only ever moves
         // forward, so a given obstacle can only cross once per run.

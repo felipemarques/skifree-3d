@@ -55,14 +55,14 @@ export class SocketClient {
     (this._handlers[event] || []).forEach(h => h(data));
   }
 
-  createRoom(playerName, roomSettings = {}, playerId = '', playerColor = '') {
+  createRoom(playerName, roomSettings = {}, playerId = '', playerColor = '', turnRate = 1.8) {
     this.connect();
-    this.socket?.emit('room:create', { playerName, playerId, playerColor, settings: roomSettings });
+    this.socket?.emit('room:create', { playerName, playerId, playerColor, settings: roomSettings, turnRate });
   }
 
-  joinRoom(roomId, playerName, playerId = '', playerColor = '') {
+  joinRoom(roomId, playerName, playerId = '', playerColor = '', turnRate = 1.8) {
     this.connect();
-    this.socket?.emit('room:join', { roomId: roomId.toUpperCase(), playerName, playerId, playerColor });
+    this.socket?.emit('room:join', { roomId: roomId.toUpperCase(), playerName, playerId, playerColor, turnRate });
   }
 
   leaveRoom() {
