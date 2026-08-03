@@ -1,5 +1,6 @@
 // @ts-nocheck
 import * as THREE from 'three';
+import { getBiomeKindAtZ } from '../../../shared/AuthoritativeSim';
 
 // Ordered distance stops - the world's palette/lighting slowly evolves with
 // z, purely for atmosphere (no gameplay/physics/determinism implications,
@@ -26,6 +27,12 @@ const CLIFFS = {
   hemiSky: 0xf0b080, hemiGround: 0x4a3550, treeHueShift: -0.08, rockHueShift: 0.06, snowTint: 0xffcc99,
   terrainReliefMult: 1.4, auroraIntensity: 1,
 };
+const GLACIER = {
+  skyTop: 0x0c2740, skyHorizon: 0xbfe8f5, skyGround: 0xe6f7fb, fogColor: 0xcdeef5,
+  mountainTint: 0xeaf9ff, mountainTintT: 0.9, sunColor: 0xeaf6ff, sunIntensityMult: 0.95,
+  hemiSky: 0xe0f7ff, hemiGround: 0x8fd0e0, treeHueShift: -0.15, rockHueShift: 0.12, snowTint: 0xbdf0ff,
+  terrainReliefMult: 1.6, auroraIntensity: 1.3,
+};
 
 const STOPS = [
   { at: 0, ...FOREST },
@@ -33,11 +40,8 @@ const STOPS = [
   { at: 1500, ...ALPINE },
   { at: 3000, ...ALPINE },
   { at: 3300, ...CLIFFS },
-];
-
-const DOMINANT_THRESHOLDS = [
-  { upTo: 1350, name: 'forest' },
-  { upTo: 3150, name: 'alpine' },
+  { at: 5200, ...CLIFFS },
+  { at: 5500, ...GLACIER },
 ];
 
 function findBracket(z) {
@@ -98,9 +102,9 @@ export function getBiomeHueShiftAtZ(z) {
   };
 }
 
+// Thin wrapper - the actual thresholds now live in shared/AuthoritativeSim.ts
+// (getBiomeKindAtZ) since obstacle generation needs them too and must stay
+// deterministic/shared; this keeps the two from ever drifting apart.
 export function getDominantBiome(z) {
-  for (const { upTo, name } of DOMINANT_THRESHOLDS) {
-    if (z < upTo) return name;
-  }
-  return 'cliffs';
+  return getBiomeKindAtZ(z);
 }

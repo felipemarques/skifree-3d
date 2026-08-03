@@ -73,6 +73,7 @@ export function App() {
           playerName={controllerSnapshot.playerName}
           defaultGameMode={controller.getSettingsValues().gameMode}
           onShowHowToPlay={() => setShowHowToPlay(true)}
+          error={state.error}
         />
       )}
       {controller && state.screen === 'settings' && (

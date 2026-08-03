@@ -1,7 +1,7 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
-import { generateGameplayChunk, getRampedHazardVolume, getRampedRampVolume } from '../../../shared/AuthoritativeSim';
+import { generateGameplayChunk, getBiomeKindAtZ, getRampedHazardVolume, getRampedRampVolume } from '../../../shared/AuthoritativeSim';
 import { getBiomeHueShiftAtZ } from './Biome';
 
 const CHUNK_SIZE = 80;
@@ -20,6 +20,62 @@ const HEARTS_PER_CHUNK = 1;
 const HEART_MIN_DISTANCE = 70;
 const BEAR_CHANCE_PER_CHUNK = 0.38;
 const SOLID_OBSTACLE_TYPES = new Set(['tree', 'fallen_tree', 'rock', 'stump', 'ramp', 'hole']);
+// Mirrors shared/AuthoritativeSim.ts's BIOME_OBSTACLE_MIX/isBiomeSetPieceZone
+// exactly (same "duplicated on purpose" relationship RAMP_LANES/TRACK_LIMIT
+// above already have with their shared counterparts) - getBiomeKindAtZ
+// itself is imported rather than duplicated, since its thresholds are the
+// one piece worth keeping single-sourced.
+const BIOME_OBSTACLE_MIX = {
+  forest: { tree: 0.44, fallen_tree: 0.18, rock: 0.18, stump: 0.20 },
+  alpine: { tree: 0.12, fallen_tree: 0.10, rock: 0.50, stump: 0.28 },
+  cliffs: { tree: 0.18, fallen_tree: 0.12, rock: 0.45, stump: 0.25 },
+  glacier: { tree: 0.03, fallen_tree: 0.05, rock: 0.58, stump: 0.34 },
+};
+const BIOME_SETPIECE_ZONE_LENGTH = 240;
+const BIOME_SETPIECE_ROLL_CHANCE = 0.3;
+const BIOME_SETPIECE_EDGE_BAND = 22;
+// Mirrors shared/AuthoritativeSim.ts's fork zone constants/forkZoneDescriptor.
+const FORK_ZONE_LENGTH = 240;
+const FORK_ZONE_ROLL_CHANCE = 0.26;
+const FORK_LANE_GAP = 6;
+
+function pickBiomeObstacleType(mix, roll) {
+  let acc = mix.tree;
+  if (roll < acc) return 'tree';
+  acc += mix.fallen_tree;
+  if (roll < acc) return 'fallen_tree';
+  acc += mix.rock;
+  if (roll < acc) return 'rock';
+  return 'stump';
+}
+
+// Same one-shot LCG shared/AuthoritativeSim.ts's SimRandom applies on
+// construction+first next() - not imported since it's a private class
+// there, but the formula is stable/simple enough to inline.
+function seededRoll(seed, salt) {
+  let s = (seed + salt) >>> 0;
+  s = (s * 1664525 + 1013904223) >>> 0;
+  return s / 4294967296;
+}
+
+function isBiomeSetPieceZone(seed, chunkIndex) {
+  const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / BIOME_SETPIECE_ZONE_LENGTH);
+  if (zoneIndex <= 0) return false;
+  return seededRoll(seed, zoneIndex * 621547) < BIOME_SETPIECE_ROLL_CHANCE;
+}
+
+function isForkZoneIndex(seed, zoneIndex) {
+  if (zoneIndex <= 0) return false;
+  if (seededRoll(seed, zoneIndex * 275604) >= FORK_ZONE_ROLL_CHANCE) return false;
+  // Never two fork zones back to back.
+  if (isForkZoneIndex(seed, zoneIndex - 1)) return false;
+  return true;
+}
+
+function isForkZone(seed, chunkIndex) {
+  const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / FORK_ZONE_LENGTH);
+  return isForkZoneIndex(seed, zoneIndex);
+}
 const NPC_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock', 'bear', 'dog']);
 const ANIMAL_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock']);
 const NPC_KNOCKDOWN_DURATION = 2.2;
@@ -245,7 +301,12 @@ export function makeTree(rng, hueShift = 0, scale = null) {
   // the rendered tree is exactly as big as its hitbox (M2). Solo passes
   // null and draws its own scale as before.
   const baseScale = scale ?? rng.range(0.78, 1.45);
-  const greenHue = (((0.32 + rng.range(-0.035, 0.025) + hueShift) % 1) + 1) % 1;
+  // Most trees get a noticeably wider spread of green (from mossy/olive
+  // through to a bluer spruce) than the old near-uniform ±0.035 band gave -
+  // a rare few (autumn stragglers) swap to an orange hue instead.
+  const isAutumn = rng.next() < 0.06;
+  const foliageHue = (((isAutumn ? rng.range(0.06, 0.10) : rng.range(0.26, 0.40)) + hueShift) % 1 + 1) % 1;
+  const foliageSat = isAutumn ? rng.range(0.55, 0.72) : rng.range(0.4, 0.66);
   const snowMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.56, 0.32, rng.range(0.86, 0.94)),
     roughness: 0.82,
@@ -256,7 +317,7 @@ export function makeTree(rng, hueShift = 0, scale = null) {
     const h = r * rng.range(1.38, 1.68);
     const coneGeo = new THREE.ConeGeometry(r, h, 6);
     const coneMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color().setHSL(greenHue, rng.range(0.48, 0.62), 0.2 + l * 0.045),
+      color: new THREE.Color().setHSL(foliageHue, foliageSat, 0.2 + l * 0.045),
       roughness: 0.86,
     });
     const cone = new THREE.Mesh(coneGeo, coneMat);
@@ -972,12 +1033,17 @@ export class Obstacles {
     this.scene = scene;
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
     this.authoritativeSeed = options.authoritativeSeed ?? null;
+    // Only used by the solo path below for the biome set-piece zone roll,
+    // which needs a stable per-run seed independent of any single chunk's
+    // own rng stream (consuming from that would perturb the existing
+    // obstacle placement sequence outside set-piece zones).
+    this.seed = Number(options.seed) || 0;
     this.difficultyRamp = !!options.difficultyRamp;
     this.chunks = new Map();
     this.active = [];
   }
 
-  generateChunk(chunkIndex, rng, chainBoost = false) {
+  generateChunk(chunkIndex, rng) {
     if (this.chunks.has(chunkIndex)) return;
     if (this.authoritativeSeed !== null && this.authoritativeSeed !== undefined) {
       this.generateAuthoritativeChunk(chunkIndex, rng);
@@ -993,15 +1059,21 @@ export class Obstacles {
     // same thing in solo as it does in a multiplayer lobby; NPC/dog/bear are
     // solo-exclusive extras and stay on the base volume.
     const hazardVolume = getRampedHazardVolume(this.volume, chunkIndex, this.difficultyRamp);
-    // Solo-only: chunks not yet generated when the player has an active jump
-    // chain get more ramps, to help keep it going. Safe only because this
-    // chunk gets cached forever the moment it's generated (see chunks.has
-    // above) - a live signal like this can't safely drive the multiplayer
-    // authoritative path, which recomputes obstacles fresh every tick and
-    // must stay identical between server and every client.
-    const rampVolume = getRampedRampVolume(this.volume, chunkIndex, this.difficultyRamp) * (chainBoost ? 1.8 : 1);
+    const rampVolume = getRampedRampVolume(this.volume, chunkIndex, this.difficultyRamp);
+    // Mirrors shared/AuthoritativeSim.ts's generateGameplayChunk biome logic
+    // exactly (see BIOME_OBSTACLE_MIX's comment above).
+    const biome = getBiomeKindAtZ(zBase);
+    const obstacleMix = BIOME_OBSTACLE_MIX[biome];
+    const setPiece = isBiomeSetPieceZone(this.seed, chunkIndex);
+    const isCrevasseField = setPiece && biome === 'glacier';
+    const setPieceHazardVolume = setPiece
+      ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
+      : hazardVolume;
+    // Fork zones take precedence over the biome set-piece edge-banding when
+    // both land on the same chunk - mirrors shared/AuthoritativeSim.ts.
+    const isFork = isForkZone(this.seed, chunkIndex);
     const counts = {
-      static: scaledCount(OBSTACLES_PER_CHUNK, hazardVolume),
+      static: scaledCount(OBSTACLES_PER_CHUNK, setPieceHazardVolume),
       ramps: scaledCount(RAMPS_PER_CHUNK, rampVolume, 1),
       holes: scaledCount(HOLES_PER_CHUNK, hazardVolume),
       hearts: scaledCount(HEARTS_PER_CHUNK, Math.max(this.volume, 0.5), 1),
@@ -1089,36 +1161,85 @@ export class Obstacles {
       return false;
     };
 
-    for (let i = 0; i < counts.static; i++) {
-      const r = rng.next();
-      if (r < 0.44) spawnPlaced(() => makeTree(rng, treeHueShift), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else if (r < 0.62) spawnPlaced(() => makeFallenTree(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else if (r < 0.8) spawnPlaced(() => makeRock(rng, rockHueShift), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else spawnPlaced(() => makeStump(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-    }
+    const spawnHazardType = (type, xRange) => {
+      if (type === 'tree') spawnPlaced(() => makeTree(rng, treeHueShift), xRange, [8, CHUNK_SIZE - 8]);
+      else if (type === 'fallen_tree') spawnPlaced(() => makeFallenTree(rng), xRange, [8, CHUNK_SIZE - 8]);
+      else if (type === 'rock') spawnPlaced(() => makeRock(rng, rockHueShift), xRange, [8, CHUNK_SIZE - 8]);
+      else spawnPlaced(() => makeStump(rng), xRange, [8, CHUNK_SIZE - 8]);
+    };
 
-    for (let i = 0; i < counts.ramps; i++) {
-      const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
-      spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], {
-        attempts: 18,
-        padding: 1.1,
-      });
-    }
+    if (isFork) {
+      // Safe lane: reduced density, a guaranteed heart. Risky lane:
+      // increased density and more ramps - mirrors
+      // shared/AuthoritativeSim.ts's generateGameplayChunk fork branch.
+      const safeLane = [-TRACK_LIMIT, -FORK_LANE_GAP];
+      const riskyLane = [FORK_LANE_GAP, TRACK_LIMIT];
+      for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 0.4); i++) {
+        spawnHazardType(pickBiomeObstacleType(obstacleMix, rng.next()), safeLane);
+      }
+      for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 1.5); i++) {
+        spawnHazardType(pickBiomeObstacleType(obstacleMix, rng.next()), riskyLane);
+      }
+      for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.6, 1); i++) {
+        spawnPlaced(() => makeRamp(rng), [riskyLane[0] + 4, riskyLane[1] - 2], [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+      }
+      // Holes are a hazard, not a safety feature - belongs in the risky
+      // lane's extra density, not guaranteed into the "safe" one.
+      for (let i = 0; i < counts.holes; i++) {
+        spawnPlaced(() => makeHole(rng), [FORK_LANE_GAP, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+      }
+      const heartCount = Math.max(1, counts.hearts);
+      for (let i = 0; i < heartCount; i++) {
+        spawnPlaced(() => makeHeartPickup(rng), safeLane, [18, CHUNK_SIZE - 12], {
+          attempts: 24, padding: 0.35, minDistanceFromType: 'heart', minDistance: HEART_MIN_DISTANCE,
+        });
+      }
+    } else {
+      for (let i = 0; i < counts.static; i++) {
+        const type = pickBiomeObstacleType(obstacleMix, rng.next());
+        // Forest tunnel / alpine canyon squeeze set-piece: obstacles
+        // concentrated toward both edges instead of spread across the full
+        // width - see shared/AuthoritativeSim.ts's matching comment.
+        const xRange = (setPiece && biome !== 'cliffs' && biome !== 'glacier')
+          ? (i % 2 === 0 ? [-TRACK_LIMIT, -BIOME_SETPIECE_EDGE_BAND] : [BIOME_SETPIECE_EDGE_BAND, TRACK_LIMIT])
+          : [-TRACK_LIMIT, TRACK_LIMIT];
+        spawnHazardType(type, xRange);
+      }
 
-    for (let i = 0; i < counts.holes; i++) {
-      spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], {
-        attempts: 14,
-        padding: 0.9,
-      });
-    }
+      for (let i = 0; i < counts.ramps; i++) {
+        const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+        spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], {
+          attempts: 18,
+          padding: 1.1,
+        });
+      }
+      // Glacier's "crevasse field" set-piece - mirrors
+      // shared/AuthoritativeSim.ts's matching isCrevasseField block.
+      if (isCrevasseField) {
+        for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume * 1.8, 1); i++) {
+          spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+        }
+        for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.5, 1); i++) {
+          const lane = RAMP_LANES[((chunkIndex + i + 1) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+          spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+        }
+      }
 
-    for (let i = 0; i < counts.hearts; i++) {
-      spawnPlaced(() => makeHeartPickup(rng), [-34, 34], [18, CHUNK_SIZE - 12], {
-        attempts: 24,
-        padding: 0.35,
-        minDistanceFromType: 'heart',
-        minDistance: HEART_MIN_DISTANCE,
-      });
+      for (let i = 0; i < counts.holes; i++) {
+        spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], {
+          attempts: 14,
+          padding: 0.9,
+        });
+      }
+
+      for (let i = 0; i < counts.hearts; i++) {
+        spawnPlaced(() => makeHeartPickup(rng), [-34, 34], [18, CHUNK_SIZE - 12], {
+          attempts: 24,
+          padding: 0.35,
+          minDistanceFromType: 'heart',
+          minDistance: HEART_MIN_DISTANCE,
+        });
+      }
     }
 
     if (chunkIndex > 1 && rng.next() < counts.bearChance) {

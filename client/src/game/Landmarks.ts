@@ -180,6 +180,7 @@ const BIOME_FACTORIES = {
   forest: [makeCabin, makeLiftPylon],
   alpine: [makeLiftPylon, makeSnowFence],
   cliffs: [makeRopeBridge, makeRuin],
+  glacier: [makeRuin, makeSnowFence],
 };
 
 export class Landmarks {

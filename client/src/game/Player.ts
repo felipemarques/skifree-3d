@@ -46,6 +46,22 @@ const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
 const YETI_PROXIMITY_BONUS_RATE = 3;
 const YETI_DANGER_RADIUS = 16;
 const LANDING_SQUASH_DURATION = 0.22;
+// Anticipation stretch played the instant a jump triggers - can't delay the
+// actual launch (would lag input), so instead of a crouch-then-launch this
+// stretches the mesh tall/thin right as it leaves the ground, easing back
+// to normal - the standard "launched with force" trick used in place of a
+// real windup.
+const TAKEOFF_SQUASH_DURATION = 0.16;
+const TAKEOFF_SQUASH_STRENGTH = 1;
+// Mirrors the mid-air trick scoring in shared/AuthoritativeSim.ts.
+const TRICK_SPIN_RATE = 4.4;
+const TRICK_ATTEMPT_DEADZONE_DEG = 30;
+const TRICK_LANDING_TOLERANCE_DEG = 45;
+const TRICK_BONUS_PER_HALF_SPIN = 2;
+const TRICK_MAX_HALF_SPINS = 4;
+const TRICK_BAD_LANDING_SPEED_MULT = 0.6;
+// Mirrors FORK_SAFE_LANE_SPEED_MULT in shared/AuthoritativeSim.ts.
+const FORK_SAFE_LANE_SPEED_MULT = 0.68;
 // Mirrors WeatherAtZ's default in shared/AuthoritativeSim.ts - Game.ts computes
 // the actual weather (getWeatherAtZ) once per frame and passes it in, since
 // solo has no separate prediction/replay step that could diverge.
@@ -136,6 +152,7 @@ export class Player {
     this._lean = 0;
     this._lastLeanAngle = 0;
     this._squashTimer = 0;
+    this._takeoffSquashTimer = 0;
     this._squashStrength = 0;
     this._jumpHeld = false;
     this._holeFallTimer = 0;
@@ -152,6 +169,9 @@ export class Player {
     this.chainCount = 0;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
+    // Accumulated mid-air spin (radians, signed) - see the steer branch and
+    // landing block below. Reset on every _triggerJump and again on landing.
+    this._trickSpinRad = 0;
     // Obstacles actually collided with, for the run's lifetime - a
     // collision pushes the player back out to just past the obstacle's
     // edge (see _resolveCollision), which on a later frame can land
@@ -169,6 +189,8 @@ export class Player {
     this.onHeal = null;
     this.onNearMiss = null;
     this.onJumpChain = null;
+    this.onTrick = null;
+    this.onTrickFail = null;
   }
 
   get x() { return this.position.x; }
@@ -225,7 +247,7 @@ export class Player {
     if (this.onUnstuck) this.onUnstuck();
   }
 
-  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER) {
+  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER, forkSafeLaneSlow = false) {
     if (!this.isAlive) {
       this.updateDeathAnimation(dt);
       return;
@@ -268,10 +290,15 @@ export class Player {
         if (input.boost) targetSpeed = BOOST_SPEED;
         if (input.brake) targetSpeed = MIN_SPEED;
       }
+      if (forkSafeLaneSlow) targetSpeed *= FORK_SAFE_LANE_SPEED_MULT;
 
       const lateralFactor = Math.cos(this.angle);
       const penalisedTarget = targetSpeed * Math.max(lateralFactor, 0.28);
       this.speed = THREE.MathUtils.lerp(this.speed, penalisedTarget, Math.min(1, 10 * dt * weather.grip));
+    } else if (skillScoring) {
+      // Mid-air trick input - lateralAxis is otherwise discarded while
+      // airborne (see `steer` above). Scored on landing below.
+      this._trickSpinRad += input.lateralAxis * TRICK_SPIN_RATE * dt;
     }
 
     const jumpPressed = input.jump;
@@ -326,10 +353,16 @@ export class Player {
           newX = resolved.x;
           newZ = resolved.z;
           const impactSpeed = Math.hypot(this._airVelocityX, this._airVelocityZ);
-          this._airVelocityX *= 0.18;
-          this._airVelocityZ *= 0.18;
-          this.jumpVelocityY = Math.min(this.jumpVelocityY, 0.5);
-          this.speed *= 0.35;
+          // Mirrors shared/AuthoritativeSim.ts's damagePlayer: an already-
+          // invincible player still gets pushed out of the obstacle's AABB
+          // (above) so they don't clip through it, but the knockback/speed
+          // penalty itself is skipped - only a fresh, un-invincible hit pays it.
+          if (!this._isInvincible) {
+            this._airVelocityX *= 0.18;
+            this._airVelocityZ *= 0.18;
+            this.jumpVelocityY = Math.min(this.jumpVelocityY, 0.5);
+            this.speed *= Math.max(0.2, impactSpeed > BOOST_SPEED * 0.85 ? 0.24 : 0.35);
+          }
           hitSomething = true;
           hitContext = { type: obs.type, obstacle: obs, impactSpeed };
           if (hitObstacles) hitObstacles.add(obs);
@@ -343,9 +376,11 @@ export class Player {
       if (obs.type === 'hole') {
         if (this._collidesAABB(newX, newZ, obs)) {
           obs.dead = true;
-          this._holeFallTimer = this._holeFallDuration;
           const impactSpeed = this.speed;
-          this.speed *= 0.18;
+          if (!this._isInvincible) {
+            this._holeFallTimer = this._holeFallDuration;
+            this.speed *= 0.18;
+          }
           hitSomething = true;
           hitContext = { type: obs.type, obstacle: obs, impactSpeed };
         }
@@ -358,7 +393,9 @@ export class Player {
         newZ = resolved.z;
 
         const impactSpeed = this.speed;
-        this.speed *= 0.35;
+        if (!this._isInvincible) {
+          this.speed *= Math.max(0.2, impactSpeed > BOOST_SPEED * 0.85 ? 0.24 : 0.35);
+        }
         hitSomething = true;
         hitContext = { type: obs.type, obstacle: obs, impactSpeed };
         if (hitObstacles) hitObstacles.add(obs);
@@ -446,6 +483,27 @@ export class Player {
         this._airVelocityZ = 0;
         this._airborneFromRamp = false;
         if (this.onJumpLand) this.onJumpLand(landed);
+
+        // Mid-air trick scoring - mirrors shared/AuthoritativeSim.ts's
+        // landing block exactly, entirely skillScoring-gated like jump-chain/
+        // near-miss so a player who never enabled skill scoring never sees
+        // a surprise stumble either.
+        if (skillScoring) {
+          const spinDeg = Math.abs(this._trickSpinRad) * (180 / Math.PI);
+          if (spinDeg > TRICK_ATTEMPT_DEADZONE_DEG) {
+            const halfSpins = Math.min(Math.round(spinDeg / 180), TRICK_MAX_HALF_SPINS);
+            const offFromClean = Math.abs(spinDeg - halfSpins * 180);
+            if (halfSpins > 0 && offFromClean <= TRICK_LANDING_TOLERANCE_DEG) {
+              const bonus = halfSpins * TRICK_BONUS_PER_HALF_SPIN;
+              this.bonusDistance += bonus;
+              if (this.onTrick) this.onTrick(bonus, halfSpins * 180);
+            } else {
+              this.speed *= TRICK_BAD_LANDING_SPEED_MULT;
+              if (this.onTrickFail) this.onTrickFail(spinDeg);
+            }
+          }
+        }
+        this._trickSpinRad = 0;
       }
     }
 
@@ -490,8 +548,18 @@ export class Player {
    */
   applyPresentation(dt, steer = 0) {
     this.mesh.position.copy(this.position);
-    this.mesh.rotation.y = -this.angle;
+    // this.angle is frozen the instant you leave the ground (it's only
+    // updated in the grounded branch of update()), so without adding the
+    // trick spin here the mesh visibly does nothing while airborne no
+    // matter how hard you hold left/right - _trickSpinRad was tracked
+    // internally for landing scoring but never actually rendered.
+    this.mesh.rotation.y = -(this.angle + (this.isAirborne ? this._trickSpinRad : 0));
     this.mesh.rotation.x = 0;
+    // Camera.ts follows this instead of mesh.rotation.y so a trick spin
+    // visibly rotates the character on screen rather than the chase camera
+    // silently orbiting along with it (which would cancel the spin out
+    // visually - the whole point of rendering it).
+    this.mesh.userData.headingAngle = -this.angle;
 
     if (this._holeFallTimer > 0) {
       const phase = 1 - this._holeFallTimer / this._holeFallDuration;
@@ -499,6 +567,11 @@ export class Player {
       this.mesh.position.y = Math.max(0.035, this.mesh.position.y - fall * 0.06);
       this.mesh.rotation.x = -fall * 0.22;
       this.mesh.scale.set(1 - fall * 0.08, 1 - fall * 0.18, 1 - fall * 0.08);
+    } else if (this._takeoffSquashTimer > 0) {
+      this._takeoffSquashTimer = Math.max(0, this._takeoffSquashTimer - dt);
+      const stretchPhase = Math.sin((this._takeoffSquashTimer / TAKEOFF_SQUASH_DURATION) * Math.PI);
+      const stretch = stretchPhase * TAKEOFF_SQUASH_STRENGTH;
+      this.mesh.scale.set(1 - stretch * 0.22, 1 + stretch * 0.3, 1 - stretch * 0.22);
     } else if (this._squashTimer > 0) {
       this._squashTimer = Math.max(0, this._squashTimer - dt);
       const squashPhase = Math.sin((this._squashTimer / LANDING_SQUASH_DURATION) * Math.PI);
@@ -752,7 +825,24 @@ export class Player {
     };
   }
 
-  collideWithSkier(partnerMesh, partnerState = {}) {
+  // Mirrors shared/AuthoritativeSim.ts's pullShoveVictimOutOfHazards - the
+  // shove knockback below is applied blindly along X, which can slam a
+  // player into a tree/hole they had no chance to avoid. The shove already
+  // cost HP, so stacking a second, unpreventable obstacle hit on top is the
+  // bug this undoes: pull back out of anything now overlapped, no extra
+  // damage.
+  _pullOutOfHazards(obstacles) {
+    if (!this.isAlive || !obstacles) return;
+    for (const obs of obstacles) {
+      if (obs.dead || obs.type === 'heart' || obs.type === 'ramp') continue;
+      if (!this._collidesAABB(this.position.x, this.position.z, obs)) continue;
+      const resolved = this._resolveCollision(this.position.x, this.position.z, obs);
+      this.position.x = resolved.x;
+      this.position.z = resolved.z;
+    }
+  }
+
+  collideWithSkier(partnerMesh, partnerState = {}, obstacles = null) {
     if (!this.isAlive || this.isAirborne || this._isInvincible || this._holeFallTimer > 0 || !partnerMesh) {
       return false;
     }
@@ -763,6 +853,7 @@ export class Player {
 
     this.speed *= 0.35;
     this.position.x += (Math.sign(this.position.x - partnerMesh.position.x) || 1) * 0.45;
+    this._pullOutOfHazards(obstacles);
     this.hp = Math.max(0, this.hp - 1);
     this.chainCount = 0;
     this.momentum = 0;
@@ -817,10 +908,22 @@ export class Player {
     this._airborneFromRamp = source === 'ramp';
     this.jumpVelocityY = force;
     this.airTime = 0;
+    this._trickSpinRad = 0;
+    this._squashTimer = 0; // a chained jump cancels any lingering landing squash
+    this._takeoffSquashTimer = TAKEOFF_SQUASH_DURATION;
     this._airAngle = this.angle;
     this._airVelocityX = Math.sin(this._airAngle) * this.speed;
     this._airVelocityZ = Math.cos(this._airAngle) * this.speed;
     if (this.onJumpStart) this.onJumpStart(source);
+  }
+
+  /** Multiplayer's authoritative path sets isAirborne directly from the
+   * server snapshot instead of calling _triggerJump, so Game.ts calls this
+   * on the grounded->airborne transition it detects to get the same
+   * takeoff juice there. */
+  triggerTakeoffSquash() {
+    this._squashTimer = 0;
+    this._takeoffSquashTimer = TAKEOFF_SQUASH_DURATION;
   }
 
   _getRampJumpVelocity() {

@@ -87,6 +87,43 @@ class GameRoom {
     }
   }
 
+  // Marks a mid-race player as disconnected without removing their seat -
+  // see index.ts's disconnect handler, which starts a grace timer instead
+  // of an immediate removePlayer() so a brief network blip doesn't end the
+  // run. The seat stays keyed by the now-dead socketId until either
+  // reconnectPlayer() re-keys it under a fresh socket, or the grace timer
+  // expires and calls removePlayer() for real.
+  markDisconnected(socketId) {
+    const player = this.players.get(socketId);
+    if (player) player.disconnectedAt = Date.now();
+    return player || null;
+  }
+
+  // Finds a held (disconnected, grace-period) seat by the stable playerId a
+  // reconnecting client sends - the Socket.IO socket id is necessarily
+  // different after a reconnect, so socketId alone can't find it.
+  findDisconnectedSeatByPlayerId(playerId) {
+    if (!playerId) return null;
+    for (const [socketId, player] of this.players) {
+      if (player.disconnectedAt && player.playerId === playerId) return socketId;
+    }
+    return null;
+  }
+
+  // Re-keys a held seat from its old (dead) socketId to the newly
+  // reconnected socket's id, preserving the player record (color, name,
+  // distance, etc.) instead of treating the reconnect as a brand-new join.
+  reconnectPlayer(oldSocketId, newSocketId) {
+    const player = this.players.get(oldSocketId);
+    if (!player) return null;
+    this.players.delete(oldSocketId);
+    player.id = newSocketId;
+    player.disconnectedAt = null;
+    this.players.set(newSocketId, player);
+    if (this.ownerId === oldSocketId) this.ownerId = newSocketId;
+    return player;
+  }
+
   updatePlayerState(socketId, state) {
     const p = this.players.get(socketId);
     if (p) {

@@ -1,6 +1,7 @@
 import type { UiStoreState } from '@/types/app';
 import type { GameController } from '@/app/gameController';
 import { isTouchActive } from '@/utils/touch';
+import { BonusPopups } from './BonusPopups';
 import { ControlsPanel } from './ControlsPanel';
 import { Hearts } from './Hearts';
 import { HitFlash } from './HitFlash';
@@ -8,6 +9,8 @@ import { LowHealthVignette } from './LowHealthVignette';
 import { MuteButton } from './MuteButton';
 import { OrientationGate } from './OrientationGate';
 import { PlayerStatusPanel } from './PlayerStatusPanel';
+import { ReconnectingOverlay } from './ReconnectingOverlay';
+import { SpeedLines } from './SpeedLines';
 import { SpeedMeter } from './SpeedMeter';
 import { TouchControls } from './TouchControls';
 import { YetiRadar } from './YetiRadar';
@@ -21,17 +24,63 @@ export function GameHud({ state, controller }: { state: UiStoreState; controller
   return (
     <>
       {showHud && (
-        <div className="hud-stat-wrapper pointer-events-none fixed left-4 top-4 z-[60] w-[242px] max-sm:left-2.5 max-sm:top-2.5 max-sm:w-[min(230px,calc(100vw-20px))]">
+        <div className="hud-stat-wrapper pointer-events-none fixed left-4 top-4 z-[110] w-[242px] max-sm:left-2.5 max-sm:top-2.5 max-sm:w-[min(230px,calc(100vw-20px))]">
+          {/* z-[110]: above ScreenFrame's screen-backdrop (z-100), which
+              otherwise sits on top of the still-rendered HUD while paused and
+              makes the mute button inside unclickable. */}
           <div className="hud-glass grid gap-2.5 p-3">
             <div className="flex items-center justify-between gap-2">
               <Hearts hp={state.hud.hp} flashKey={state.healFlashKey + state.hitFlashKey} />
-              <MuteButton visible={!!controller && !!cs?.muteVisible} muted={!!cs?.muted} onToggle={() => controller?.toggleMute()} className="h-8 w-8 bg-white/10" />
+              <div className="flex items-center gap-1.5">
+                {/* Ambient connection-quality signal (multiplayer only -
+                    hud.pingMs stays null in solo, see Game.ts's
+                    _updatePingMeasurement) - gives players feedback before
+                    the 2s "Connection unstable" watchdog would otherwise be
+                    the first sign anything's wrong. */}
+                {state.hud.pingMs != null && (
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[10px] font-extrabold tabular-nums ${
+                      state.hud.pingMs > 250
+                        ? 'border-red-300/50 bg-red-600/20 text-red-200'
+                        : state.hud.pingMs > 120
+                          ? 'border-amber-300/50 bg-amber-500/15 text-amber-200'
+                          : 'border-emerald-300/40 bg-emerald-500/15 text-emerald-200'
+                    }`}
+                  >
+                    {Math.round(state.hud.pingMs)}ms
+                  </span>
+                )}
+                <MuteButton visible={!!controller && !!cs?.muteVisible} muted={!!cs?.muted} onToggle={() => controller?.toggleMute()} className="h-8 w-8 bg-white/10" />
+              </div>
             </div>
             <SpeedMeter distance={state.hud.distance} speed={state.hud.speed} momentum={state.hud.momentum} />
             <div className="flex flex-wrap gap-2">
               <div className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide ${state.hud.isAirborne ? 'border-cyan-300/50 bg-blue-500/30 text-white' : 'border-white/15 bg-white/10 text-[#dceeff]'}`}>
                 {state.hud.isAirborne ? 'Air' : 'Ground'}
               </div>
+              {(() => {
+                // Mirrors TRICK_ATTEMPT_DEADZONE_DEG/TRICK_LANDING_TOLERANCE_DEG
+                // in shared/AuthoritativeSim.ts - display-only copy so a spin
+                // attempt shows live whether it's currently lined up for a
+                // clean landing, rather than only revealing the result after
+                // you've already landed.
+                const spin = state.hud.trickSpinDeg;
+                if (!state.hud.isAirborne || spin <= 30) return null;
+                const nearest180 = Math.round(spin / 180) * 180;
+                const offFromClean = Math.abs(spin - nearest180);
+                const clean = offFromClean <= 45;
+                return (
+                  <div
+                    className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide tabular-nums transition-colors ${
+                      clean
+                        ? 'border-emerald-300/60 bg-emerald-500/25 text-emerald-100 shadow-[0_0_14px_rgba(52,211,153,0.35)]'
+                        : 'border-amber-300/50 bg-amber-500/15 text-amber-100'
+                    }`}
+                  >
+                    ↻ {Math.round(spin)}°
+                  </div>
+                );
+              })()}
               <div className="rounded-full border border-white/15 bg-white/10 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-[#dceeff]">
                 {state.hud.graphicsQuality}
               </div>
@@ -57,6 +106,11 @@ export function GameHud({ state, controller }: { state: UiStoreState; controller
               {state.hud.yetiDangerT > 0 && (
                 <div className="animate-pulse rounded-full border border-red-300/50 bg-red-600/25 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-red-100 shadow-[0_0_14px_rgba(255,90,90,0.3)]">
                   Danger Bonus
+                </div>
+              )}
+              {state.hud.avalancheDangerT > 0 && (
+                <div className="animate-pulse rounded-full border border-orange-300/50 bg-orange-600/25 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-orange-100 shadow-[0_0_14px_rgba(255,150,50,0.3)]">
+                  Avalanche!
                 </div>
               )}
               {state.hud.iceGripT > 0.15 && (
@@ -89,8 +143,11 @@ export function GameHud({ state, controller }: { state: UiStoreState; controller
       )}
       {showControls && touchActive && <TouchControls controller={controller} />}
       <OrientationGate active={showControls && touchActive} controller={controller} />
+      <ReconnectingOverlay active={state.reconnecting} />
       <LowHealthVignette hp={state.hud.hp} active={showHud} />
       <HitFlash flashKey={state.hitFlashKey} />
+      {showHud && <BonusPopups popups={state.popups} />}
+      {state.screen === 'game' && <SpeedLines speed={state.hud.speed} />}
     </>
   );
 }

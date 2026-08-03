@@ -11,6 +11,11 @@ const app = express();
 const server = http.createServer(app);
 const rankings = new RankingRepository();
 const MULTIPLAYER_START_COUNTDOWN_SECONDS = 10;
+// How long a mid-race disconnect holds the player's seat before it's given
+// up for good - long enough to survive a Wi-Fi blip or a phone briefly
+// backgrounding the tab, short enough that the rest of the room isn't stuck
+// waiting on someone who isn't coming back.
+const DISCONNECT_GRACE_MS = 15_000;
 
 const openApiSpec = {
   openapi: '3.0.3',
@@ -131,6 +136,11 @@ const rooms = new Map();
 // playerRooms: Map<socketId, roomId>
 const playerRooms = new Map();
 
+// disconnectGraceTimers: Map<`${roomId}:${socketId}`, Timeout> - held seats
+// pending either a reconnect (room:join, matched by playerId) or expiry
+// (removed for real once the timer fires). See _handleDisconnect/room:join.
+const disconnectGraceTimers = new Map();
+
 // Cleanup empty rooms every 5 minutes
 setInterval(() => {
   const now = Date.now();
@@ -240,7 +250,45 @@ io.on('connection', (socket) => {
       return;
     }
     if (room.started && prevRoom !== roomId) {
-      socket.emit('room:error', { message: 'Room game already started.' });
+      // The reconnecting socket always has a fresh Socket.IO id (prevRoom
+      // above can never match it), so the only way back into an in-progress
+      // run is a held seat from a recent disconnect, matched by the stable
+      // playerId the client persists across reconnects - see
+      // GameRoom.markDisconnected/reconnectPlayer.
+      const heldSocketId = room.findDisconnectedSeatByPlayerId(playerId);
+      if (!heldSocketId) {
+        socket.emit('room:error', { message: 'Room game already started.' });
+        return;
+      }
+
+      const timerKey = `${roomId}:${heldSocketId}`;
+      const graceTimer = disconnectGraceTimers.get(timerKey);
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        disconnectGraceTimers.delete(timerKey);
+      }
+
+      room.reconnectPlayer(heldSocketId, socket.id);
+      if (room.runtime) room.runtime.reconnectPlayer(heldSocketId, socket.id);
+      playerRooms.set(socket.id, roomId);
+      socket.join(roomId);
+
+      socket.emit('room:joined', {
+        roomId,
+        seed: room.seed,
+        players: room.getPlayerList(),
+        ownerId: room.ownerId,
+        settings: room.settings,
+        countdown: room.countdownRemaining,
+        resumed: true,
+      });
+      socket.to(roomId).emit('room:state', {
+        players: room.getPlayerList(),
+        ownerId: room.ownerId,
+        settings: room.settings,
+        countdown: room.countdownRemaining,
+      });
+      console.log(`[room] ${playerName} reconnected to ${roomId}`);
       return;
     }
     if (room.isFull()) {
@@ -417,20 +465,58 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`[-] ${socket.id} disconnected`);
     const roomId = playerRooms.get(socket.id);
-    if (roomId) _leaveRoom(socket, roomId);
+    if (!roomId) return;
+    playerRooms.delete(socket.id);
+
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    // Mid-race, hold the seat instead of ending the run outright - a
+    // brief network blip (or a phone backgrounding the tab) shouldn't cost
+    // the player their run. Lobby disconnects (not started yet) have no run
+    // to preserve, so those still leave immediately.
+    if (room.started && room.runtime && room.players.has(socket.id)) {
+      room.markDisconnected(socket.id);
+      socket.leave(roomId);
+      socket.to(roomId).emit('room:state', {
+        players: room.getPlayerList(),
+        ownerId: room.ownerId,
+        settings: room.settings,
+        countdown: room.countdownRemaining,
+      });
+      const timerKey = `${roomId}:${socket.id}`;
+      const timer = setTimeout(() => {
+        disconnectGraceTimers.delete(timerKey);
+        _removePlayerFromRoom(roomId, socket.id);
+      }, DISCONNECT_GRACE_MS);
+      disconnectGraceTimers.set(timerKey, timer);
+      return;
+    }
+
+    socket.leave(roomId);
+    _removePlayerFromRoom(roomId, socket.id);
   });
 });
 
 function _leaveRoom(socket, roomId) {
+  socket.leave(roomId);
+  _removePlayerFromRoom(roomId, socket.id);
+}
+
+// Shared by an explicit room:leave, a lobby-stage disconnect, and a
+// mid-race disconnect whose grace period (DISCONNECT_GRACE_MS) expired with
+// no reconnect - the seat is given up for good. Takes a roomId/socketId
+// pair rather than a live socket, since the grace-timer path has no socket
+// left by the time it fires.
+function _removePlayerFromRoom(roomId, socketId) {
   const room = rooms.get(roomId);
   if (!room) return;
   if (room.runtime) {
-    room.runtime.removePlayer(socket.id);
+    room.runtime.removePlayer(socketId);
   }
-  room.removePlayer(socket.id);
-  playerRooms.delete(socket.id);
-  socket.leave(roomId);
-  socket.to(roomId).emit('player:left', { id: socket.id });
+  room.removePlayer(socketId);
+  playerRooms.delete(socketId);
+  io.to(roomId).emit('player:left', { id: socketId });
   if (room.isEmpty()) {
     room.clearCountdown();
     if (room.runtime) {

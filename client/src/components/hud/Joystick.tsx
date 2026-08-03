@@ -78,7 +78,11 @@ export function Joystick({ controller }: { controller: GameController | null }) 
 
   return (
     <div
-      className="pointer-events-auto fixed inset-y-0 left-0 z-[150] w-[58%]"
+      // Starts below the top-left HUD stat panel (hearts/mute button row)
+      // instead of the full viewport height - otherwise this touch-capture
+      // zone sits on top of the mute button and swallows every tap meant
+      // for it.
+      className="pointer-events-auto fixed left-0 top-20 bottom-0 z-[150] w-[58%]"
       style={{ touchAction: 'none' }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}

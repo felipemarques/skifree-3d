@@ -106,6 +106,41 @@ const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
 // capture decision, reused here as a continuous bonus signal.
 const YETI_PROXIMITY_BONUS_RATE = 3;
 const MULTIPLAYER_SPAWN_LIMIT = 34;
+// Mid-air tricks: lateralAxis is otherwise discarded while airborne (see
+// simulatePlayerTick's steer branch), repurposed here to spin the skier.
+// TRICK_SPIN_RATE/TRICK_LANDING_TOLERANCE_DEG are tuned so the single most
+// natural input - just hold a direction for the whole jump - lands clean on
+// an ordinary manual jump (~0.8s airtime: 4.4 * 0.8 ~= 202 deg, well inside
+// the +-45 tolerance around 180). An earlier tuning (5.5 rad/s, +-25 deg)
+// made that same natural full-hold input overshoot to ~252 deg and fail
+// every time, which read as "tricks don't work" even though the scoring
+// logic itself was correct. Landing within TRICK_LANDING_TOLERANCE_DEG of a
+// clean multiple of 180 pays a bonus; landing further off than that (but
+// past the attempt deadzone, so a stray touch of the stick doesn't count as
+// a failed trick) stumbles.
+const TRICK_SPIN_RATE = 4.4;
+const TRICK_ATTEMPT_DEADZONE_DEG = 30;
+const TRICK_LANDING_TOLERANCE_DEG = 45;
+const TRICK_BONUS_PER_HALF_SPIN = 2;
+const TRICK_MAX_HALF_SPINS = 4;
+const TRICK_BAD_LANDING_SPEED_MULT = 0.6;
+// Avalanche: same below-BOOST_SPEED "sustain speed to escape" guarantee as
+// the yeti (see YETI_CHASE_SPEED), tuned closer to BOOST_SPEED since the
+// threat is time-boxed to one zone rather than the whole rest of the run.
+const AVALANCHE_CHASE_SPEED: Record<Difficulty, number> = {
+  easy: 22,
+  normal: 24,
+  hard: 26,
+  extreme: 27,
+};
+const AVALANCHE_DANGER_GAP_WINDOW = 80;
+const AVALANCHE_PROXIMITY_BONUS_RATE = 3;
+const AVALANCHE_OUTRUN_BONUS = 6;
+const AVALANCHE_GRACE_DISTANCE = 20;
+
+export function getAvalancheChaseSpeed(difficulty: Difficulty): number {
+  return AVALANCHE_CHASE_SPEED[difficulty] || AVALANCHE_CHASE_SPEED.normal;
+}
 
 export type GameMode = 'classic' | 'sky_mario';
 export type Difficulty = 'easy' | 'normal' | 'hard' | 'extreme';
@@ -245,6 +280,15 @@ export interface PlayerSimState {
   lastProcessedInputSeq: number;
   lastInputAtMs: number;
   yetiTriggerAtMs: number;
+  avalancheTriggerAtMs: number;
+  avalancheTriggerDistance: number;
+  // Dwell tracking for the fork "Bold Line" bonus - see maybeApplyForkBonus.
+  forkZoneRiskyTicks: number;
+  forkZoneTotalTicks: number;
+  // Accumulated mid-air spin (radians, signed) while airborne - see
+  // simulatePlayerTick's steer branch and landing block. Reset on every
+  // triggerJump and again on landing.
+  trickSpinRad: number;
   stuckTimer: number;
   deathKind?: string;
   // Obstacles this player has actually collided with, for the lifetime of
@@ -258,7 +302,8 @@ export interface PlayerSimState {
 }
 
 export interface SimEvent {
-  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck';
+  type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck'
+    | 'avalanche-warning' | 'avalanche-capture' | 'avalanche-outrun' | 'trick' | 'trick-fail' | 'fork-bold-line';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -268,6 +313,7 @@ export interface SimEvent {
   kind?: string;
   chainCount?: number;
   bonus?: number;
+  spinDeg?: number;
 }
 
 export interface RoomSnapshotPlayer {
@@ -498,6 +544,191 @@ export function getWeatherAtZ(seed: number, z: number): WeatherAtZ {
   };
 }
 
+// Exported so the client can find the nearest ice zone at/ahead of the
+// player for a ground-tint "visible from afar" warning (SnowTerrain.ts,
+// Game.ts), mirroring why WEATHER_ZONE_LENGTH above is exported for the
+// storm-wall blizzard warning. Samples each candidate zone's midpoint
+// (clear of the 80m transition blend) rather than duplicating the seeded
+// roll logic in weatherZoneDescriptor, which stays private - grip < 0.5 is
+// unambiguous since only ice reduces it (WEATHER_ICE_GRIP = 0.22; clear and
+// blizzard are both grip: 1). i = 0 covers the player's current zone too,
+// so the tint stays visible while standing on the ice, not just approaching it.
+export function getIceZoneAhead(seed: number, z: number, maxZonesAhead = 2): { start: number; end: number } | null {
+  const currentZoneIndex = Math.floor(z / WEATHER_ZONE_LENGTH);
+  for (let i = 0; i <= maxZonesAhead; i++) {
+    const zoneIndex = currentZoneIndex + i;
+    if (zoneIndex <= 0) continue;
+    const sampleZ = zoneIndex * WEATHER_ZONE_LENGTH + WEATHER_ZONE_LENGTH * 0.5;
+    if (getWeatherAtZ(seed, sampleZ).grip < 0.5) {
+      return { start: zoneIndex * WEATHER_ZONE_LENGTH, end: (zoneIndex + 1) * WEATHER_ZONE_LENGTH };
+    }
+  }
+  return null;
+}
+
+// A second, independent periodic zone system (own length/roll multiplier,
+// deliberately not derived from WEATHER_ZONE_LENGTH) so avalanche zones can
+// fall anywhere relative to weather/ice, rather than being coupled to it -
+// see maybeApplyAvalancheCapture for the actual chase/capture decision,
+// which re-derives zone containment from state.z directly rather than
+// calling this lookahead version.
+export const AVALANCHE_ZONE_LENGTH = 640;
+const AVALANCHE_ZONE_ROLL_CHANCE = 0.35;
+
+function avalancheZoneDescriptor(seed: number, zoneIndex: number): boolean {
+  // Mirrors weatherZoneDescriptor's "zone 0 is always safe" rule - the very
+  // start of a run shouldn't already be an avalanche chase.
+  if (zoneIndex <= 0) return false;
+  const roll = new SimRandom((seed + zoneIndex * 950213) >>> 0).next();
+  return roll < AVALANCHE_ZONE_ROLL_CHANCE;
+}
+
+// Exported for an advance "avalanche ahead" client cue, mirroring
+// getIceZoneAhead's shape - optional/cosmetic, not required for the capture
+// logic itself to be correct.
+export function getAvalancheZoneAhead(seed: number, z: number, maxZonesAhead = 2): { start: number; end: number } | null {
+  const currentZoneIndex = Math.floor(z / AVALANCHE_ZONE_LENGTH);
+  for (let i = 0; i <= maxZonesAhead; i++) {
+    const zoneIndex = currentZoneIndex + i;
+    if (avalancheZoneDescriptor(seed, zoneIndex)) {
+      return { start: zoneIndex * AVALANCHE_ZONE_LENGTH, end: (zoneIndex + 1) * AVALANCHE_ZONE_LENGTH };
+    }
+  }
+  return null;
+}
+
+// A fourth independent periodic zone (own length/roll multiplier again) -
+// branching trail forks. Tuned as an occasional set-piece rather than a
+// constant lane split: a per-zone roll plus a cooldown that forbids two
+// fork zones back to back, so a run gets a handful of deliberate choices
+// rather than feeling like every other zone is a fork. FORK_LANE_GAP is the
+// half-width of the obstacle-free centerline strip separating the two
+// lanes - narrower than either lane itself, so straddling it is a
+// deliberate, narrow option rather than a free third path.
+export const FORK_ZONE_LENGTH = 240;
+const FORK_ZONE_ROLL_CHANCE = 0.26;
+export const FORK_LANE_GAP = 6;
+const FORK_BOLD_LINE_RATIO = 0.65;
+const FORK_BOLD_LINE_BONUS = 5;
+// The safe lane trades hazard density for raw pace rather than being a
+// strictly-better option - a real risk/reward tradeoff against the risky
+// lane's higher hazard density and Bold Line bonus. Tuned well below the
+// cos(angle) speed variation normal steering already causes, so the
+// tradeoff reads as a deliberate slowdown rather than getting lost in
+// ordinary turning noise.
+export const FORK_SAFE_LANE_SPEED_MULT = 0.68;
+
+function forkZoneDescriptor(seed: number, zoneIndex: number): boolean {
+  if (zoneIndex <= 0) return false;
+  const roll = new SimRandom((seed + zoneIndex * 275604) >>> 0).next();
+  if (roll >= FORK_ZONE_ROLL_CHANCE) return false;
+  // Never two fork zones back to back.
+  if (forkZoneDescriptor(seed, zoneIndex - 1)) return false;
+  return true;
+}
+
+// Exported so the client can find the fork zone bounds for the divider
+// shader visual (SnowTerrain.ts) - mirrors getIceZoneAhead/getAvalancheZoneAhead.
+export function getForkZoneAhead(seed: number, z: number, maxZonesAhead = 2): { start: number; end: number } | null {
+  const currentZoneIndex = Math.floor(z / FORK_ZONE_LENGTH);
+  for (let i = 0; i <= maxZonesAhead; i++) {
+    const zoneIndex = currentZoneIndex + i;
+    if (forkZoneDescriptor(seed, zoneIndex)) {
+      return { start: zoneIndex * FORK_ZONE_LENGTH, end: (zoneIndex + 1) * FORK_ZONE_LENGTH };
+    }
+  }
+  return null;
+}
+
+/**
+ * "Bold Line" bonus: a one-shot reward if the player spent most of a fork
+ * zone in the risky (x > FORK_LANE_GAP) lane, mirroring
+ * maybeApplyAvalancheCapture's "track state while in the zone, pay out once
+ * on exit" shape. Tracks a running risky-tick ratio rather than sampling
+ * once, so briefly ducking into the safe lane doesn't flip the result.
+ */
+export function maybeApplyForkBonus(state: PlayerSimState, seed: number, events: SimEvent[], skillScoring = false) {
+  if (!skillScoring || !state.alive) return;
+  const zoneIndex = Math.floor(state.z / FORK_ZONE_LENGTH);
+  const inZone = forkZoneDescriptor(seed, zoneIndex);
+
+  if (!inZone) {
+    if (state.forkZoneTotalTicks > 0) {
+      const riskyRatio = state.forkZoneRiskyTicks / state.forkZoneTotalTicks;
+      if (riskyRatio >= FORK_BOLD_LINE_RATIO) {
+        state.bonusDistance += FORK_BOLD_LINE_BONUS;
+        events.push({ type: 'fork-bold-line', playerId: state.playerId, socketId: state.id, distance: state.distance, bonus: FORK_BOLD_LINE_BONUS });
+      }
+    }
+    state.forkZoneRiskyTicks = 0;
+    state.forkZoneTotalTicks = 0;
+    return;
+  }
+
+  state.forkZoneTotalTicks += 1;
+  if (state.x > FORK_LANE_GAP) state.forkZoneRiskyTicks += 1;
+}
+
+// Same z-threshold table client/src/game/Biome.ts's getDominantBiome uses
+// for its (purely cosmetic) palette switch - defined here as the single
+// source of truth since obstacle generation below needs it too and must
+// stay deterministic/shared. Biome.ts's getDominantBiome is now a thin
+// wrapper over this export instead of duplicating the thresholds.
+export type BiomeKind = 'forest' | 'alpine' | 'cliffs' | 'glacier';
+const BIOME_DOMINANT_THRESHOLDS: [number, BiomeKind][] = [[1350, 'forest'], [3150, 'alpine'], [5350, 'cliffs']];
+
+export function getBiomeKindAtZ(z: number): BiomeKind {
+  for (const [upTo, name] of BIOME_DOMINANT_THRESHOLDS) {
+    if (z < upTo) return name;
+  }
+  return 'glacier';
+}
+
+// Per-biome static-hazard type mix (tree/fallen_tree/rock/stump weights,
+// must sum to 1) - forest keeps the original default split; alpine goes
+// rock/stump-heavy and tree-light (matches the above-treeline palette
+// Biome.ts already uses); cliffs stays close to alpine's mix since the
+// biome's real distinguishing feature is its set-piece (see below), not
+// its baseline mix. Glacier is almost bare rock/ice (barely any trees at
+// all) - its own distinguishing feature is the crevasse-field set-piece.
+const BIOME_OBSTACLE_MIX: Record<BiomeKind, { tree: number; fallen_tree: number; rock: number; stump: number }> = {
+  forest: { tree: 0.44, fallen_tree: 0.18, rock: 0.18, stump: 0.20 },
+  alpine: { tree: 0.12, fallen_tree: 0.10, rock: 0.50, stump: 0.28 },
+  cliffs: { tree: 0.18, fallen_tree: 0.12, rock: 0.45, stump: 0.25 },
+  glacier: { tree: 0.03, fallen_tree: 0.05, rock: 0.58, stump: 0.34 },
+};
+
+function pickBiomeObstacleType(mix: { tree: number; fallen_tree: number; rock: number; stump: number }, roll: number): ObstacleType {
+  let acc = mix.tree;
+  if (roll < acc) return 'tree';
+  acc += mix.fallen_tree;
+  if (roll < acc) return 'fallen_tree';
+  acc += mix.rock;
+  if (roll < acc) return 'rock';
+  return 'stump';
+}
+
+// A third independent periodic zone (own length/roll multiplier again),
+// deciding which chunks fall inside a biome set-piece band - a short run of
+// chunks with a distinctly different layout from that biome's normal
+// baseline, so each biome reads as somewhere different to actually ski
+// through, not just a different color grade. Flavor is picked from
+// whichever biome the zone's z falls into, so no separate per-biome zone
+// system is needed.
+const BIOME_SETPIECE_ZONE_LENGTH = 240;
+const BIOME_SETPIECE_ROLL_CHANCE = 0.3;
+// How far in from each edge the set-piece's obstacle bands sit (forest
+// tunnel / alpine squeeze), leaving a clear-ish lane of
+// 2*(TRACK_LIMIT-BIOME_SETPIECE_EDGE_BAND) down the middle.
+const BIOME_SETPIECE_EDGE_BAND = 22;
+
+function isBiomeSetPieceZone(seed: number, chunkIndex: number): boolean {
+  const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / BIOME_SETPIECE_ZONE_LENGTH);
+  if (zoneIndex <= 0) return false;
+  const roll = new SimRandom((seed + zoneIndex * 621547) >>> 0).next();
+  return roll < BIOME_SETPIECE_ROLL_CHANCE;
+}
+
 export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false) {
   const rng = new SimRandom((seed + chunkIndex * 7919) >>> 0);
   const zBase = chunkIndex * CHUNK_SIZE;
@@ -509,6 +740,23 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   // also strip away the tools that make the added hazards survivable.
   const hazardVolume = getRampedHazardVolume(volume, chunkIndex, difficultyRamp);
   const rampVolume = getRampedRampVolume(volume, chunkIndex, difficultyRamp);
+
+  const biome = getBiomeKindAtZ(zBase);
+  const obstacleMix = BIOME_OBSTACLE_MIX[biome];
+  const setPiece = isBiomeSetPieceZone(seed, chunkIndex);
+  // Cliffs' set-piece is a "frozen lake crossing" - sparse, high-speed,
+  // scenic - so it reduces density instead of the edge-band squeeze forest/
+  // alpine use. Glacier's "crevasse field" (below) adds its danger entirely
+  // through extra holes/ramps rather than static obstacles, so its own
+  // baseline density is toned down to match, not stacked on top.
+  const isCrevasseField = setPiece && biome === 'glacier';
+  const setPieceHazardVolume = setPiece
+    ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
+    : hazardVolume;
+  // Fork zones take precedence over the biome set-piece edge-banding when
+  // both happen to land on the same chunk - the lane split is the more
+  // player-facing mechanic of the two.
+  const isFork = forkZoneDescriptor(seed, Math.floor(zBase / FORK_ZONE_LENGTH));
 
   const trySpawn = (type: ObstacleType, xRange: [number, number], zRange: [number, number], options: { attempts?: number; padding?: number; heartSpacing?: boolean } = {}) => {
     const attempts = options.attempts ?? 12;
@@ -522,25 +770,73 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
     return false;
   };
 
-  for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume); i++) {
-    const r = rng.next();
-    if (r < 0.44) trySpawn('tree', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-    else if (r < 0.62) trySpawn('fallen_tree', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-    else if (r < 0.8) trySpawn('rock', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-    else trySpawn('stump', [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-  }
+  if (isFork) {
+    // Safe lane: reduced density, a guaranteed heart. Risky lane: increased
+    // density and more ramps (feeding the jump-chain/trick systems). Two
+    // separate loops rather than one shared loop with biased xRange
+    // selection, so the density difference is real, not just which lane
+    // happens to get more of the same total count.
+    const safeLane: [number, number] = [-TRACK_LIMIT, -FORK_LANE_GAP];
+    const riskyLane: [number, number] = [FORK_LANE_GAP, TRACK_LIMIT];
+    for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 0.4); i++) {
+      trySpawn(pickBiomeObstacleType(obstacleMix, rng.next()), safeLane, [8, CHUNK_SIZE - 8]);
+    }
+    for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 1.5); i++) {
+      trySpawn(pickBiomeObstacleType(obstacleMix, rng.next()), riskyLane, [8, CHUNK_SIZE - 8]);
+    }
+    for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.6, 1); i++) {
+      trySpawn('ramp', [riskyLane[0] + 4, riskyLane[1] - 2], [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+    }
+    // Holes are a hazard, not a safety feature - they belong in the risky
+    // lane's extra density, not guaranteed into the "safe" one (that was
+    // inverted: the safe lane was both slower and still guaranteed a hole).
+    for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume); i++) {
+      trySpawn('hole', [FORK_LANE_GAP, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+    }
+    const heartCount = Math.max(1, scaledCount(HEARTS_PER_CHUNK, Math.max(volume, 0.5), 1));
+    for (let i = 0; i < heartCount; i++) {
+      trySpawn('heart', safeLane, [18, CHUNK_SIZE - 12], { attempts: 24, padding: 0.35, heartSpacing: true });
+    }
+  } else {
+    for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, setPieceHazardVolume); i++) {
+      const type = pickBiomeObstacleType(obstacleMix, rng.next());
+      // Forest tunnel / alpine canyon squeeze: obstacles concentrated toward
+      // both edges instead of spread across the full width, leaving a
+      // clear-ish lane down the middle - reads as a squeeze without touching
+      // TRACK_LIMIT or the player's own position clamp (the physical width
+      // stays constant everywhere on purpose - see the biome plan's explicit
+      // scope note on why).
+      const xRange: [number, number] = (setPiece && biome !== 'cliffs' && biome !== 'glacier')
+        ? (i % 2 === 0 ? [-TRACK_LIMIT, -BIOME_SETPIECE_EDGE_BAND] : [BIOME_SETPIECE_EDGE_BAND, TRACK_LIMIT])
+        : [-TRACK_LIMIT, TRACK_LIMIT];
+      trySpawn(type, xRange, [8, CHUNK_SIZE - 8]);
+    }
 
-  for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume, 1); i++) {
-    const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
-    trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
-  }
+    for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume, 1); i++) {
+      const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+      trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+    }
+    // Glacier's "crevasse field" set-piece: a burst of extra holes plus
+    // extra ramps, rewarding a chain of jumps across the gaps instead of
+    // the edge-squeeze forest/alpine use or the sparse breather cliffs
+    // uses - the danger is "jump or fall in", not "dodge the clutter".
+    if (isCrevasseField) {
+      for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume * 1.8, 1); i++) {
+        trySpawn('hole', [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+      }
+      for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.5, 1); i++) {
+        const lane = RAMP_LANES[((chunkIndex + i + 1) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+        trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+      }
+    }
 
-  for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume); i++) {
-    trySpawn('hole', [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
-  }
+    for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume); i++) {
+      trySpawn('hole', [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+    }
 
-  for (let i = 0; i < scaledCount(HEARTS_PER_CHUNK, Math.max(volume, 0.5), 1); i++) {
-    trySpawn('heart', [-34, 34], [18, CHUNK_SIZE - 12], { attempts: 24, padding: 0.35, heartSpacing: true });
+    for (let i = 0; i < scaledCount(HEARTS_PER_CHUNK, Math.max(volume, 0.5), 1); i++) {
+      trySpawn('heart', [-34, 34], [18, CHUNK_SIZE - 12], { attempts: 24, padding: 0.35, heartSpacing: true });
+    }
   }
 
   return records;
@@ -611,6 +907,11 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     lastProcessedInputSeq: 0,
     lastInputAtMs: 0,
     yetiTriggerAtMs: -1,
+    avalancheTriggerAtMs: -1,
+    avalancheTriggerDistance: 0,
+    forkZoneRiskyTicks: 0,
+    forkZoneTotalTicks: 0,
+    trickSpinRad: 0,
     stuckTimer: 0,
     hitObstacleHistory: new Set(),
   };
@@ -634,6 +935,7 @@ function triggerJump(state: PlayerSimState, force = MANUAL_JUMP_VELOCITY, source
   state.airborneFromRamp = source === 'ramp';
   state.jumpVelocityY = force;
   state.airTime = 0;
+  state.trickSpinRad = 0;
   state.airVelocityX = Math.sin(state.angle) * state.speed;
   state.airVelocityZ = Math.cos(state.angle) * state.speed;
   return true;
@@ -696,6 +998,7 @@ export function simulatePlayerTick(
   nowMs: number,
   skillScoring = false,
   weather: WeatherAtZ = CLEAR_WEATHER,
+  forkSafeLaneSlow = false,
 ): SimEvent[] {
   const events: SimEvent[] = [];
   if (!state.alive) return events;
@@ -719,8 +1022,12 @@ export function simulatePlayerTick(
     let targetSpeed = BASE_SPEED;
     if (cleanInput.boost) targetSpeed = BOOST_SPEED;
     if (cleanInput.brake) targetSpeed = MIN_SPEED;
+    if (forkSafeLaneSlow) targetSpeed *= FORK_SAFE_LANE_SPEED_MULT;
     const penalisedTarget = targetSpeed * Math.max(Math.cos(state.angle), 0.28);
     state.speed = lerp(state.speed, penalisedTarget, Math.min(1, 10 * dt * weather.grip));
+  } else if (skillScoring) {
+    // Mid-air trick input - see TRICK_SPIN_RATE's comment. Scored on landing.
+    state.trickSpinRad += cleanInput.lateralAxis * TRICK_SPIN_RATE * dt;
   }
 
   if (cleanInput.jumpPressed && !state.jumpHeld) {
@@ -882,6 +1189,26 @@ export function simulatePlayerTick(
       state.jumpVelocityY = 0;
       state.airTime = 0;
       events.push({ type: 'landing', playerId: state.playerId, socketId: state.id, distance: state.distance });
+
+      // Mid-air trick scoring - see TRICK_SPIN_RATE's comment. Entirely
+      // skillScoring-gated, same as jump-chain/near-miss, so a player who
+      // never enabled skill scoring never sees a surprise stumble either.
+      if (skillScoring) {
+        const spinDeg = Math.abs(state.trickSpinRad) * (180 / Math.PI);
+        if (spinDeg > TRICK_ATTEMPT_DEADZONE_DEG) {
+          const halfSpins = Math.min(Math.round(spinDeg / 180), TRICK_MAX_HALF_SPINS);
+          const offFromClean = Math.abs(spinDeg - halfSpins * 180);
+          if (halfSpins > 0 && offFromClean <= TRICK_LANDING_TOLERANCE_DEG) {
+            const bonus = halfSpins * TRICK_BONUS_PER_HALF_SPIN;
+            state.bonusDistance += bonus;
+            events.push({ type: 'trick', playerId: state.playerId, socketId: state.id, distance: state.distance, spinDeg: halfSpins * 180, bonus });
+          } else {
+            state.speed *= TRICK_BAD_LANDING_SPEED_MULT;
+            events.push({ type: 'trick-fail', playerId: state.playerId, socketId: state.id, distance: state.distance, spinDeg });
+          }
+        }
+      }
+      state.trickSpinRad = 0;
     }
   }
 
@@ -1028,6 +1355,73 @@ export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSetti
     if (dangerT > 0) {
       state.bonusDistance += dt * dangerT * YETI_PROXIMITY_BONUS_RATE;
     }
+  }
+}
+
+/**
+ * Avalanche chase, zone-bounded (see AVALANCHE_ZONE_LENGTH/avalancheZoneDescriptor)
+ * rather than persistent-once-triggered like the yeti - reads as a
+ * self-contained set-piece rather than a second permanent threat. The zone
+ * containing state.z is re-derived every call (not looked up via
+ * getAvalancheZoneAhead, which is for an advance client cue only) so entry/
+ * exit is exact. avalancheTriggerDistance anchors the chase line in
+ * state.distance-space at the moment of entry, since distance (unlike z)
+ * already includes bonusDistance and varies per player.
+ */
+export function maybeApplyAvalancheCapture(state: PlayerSimState, seed: number, difficulty: Difficulty, roomTimeMs: number, events: SimEvent[], dt = 0, skillScoring = false) {
+  if (!state.alive) return;
+  const zoneIndex = Math.floor(state.z / AVALANCHE_ZONE_LENGTH);
+  const inZone = avalancheZoneDescriptor(seed, zoneIndex);
+
+  if (!inZone) {
+    if (state.avalancheTriggerAtMs >= 0) {
+      // Cleared the zone alive - a one-shot reward on exit, mirrors the
+      // yeti danger bonus's "reuse the real gap" principle but paid once
+      // instead of continuously, since the threat itself is bounded.
+      if (skillScoring) {
+        state.bonusDistance += AVALANCHE_OUTRUN_BONUS;
+        events.push({ type: 'avalanche-outrun', playerId: state.playerId, socketId: state.id, distance: state.distance, bonus: AVALANCHE_OUTRUN_BONUS });
+      }
+      state.avalancheTriggerAtMs = -1;
+    }
+    return;
+  }
+
+  if (state.avalancheTriggerAtMs < 0) {
+    state.avalancheTriggerAtMs = roomTimeMs;
+    // Unlike the yeti's fixed, externally-known triggerDistance (which the
+    // player can already see coming via the distance HUD, giving a real
+    // head start), the avalanche's chase line anchors to wherever the
+    // player's own distance happens to be at the exact tick they enter the
+    // zone - with no grace distance, gap starts at exactly 0 and goes
+    // negative the very next tick for anyone not already above chaseSpeed
+    // at that precise instant, an unfair near-instant capture regardless of
+    // skill. This grace distance gives every player the same brief buffer
+    // to react, matching the "sustain speed to escape" intent.
+    state.avalancheTriggerDistance = state.distance - AVALANCHE_GRACE_DISTANCE;
+  }
+
+  const elapsedSinceTrigger = Math.max(0, (roomTimeMs - state.avalancheTriggerAtMs) / 1000);
+  const chaseSpeed = AVALANCHE_CHASE_SPEED[difficulty] || AVALANCHE_CHASE_SPEED.normal;
+  const avalancheDistance = state.avalancheTriggerDistance + chaseSpeed * elapsedSinceTrigger;
+  const gap = state.distance - avalancheDistance;
+
+  if (gap <= 0) {
+    state.alive = false;
+    state.finished = true;
+    state.deathKind = 'avalanche';
+    events.push({ type: 'avalanche-capture', playerId: state.playerId, socketId: state.id, kind: 'avalanche', distance: state.distance });
+    events.push({ type: 'death', playerId: state.playerId, socketId: state.id, kind: 'avalanche', distance: state.distance, hp: state.hp });
+    return;
+  }
+
+  const dangerT = clamp(1 - gap / AVALANCHE_DANGER_GAP_WINDOW, 0, 1);
+  if (dangerT > 0.5) {
+    events.push({ type: 'avalanche-warning', playerId: state.playerId, socketId: state.id, distance: state.distance });
+  }
+
+  if (skillScoring && dt > 0 && dangerT > 0) {
+    state.bonusDistance += dt * dangerT * AVALANCHE_PROXIMITY_BONUS_RATE;
   }
 }
 

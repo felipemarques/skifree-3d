@@ -99,18 +99,24 @@ export function SettingsScreen({ controller }: SettingsScreenProps) {
             <option value="disabled">No Yeti</option>
           </Select>
         ))}
-        <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
-          Difficulty Ramp
-          <Checkbox checked={!!form.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
-        </label>
-        <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
-          Skill Scoring
-          <Checkbox checked={!!form.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
-        </label>
+        <div className="grid gap-1">
+          <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+            Difficulty Ramp
+            <Checkbox checked={!!form.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
+          </label>
+          <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Obstacle and ramp density gradually increase the further you ski.</p>
+        </div>
+        <div className="grid gap-1">
+          <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+            Skill Scoring
+            <Checkbox checked={!!form.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
+          </label>
+          <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Rewards risky play - ramp chains, clean runs, near misses, and yeti danger all add bonus distance.</p>
+        </div>
       </div>
 
       <p className="text-center text-[11px] font-bold uppercase tracking-wide text-[#7d92ab]">
-        Fog &amp; snowfall apply immediately. Obstacles, graphics quality &amp; run rules apply from your next run.
+        Control Mode, Touch Controls, Mouse Sensitivity, Invert Mouse Y, Fog &amp; Snowfall apply immediately. Sound Volume, Obstacles, graphics quality &amp; run rules apply from your next run.
       </p>
 
       <div className="grid grid-cols-2 gap-2">

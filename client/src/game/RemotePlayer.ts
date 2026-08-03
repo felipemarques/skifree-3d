@@ -182,8 +182,26 @@ export class RemotePlayer {
     this.currentSpeed = speed;
     this.mesh.rotation.y = -angle;
     if (!alive) {
-      this.mesh.rotation.x = -Math.PI * 0.5;
-      this.mesh.rotation.z = Math.sin((this.id.length || 1) * 1.7) * 0.55;
+      // Distinct pose per cause of death (state.deathKind, threaded through
+      // from the authoritative snapshot - see Game.ts's receiveState call)
+      // instead of the same flop regardless of what actually happened -
+      // a friend caught by the yeti no longer looks identical to one who
+      // crashed into a tree. Full per-cause fragment physics (see Player.ts's
+      // startDeathAnimation) is a local-player-only system; this is the
+      // lighter-weight remote equivalent - a differentiated final pose
+      // rather than a full shatter animation.
+      if (state.deathKind === 'yeti') {
+        const wobble = Math.sin(nowMs * 0.006 + (this.id.length || 1)) * 0.12;
+        this.mesh.rotation.x = -Math.PI * 0.3 + wobble;
+        this.mesh.rotation.z = Math.cos(nowMs * 0.005 + (this.id.length || 1)) * 0.4;
+      } else if (state.deathKind === 'avalanche') {
+        const tumble = Math.sin(nowMs * 0.008 + (this.id.length || 1)) * 0.25;
+        this.mesh.rotation.x = -Math.PI * 0.42 + tumble;
+        this.mesh.rotation.z = Math.PI * 0.5 * (Math.sin((this.id.length || 1) * 2.3) > 0 ? 1 : -1);
+      } else {
+        this.mesh.rotation.x = -Math.PI * 0.5;
+        this.mesh.rotation.z = Math.sin((this.id.length || 1) * 1.7) * 0.55;
+      }
       return;
     }
     this.mesh.rotation.x = 0;

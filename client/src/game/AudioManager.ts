@@ -678,9 +678,10 @@ export class AudioManager {
   }
 
   /**
-   * biomeName: 'forest' | 'alpine' | 'cliffs' - fires an occasional ambient
-   * cue and returns which one just fired ('bird' | 'wind' | 'echo' | null),
-   * so callers can sync a matching visual (e.g. a bird crossing the sky).
+   * biomeName: 'forest' | 'alpine' | 'cliffs' | 'glacier' - fires an
+   * occasional ambient cue and returns which one just fired
+   * ('bird' | 'wind' | 'echo' | 'crack' | null), so callers can sync a
+   * matching visual (e.g. a bird crossing the sky).
    */
   updateAmbient(dt, biomeName) {
     if (!this._ready || this._muted || this._stopped) return null;
@@ -695,6 +696,7 @@ export class AudioManager {
       else this.playDistantRumble(pan);
       return 'echo';
     }
+    if (biomeName === 'glacier') { this.playIceCrack(pan); return 'crack'; }
     return null;
   }
 

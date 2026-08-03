@@ -23,8 +23,11 @@ const initialState: UiStoreState = {
     momentum: 0,
     cleanStreakSeconds: 0,
     yetiDangerT: 0,
+    avalancheDangerT: 0,
     iceGripT: 0,
     blizzardT: 0,
+    pingMs: null,
+    trickSpinDeg: 0,
   },
   gameMode: 'classic',
   room: {
@@ -52,12 +55,14 @@ const initialState: UiStoreState = {
   controlsNotice: '',
   error: '',
   notice: '',
+  reconnecting: false,
   hitFlashKey: 0,
   healFlashKey: 0,
   landingFlashKey: 0,
   nearMissFlashKey: 0,
   jumpChainFlashKey: 0,
   unstuckFlashKey: 0,
+  popups: [],
 };
 
 type Listener = () => void;

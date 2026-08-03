@@ -22,6 +22,10 @@ import type { UiStore } from './uiStore';
 const PLAYER_NAME_KEY = 'skifree3d_player_name';
 const PLAYER_COLOR_KEY = 'skifree3d_player_color';
 const blockedBrowserShortcutKeys = new Set(['s', 'o', 'a', 'b', 'f', 'p', 'w', 'q']);
+// A little longer than the server's own DISCONNECT_GRACE_MS (server/index.ts)
+// so a reconnect attempt that lands right at the edge of the server's window
+// still has a chance to succeed before the client gives up on its own.
+const RECONNECT_GIVE_UP_MS = 17_000;
 
 type SnapshotListener = () => void;
 
@@ -90,6 +94,8 @@ export class GameController {
   private settingsReturnMode: 'title' | 'pause' = 'title';
   private currentRankingEntries: RankingEntry[] = [];
   private listeners = new Set<SnapshotListener>();
+  private isReconnecting = false;
+  private reconnectGiveUpHandle: number | null = null;
 
   constructor(
     host: HTMLElement,
@@ -188,15 +194,12 @@ export class GameController {
   }
 
   savePlayerName(name: string) {
-    this.playerName = normalizePlayerName(name);
-    try {
-      localStorage.setItem(PLAYER_NAME_KEY, this.playerName);
-    } catch (e) {
-      // Ignore localStorage write failures.
-    }
-    this.ui.setNotice('Name saved.');
-    this.emit();
-    return this.playerName;
+    // Same persistence Play/Create/Join already do silently on every click
+    // (see persistPlayerName) - no toast here either, since a name is
+    // always saved by the time any play action fires and a dedicated
+    // "Name saved." notice made this button look load-bearing when it
+    // isn't.
+    return this.persistPlayerName(name);
   }
 
   setPlayerNameDraft(name: string) {
@@ -423,6 +426,46 @@ export class GameController {
     else this.currentGame.resume();
   }
 
+  /**
+   * Mid-race disconnect: freeze the local run (setSimulationPaused, not
+   * pauseCurrentGame - same reasoning as OrientationGate, don't navigate to
+   * the 'pause' screen) and give socket.io's own auto-reconnect a window to
+   * land, instead of tearing the run down on the first dropped packet. The
+   * server holds this player's seat for a matching window (see
+   * DISCONNECT_GRACE_MS, server/index.ts) - the existing 'connect' handler
+   * below already re-fires room:join with the same playerId, which the
+   * server recognizes as a resume rather than a fresh join.
+   */
+  private startReconnecting() {
+    if (this.isReconnecting) return;
+    this.isReconnecting = true;
+    this.ui.setReconnecting(true);
+    this.setSimulationPaused(true);
+    this.reconnectGiveUpHandle = window.setTimeout(() => {
+      this.reconnectGiveUpHandle = null;
+      if (!this.isReconnecting) return;
+      this.isReconnecting = false;
+      this.ui.setReconnecting(false);
+      this.leaveCurrentGameToMenu();
+      this.ui.setError('Lost connection to the race.');
+      this.emit();
+    }, RECONNECT_GIVE_UP_MS);
+  }
+
+  /** Successful resume (room:joined with resumed:true) or a hard failure
+   * (room:error) both land here to cancel the give-up timer and hide the
+   * overlay; only a genuine resume also unpauses the run. */
+  private clearReconnecting() {
+    if (this.reconnectGiveUpHandle !== null) {
+      window.clearTimeout(this.reconnectGiveUpHandle);
+      this.reconnectGiveUpHandle = null;
+    }
+    if (!this.isReconnecting) return;
+    this.isReconnecting = false;
+    this.ui.setReconnecting(false);
+    this.setSimulationPaused(false);
+  }
+
   updateRoomSettings(nextSettings: Partial<RoomSettings>) {
     if (!this.isRoomHost()) return;
     this.roomSettings = normalizeRoomSettings({ ...this.roomSettings, ...nextSettings });
@@ -621,7 +664,7 @@ export class GameController {
       this.setRoomCountdown(countdown);
     });
 
-    this.socket.on('room:joined', ({ roomId, seed, players, ownerId, settings: serverSettings, countdown }: any) => {
+    this.socket.on('room:joined', ({ roomId, seed, players, ownerId, settings: serverSettings, countdown, resumed }: any) => {
       this.roomId = roomId;
       this.roomSeed = seed;
       this.roomPlayers = players;
@@ -632,6 +675,15 @@ export class GameController {
         ...current,
         room: { ...current.room, roomId, seed, players, ownerId },
       }));
+      if (resumed) {
+        // Reconnected into a held seat in an already-in-progress race (see
+        // startReconnecting) - stay on the current screen and unfreeze the
+        // run instead of bouncing to the waiting-room screen a fresh join
+        // would normally show.
+        this.clearReconnecting();
+        this.emit();
+        return;
+      }
       this.showWaitingScreen(roomId, players);
       this.setRoomCountdown(countdown);
     });
@@ -639,6 +691,18 @@ export class GameController {
     this.socket.on('room:state', ({ players, ownerId, settings: serverSettings, countdown }: any) => {
       this.roomPlayers = players;
       this.syncLocalPlayerColor(players);
+      // A previous owner existing (not just any ownerId) means this is a
+      // real migration (e.g. the host disconnected - see GameRoom.removePlayer's
+      // Map-insertion-order promotion), not just the room's first ownerId
+      // arriving from room:created/room:joined.
+      if (ownerId && this.roomOwnerId && ownerId !== this.roomOwnerId) {
+        if (ownerId === this.socket.id) {
+          this.ui.setNotice('You are now the host.');
+        } else {
+          const newHost = players.find((p: PlayerStatus) => p.id === ownerId);
+          this.ui.setNotice(`${newHost?.name || 'A player'} is now the host.`);
+        }
+      }
       if (ownerId) this.roomOwnerId = ownerId;
       if (serverSettings) this.applyRoomSettings(serverSettings);
       if (countdown !== undefined) this.setRoomCountdown(countdown);
@@ -659,6 +723,7 @@ export class GameController {
     });
 
     this.socket.on('room:error', ({ message }: any) => {
+      this.clearReconnecting();
       if (this.currentGame) {
         // A room-level error mid-run (e.g. a rejoin attempt rejected after a
         // connection blip) means the server-side run is unreachable — don't
@@ -708,12 +773,21 @@ export class GameController {
         return;
       }
 
-      // Mid-run or lobby: the server already marked us finished
-      // (deathKind 'disconnect') and stopped streaming snapshots. Without
-      // this the local prediction loop keeps reviving a run that no longer
-      // exists (C2 zombie run). End cleanly and land on the title screen.
+      if (screen === 'game' || screen === 'pause') {
+        // Mid-race: the server holds this seat for a grace window instead
+        // of ending the run on the first dropped packet (see
+        // DISCONNECT_GRACE_MS, server/index.ts) - give socket.io's own
+        // auto-reconnect the same window before giving up.
+        this.startReconnecting();
+        this.emit();
+        return;
+      }
+
+      // Lobby (not started yet): no run in progress for the server to
+      // hold a seat for, so there's nothing to reconnect into - end
+      // cleanly and land on the title screen, same as before.
       this.leaveCurrentGameToMenu();
-      this.ui.setError(screen === 'lobby' ? 'Disconnected from server.' : 'Disconnected from server — your run ended.');
+      this.ui.setError('Disconnected from server.');
       this.emit();
     });
   }

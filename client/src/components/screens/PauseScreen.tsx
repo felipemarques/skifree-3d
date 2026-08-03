@@ -2,8 +2,10 @@ import { Home, Play, Settings } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { GameController } from '@/app/gameController';
 import { Brand, ScreenFrame } from './ScreenFrame';
+import { isTouchActive } from '@/utils/touch';
 
 export function PauseScreen({ controller, multiplayer = false }: { controller: GameController; multiplayer?: boolean }) {
+  const touchActive = isTouchActive();
   return (
     <ScreenFrame panelClassName="text-center">
       <Brand eyebrow="Paused" title="Run Paused" />
@@ -27,7 +29,7 @@ export function PauseScreen({ controller, multiplayer = false }: { controller: G
           moving and can crash. Resume quickly.
         </p>
       )}
-      <div className="text-sm text-[#aab9cf]">Press Esc to resume</div>
+      {!touchActive && <div className="text-sm text-[#aab9cf]">Press Esc to resume</div>}
     </ScreenFrame>
   );
 }

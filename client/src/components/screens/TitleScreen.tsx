@@ -14,12 +14,19 @@ interface TitleScreenProps {
   playerName: string;
   defaultGameMode: GameMode;
   onShowHowToPlay: () => void;
+  error?: string;
 }
 
-export function TitleScreen({ controller, playerName, defaultGameMode, onShowHowToPlay }: TitleScreenProps) {
+export function TitleScreen({ controller, playerName, defaultGameMode, onShowHowToPlay, error }: TitleScreenProps) {
   const [name, setName] = useState(playerName);
   const [roomCode, setRoomCode] = useState('');
   const [gameMode, setGameMode] = useState<GameMode>(defaultGameMode || 'classic');
+  // Create/Join Room are fire-and-forget socket emits with no promise to
+  // await - this is the only local signal a click actually did something
+  // while waiting for room:created/room:joined/room:error. Success
+  // navigates away (this screen unmounts), so only the error path needs to
+  // clear it explicitly.
+  const [pendingRoom, setPendingRoom] = useState<'create' | 'join' | null>(null);
   const difficulty = controller.getSettingsValues().difficulty;
   const ghost = ghostStore.getBest(gameMode, difficulty);
   // A landscape phone has width to spare and height to save - spreading
@@ -29,6 +36,9 @@ export function TitleScreen({ controller, playerName, defaultGameMode, onShowHow
   const wide = useCompactLandscape();
 
   useEffect(() => setName(playerName), [playerName]);
+  useEffect(() => {
+    if (error) setPendingRoom(null);
+  }, [error]);
 
   return (
     <ScreenFrame panelClassName={wide ? 'w-[min(760px,calc(100vw-40px))]' : undefined}>
@@ -67,9 +77,13 @@ export function TitleScreen({ controller, playerName, defaultGameMode, onShowHow
 
         <div className="grid gap-5">
           <Section title="Multiplayer">
-            <Button type="button" onClick={() => controller.createRoom(name, gameMode)}>
+            <Button
+              type="button"
+              disabled={pendingRoom !== null}
+              onClick={() => { setPendingRoom('create'); controller.createRoom(name, gameMode); }}
+            >
               <Users className="h-4 w-4" />
-              Create Room
+              {pendingRoom === 'create' ? 'Connecting…' : 'Create Room'}
             </Button>
             <div className="grid grid-cols-[1fr_auto] gap-2 max-sm:grid-cols-1">
               <Input
@@ -79,8 +93,13 @@ export function TitleScreen({ controller, playerName, defaultGameMode, onShowHow
                 className="text-center uppercase tracking-[0.18em]"
                 onChange={event => setRoomCode(event.target.value.toUpperCase())}
               />
-              <Button variant="secondary" type="button" onClick={() => controller.joinRoom(roomCode, name)}>
-                Join
+              <Button
+                variant="secondary"
+                type="button"
+                disabled={pendingRoom !== null}
+                onClick={() => { setPendingRoom('join'); controller.joinRoom(roomCode, name); }}
+              >
+                {pendingRoom === 'join' ? 'Connecting…' : 'Join'}
               </Button>
             </div>
           </Section>

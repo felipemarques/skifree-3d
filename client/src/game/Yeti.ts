@@ -119,7 +119,6 @@ function animateYeti(mesh, phase) {
   }
 }
 
-const YETI_CAPTURE_DIST = 1.5;
 const YETI_HALF_W = 0.75;
 const YETI_HALF_D = 0.75;
 const YETI_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock']);
@@ -188,7 +187,6 @@ export class YetiManager {
     this.yetis = [];
     this.active = false;
     this._timeSinceMultiply = 0;
-    this._onCapture = null;
     this.startMode = ['distance', 'immediate', 'disabled'].includes(options.startMode)
       ? options.startMode
       : 'distance';
@@ -198,10 +196,6 @@ export class YetiManager {
   setDifficulty(difficulty) {
     this.difficulty = DIFFICULTY_PRESETS[difficulty] ? difficulty : 'normal';
     this.config = DIFFICULTY_PRESETS[this.difficulty];
-  }
-
-  onCapture(cb) {
-    this._onCapture = cb;
   }
 
   update(dt, playerPos, playerDistance, groundYAt = null, blockers = null) {
@@ -230,7 +224,6 @@ export class YetiManager {
 
     // Move each Yeti toward player
     for (const yeti of this.yetis) {
-      if (yeti.captured) continue;
       if (yeti.jumpCooldown > 0) yeti.jumpCooldown = Math.max(0, yeti.jumpCooldown - dt);
       if (yeti.jumpTimer > 0) yeti.jumpTimer = Math.max(0, yeti.jumpTimer - dt);
       const airborne = yeti.jumpTimer > 0;
@@ -264,13 +257,6 @@ export class YetiManager {
 
       // Face player
       yeti.mesh.lookAt(playerPos.x, groundY, playerPos.z);
-
-      // Check capture
-      const dist = yeti.mesh.position.distanceTo(playerPos);
-      if (dist < YETI_CAPTURE_DIST) {
-        yeti.captured = true;
-        if (this._onCapture) this._onCapture();
-      }
     }
 
     // Animate yetis (bob)
@@ -295,7 +281,6 @@ export class YetiManager {
     this.scene.add(mesh);
     this.yetis.push({
       mesh,
-      captured: false,
       phase: Math.random() * Math.PI * 2,
       jumpTimer: 0,
       jumpDuration: 0,
@@ -310,7 +295,6 @@ export class YetiManager {
 
   getThreats(playerPos, maxDistance = 140) {
     return this.yetis
-      .filter(y => !y.captured)
       .map(y => {
         const dx = y.mesh.position.x - playerPos.x;
         const dz = y.mesh.position.z - playerPos.z;

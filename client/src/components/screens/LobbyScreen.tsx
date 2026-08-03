@@ -1,4 +1,4 @@
-import { ArrowLeft, Play, Users } from 'lucide-react';
+import { ArrowLeft, Crown, Play, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Select } from '@/components/ui/select';
@@ -66,6 +66,7 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
               <div key={player.id || player.name} className="flex items-center justify-between gap-3 rounded-md bg-white/[0.045] px-3 py-2 text-sm font-bold text-[#dbeaff]">
                 <span className="flex min-w-0 items-center gap-2">
                   <span className="h-3 w-3 shrink-0 rounded-full border border-white/40" style={{ backgroundColor: player.color || '#2979ff' }} />
+                  {player.id === room.ownerId && <Crown className="h-3.5 w-3.5 shrink-0 text-amber-300" aria-label="Host" />}
                   <span className="truncate">{player.name || 'Player'}</span>
                 </span>
                 {player.id === localPlayerId && <span className="text-[10px] font-black uppercase tracking-[0.08em] text-cyan-300">You</span>}
@@ -129,14 +130,20 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
               </span>
               <Slider disabled={locked} min={0} max={2} step={0.1} value={settings.obstacleVolume} onChange={event => update('obstacleVolume', Number(event.target.value))} />
             </label>
-            <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
-              Difficulty Ramp
-              <Checkbox disabled={locked} checked={!!settings.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
-            </label>
-            <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
-              Skill Scoring
-              <Checkbox disabled={locked} checked={!!settings.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
-            </label>
+            <div className="grid gap-1">
+              <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+                Difficulty Ramp
+                <Checkbox disabled={locked} checked={!!settings.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
+              </label>
+              <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Obstacle and ramp density gradually increase the further you ski.</p>
+            </div>
+            <div className="grid gap-1">
+              <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+                Skill Scoring
+                <Checkbox disabled={locked} checked={!!settings.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
+              </label>
+              <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Rewards risky play - ramp chains, clean runs, near misses, and yeti danger all add bonus distance.</p>
+            </div>
           </div>
         </div>
       </div>

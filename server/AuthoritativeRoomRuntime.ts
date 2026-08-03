@@ -8,8 +8,12 @@ import {
   applyPlayerCollision,
   createInitialPlayerState,
   createMultiplayerSpawnXs,
+  FORK_LANE_GAP,
+  getForkZoneAhead,
   getGameplayObstaclesNear,
   getWeatherAtZ,
+  maybeApplyAvalancheCapture,
+  maybeApplyForkBonus,
   maybeApplyYetiCapture,
   simulatePlayerTick,
   toSnapshotPlayer,
@@ -86,13 +90,35 @@ export class AuthoritativeRoomRuntime {
     this.inputBuffers.delete(socketId);
   }
 
+  // Mirrors GameRoom.reconnectPlayer - re-keys the sim state and input
+  // buffer from the held (dead) socketId to the newly reconnected socket,
+  // so a resumed player picks up mid-tick exactly where they left off
+  // (position, hp, speed, invincibility, everything) instead of respawning.
+  reconnectPlayer(oldSocketId, newSocketId) {
+    const state = this.players.get(oldSocketId);
+    if (!state) return false;
+    this.players.delete(oldSocketId);
+    state.id = newSocketId;
+    this.players.set(newSocketId, state);
+
+    const buffer = this.inputBuffers.get(oldSocketId);
+    this.inputBuffers.delete(oldSocketId);
+    this.inputBuffers.set(newSocketId, buffer || new OrderedInputBuffer());
+    return true;
+  }
+
   tick() {
     this.serverTick += 1;
     this.roomTimeMs += SIM_DT * 1000;
 
     const obstaclesByPlayer = new Map();
     for (const [socketId, state] of this.players) {
-      if (!this.room.players.has(socketId)) continue;
+      const seat = this.room.players.get(socketId);
+      if (!seat) continue;
+      // Held during a disconnect grace period (see GameRoom.markDisconnected)
+      // - freeze in place rather than simulating so they can't drift into a
+      // hazard unattended while the seat waits to be reclaimed or expire.
+      if (seat.disconnectedAt) continue;
       const input = this.getInputForPlayer(socketId, state);
       const obstacles = getGameplayObstaclesNear(
         this.room.seed,
@@ -104,9 +130,12 @@ export class AuthoritativeRoomRuntime {
       );
       obstaclesByPlayer.set(socketId, obstacles);
       const weather = getWeatherAtZ(this.room.seed, state.z);
+      const forkSafeLaneSlow = state.x < -FORK_LANE_GAP && getForkZoneAhead(this.room.seed, state.z, 0) !== null;
       const wasFinished = !!this.room.players.get(socketId)?.finished;
-      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather));
+      this.events.push(...simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather, forkSafeLaneSlow));
       maybeApplyYetiCapture(state, this.room.settings, this.roomTimeMs, this.events, SIM_DT, this.room.settings.skillScoring);
+      maybeApplyAvalancheCapture(state, this.room.seed, this.room.settings.difficulty, this.roomTimeMs, this.events, SIM_DT, this.room.settings.skillScoring);
+      maybeApplyForkBonus(state, this.room.seed, this.events, this.room.settings.skillScoring);
       this.room.updateAuthoritativePlayerState(socketId, state);
       if (!state.alive && !wasFinished) {
         this.room.markPlayerFinished(socketId, state.distance);

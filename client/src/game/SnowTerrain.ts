@@ -61,6 +61,10 @@ const VERT = /* glsl */`
 
 const FRAG = /* glsl */`
   uniform vec3 uBiomeTint;
+  uniform float uIceZoneStart;
+  uniform float uIceZoneEnd;
+  uniform float uForkZoneStart;
+  uniform float uForkZoneEnd;
   varying vec3 vWorldPos;
   varying float vVisualY;
   varying float vRidge;
@@ -109,6 +113,73 @@ const FRAG = /* glsl */`
     float farHaze = smoothstep(90.0, 220.0, vRelZ);
     col = mix(col, vec3(0.95, 0.97, 1.0), farHaze * 0.2);
 
+    // Ice zone ground tint - visible well before the player reaches it
+    // (uIceZoneStart/End set from shared/AuthoritativeSim.ts's
+    // getIceZoneAhead), with a soft-edged band matching the same 80m
+    // transition width the grip physics itself fades over, so the visual
+    // boundary lines up with where handling actually starts changing.
+    float iceBand = smoothstep(uIceZoneStart - 40.0, uIceZoneStart + 40.0, vWorldPos.z)
+                  - smoothstep(uIceZoneEnd - 40.0, uIceZoneEnd + 40.0, vWorldPos.z);
+
+    // Saturated, clearly-blue base color so the patch reads as ice at a
+    // glance from any angle, not just where the reflection below happens to
+    // catch the light - a purely angle-gated effect was too easy to miss
+    // entirely depending on where the camera looked (minor list: ice not
+    // spottable).
+    col = mix(col, col * vec3(0.35, 0.72, 1.0) * 1.3, iceBand * 0.85);
+
+    // Reflection on top: smooth the bumpy snow normal toward flat (real ice
+    // is slick, not ridged - this also avoids moire aliasing from reflecting
+    // off the high-frequency relief normal at a distance) and reflect a
+    // simple two-tone sky gradient off it. Fresnel still shapes it (grazing
+    // angles reflect more, like real ice), but the floor is raised well
+    // above a physically "correct" value so it stays visibly shiny even
+    // looking straight down at it, plus a broad (not mirror-tight) sun
+    // glint. (A per-pixel time-based shimmer was tried here too but caused a
+    // distracting moire ripple at distance - see M-list - so it's out.)
+    if (iceBand > 0.001) {
+      vec3 iceNormal = normalize(mix(vSnowNormal, vec3(0.0, 1.0, 0.0), 0.85));
+      vec3 viewDir = normalize(cameraPosition - vWorldPos);
+      vec3 reflectDir = reflect(-viewDir, iceNormal);
+
+      vec3 skyHorizon = vec3(0.86, 0.93, 1.0);
+      vec3 skyZenith = vec3(0.3, 0.52, 0.85);
+      vec3 skyReflection = mix(skyHorizon, skyZenith, clamp(reflectDir.y * 0.5 + 0.5, 0.0, 1.0));
+
+      float fresnel = pow(1.0 - clamp(dot(viewDir, iceNormal), 0.0, 1.0), 2.0);
+      float reflectivity = mix(0.6, 1.0, fresnel);
+      col = mix(col, skyReflection, iceBand * reflectivity);
+
+      float specAngle = clamp(dot(reflectDir, sunDir), 0.0, 1.0);
+      col += pow(specAngle, 10.0) * iceBand * 2.2;
+    }
+
+    // Fork zone divider - paints only the safe (negative-x) lane with an icy
+    // stripe; the risky lane is left as plain snow, so there's one clear
+    // "this side is safe" cue instead of two lane washes/a caution stripe
+    // that read as unrelated markers. Visible well before the zone starts
+    // (same 40m soft edge as the ice band) so a player can pick a lane in
+    // advance. uForkZoneStart/End set from getForkZoneAhead in
+    // shared/AuthoritativeSim.ts.
+    float forkBand = smoothstep(uForkZoneStart - 40.0, uForkZoneStart + 40.0, vWorldPos.z)
+                    - smoothstep(uForkZoneEnd - 40.0, uForkZoneEnd + 40.0, vWorldPos.z);
+    if (forkBand > 0.001) {
+      // One signal instead of two: a solid icy stripe painted only on the
+      // safe (negative-x) side, fading out toward its outer edge. The risky
+      // lane is left as plain snow - "unmarked" reads as the risk on its
+      // own, no separate wash/caution-stripe pair to misread as two
+      // different lane markers.
+      float safeSide = step(vWorldPos.x, 0.0);
+      float distFromCenter = -vWorldPos.x; // positive across the safe lane
+      float iceMask = smoothstep(0.0, 4.0, distFromCenter) * (1.0 - smoothstep(30.0, 44.0, distFromCenter)) * safeSide;
+      vec3 iceColor = vec3(0.66, 0.9, 1.0);
+      col = mix(col, col * iceColor * 1.25 + iceColor * 0.16, forkBand * iceMask * 0.85);
+      // A brighter, tighter glint along the very center of the safe lane so
+      // it still pops even where iceMask's outer falloff has faded.
+      float glint = (1.0 - smoothstep(0.0, 14.0, distFromCenter)) * safeSide;
+      col += vec3(0.55, 0.8, 1.0) * forkBand * glint * 0.18;
+    }
+
     col *= uBiomeTint;
 
     gl_FragColor = vec4(col, 1.0);
@@ -126,6 +197,10 @@ export class SnowTerrain {
         uAnchor: { value: new THREE.Vector2(0, 0) },
         uBiomeTint: { value: new THREE.Color(1, 1, 1) },
         uReliefMult: { value: 1 },
+        uIceZoneStart: { value: -1e6 },
+        uIceZoneEnd: { value: -1e6 },
+        uForkZoneStart: { value: -1e6 },
+        uForkZoneEnd: { value: -1e6 },
       },
       vertexShader: VERT,
       fragmentShader: FRAG,
@@ -154,6 +229,20 @@ export class SnowTerrain {
 
   setReliefMult(mult) {
     this._material.uniforms.uReliefMult.value = mult;
+  }
+
+  /** zone: { start, end } world-Z bounds from getIceZoneAhead, or null to
+   * clear - see shared/AuthoritativeSim.ts. */
+  setIceZone(zone) {
+    this._material.uniforms.uIceZoneStart.value = zone ? zone.start : -1e6;
+    this._material.uniforms.uIceZoneEnd.value = zone ? zone.end : -1e6;
+  }
+
+  /** zone: { start, end } world-Z bounds from getForkZoneAhead, or null to
+   * clear - see shared/AuthoritativeSim.ts. */
+  setForkZone(zone) {
+    this._material.uniforms.uForkZoneStart.value = zone ? zone.start : -1e6;
+    this._material.uniforms.uForkZoneEnd.value = zone ? zone.end : -1e6;
   }
 
   update(playerZ, elapsed = 0, anchorX = 0) {

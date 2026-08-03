@@ -6,10 +6,18 @@ import {
   OrderedInputBuffer,
   createInitialPlayerState,
   createMultiplayerSpawnXs,
+  FORK_SAFE_LANE_SPEED_MULT,
+  FORK_ZONE_LENGTH,
   generateGameplayChunk,
+  getAvalancheChaseSpeed,
+  getAvalancheZoneAhead,
+  getBiomeKindAtZ,
   getChainWindowMs,
+  getForkZoneAhead,
   getWeatherAtZ,
   getYetiConfig,
+  maybeApplyAvalancheCapture,
+  maybeApplyForkBonus,
   maybeApplyYetiCapture,
   simulatePlayerTick,
 } from '../server/dist/shared/AuthoritativeSim.js';
@@ -363,6 +371,257 @@ simulatePlayerTick(clearTickPlayer, steerInput, SIM_DT, [], new Set(), 0, false,
 assert.ok(
   Math.abs(iceTickPlayer.angle) < Math.abs(clearTickPlayer.angle),
   'reduced grip on an icy zone must produce a slower steering response than the same input on clear ground',
+);
+
+// --- Avalanche zones: zone-bounded chase, escapable by sustaining speed ---
+const avalancheSeed = 3131;
+let avalancheZone = null;
+for (let z = 500; z < 40000; z += 20) {
+  const zone = getAvalancheZoneAhead(avalancheSeed, z, 0);
+  // Also require the very next zone not to roll as avalanche too, so the
+  // "clear the zone alive" tests below land cleanly on the exit branch
+  // instead of immediately re-triggering in the following zone.
+  if (zone && !getAvalancheZoneAhead(avalancheSeed, zone.end + 1, 0)) {
+    avalancheZone = zone;
+    break;
+  }
+}
+assert.ok(avalancheZone !== null, 'test setup should find an avalanche zone within the scanned range');
+
+for (const difficulty of ['easy', 'normal', 'hard', 'extreme']) {
+  const speed = getAvalancheChaseSpeed(difficulty);
+  assert.ok(speed < 28, `${difficulty}'s avalanche chase speed (${speed}) must stay below the player's max speed (28) or it becomes impossible to outrun`);
+}
+
+// Escape: sustaining speed above chase speed for the whole zone length must
+// not capture the player.
+const escapingAvalanchePlayer = createInitialPlayerState('socket-u', 'Skier', 'player-u');
+escapingAvalanchePlayer.z = avalancheZone.start + 1;
+escapingAvalanchePlayer.distance = avalancheZone.start + 1;
+const avalancheChaseSpeed = getAvalancheChaseSpeed('normal');
+const avalancheEscapeSpeed = avalancheChaseSpeed + 2;
+let avalancheRoomTimeMs = 0;
+maybeApplyAvalancheCapture(escapingAvalanchePlayer, avalancheSeed, 'normal', avalancheRoomTimeMs, [], SIM_DT, false);
+const zoneLength = avalancheZone.end - avalancheZone.start;
+const stepsToCrossZone = Math.ceil(zoneLength / (avalancheEscapeSpeed * SIM_DT)) + 5;
+for (let i = 0; i < stepsToCrossZone; i++) {
+  avalancheRoomTimeMs += SIM_DT * 1000;
+  escapingAvalanchePlayer.z += avalancheEscapeSpeed * SIM_DT;
+  escapingAvalanchePlayer.distance += avalancheEscapeSpeed * SIM_DT;
+  maybeApplyAvalancheCapture(escapingAvalanchePlayer, avalancheSeed, 'normal', avalancheRoomTimeMs, [], SIM_DT, false);
+}
+assert.equal(escapingAvalanchePlayer.alive, true, 'sustaining speed above the avalanche chase speed should let the player clear the zone alive');
+
+// Capture: falling far behind the chase line must actually catch the player.
+const caughtAvalanchePlayer = createInitialPlayerState('socket-v', 'Skier', 'player-v');
+caughtAvalanchePlayer.z = avalancheZone.start + 1;
+caughtAvalanchePlayer.distance = avalancheZone.start + 1;
+const caughtAvalancheEvents = [];
+maybeApplyAvalancheCapture(caughtAvalanchePlayer, avalancheSeed, 'normal', 0, caughtAvalancheEvents, SIM_DT, true);
+caughtAvalanchePlayer.z += 5;
+caughtAvalanchePlayer.distance += 5;
+maybeApplyAvalancheCapture(caughtAvalanchePlayer, avalancheSeed, 'normal', 20000, caughtAvalancheEvents, SIM_DT, true);
+assert.equal(caughtAvalanchePlayer.alive, false, 'falling far behind the avalanche chase line must capture the player');
+assert.ok(caughtAvalancheEvents.some(e => e.type === 'avalanche-capture'), 'a real avalanche capture must emit an avalanche-capture event');
+assert.equal(caughtAvalanchePlayer.deathKind, 'avalanche', 'avalanche capture should set deathKind to avalanche');
+
+// Outrun bonus: clearing the zone alive should pay a one-shot reward.
+const outrunPlayer = createInitialPlayerState('socket-w', 'Skier', 'player-w');
+outrunPlayer.z = avalancheZone.start + 1;
+outrunPlayer.distance = avalancheZone.start + 1;
+const outrunEvents = [];
+maybeApplyAvalancheCapture(outrunPlayer, avalancheSeed, 'normal', 0, outrunEvents, SIM_DT, true);
+outrunPlayer.z = avalancheZone.end + 1;
+outrunPlayer.distance = avalancheZone.end + 1;
+maybeApplyAvalancheCapture(outrunPlayer, avalancheSeed, 'normal', 100, outrunEvents, SIM_DT, true);
+assert.ok(outrunPlayer.bonusDistance > 0, 'clearing an avalanche zone alive should award the outrun bonus');
+assert.ok(outrunEvents.some(e => e.type === 'avalanche-outrun'), 'clearing an avalanche zone alive should emit an avalanche-outrun event');
+
+const noOutrunWithoutSkillScoring = createInitialPlayerState('socket-x', 'Skier', 'player-x');
+noOutrunWithoutSkillScoring.z = avalancheZone.start + 1;
+noOutrunWithoutSkillScoring.distance = avalancheZone.start + 1;
+maybeApplyAvalancheCapture(noOutrunWithoutSkillScoring, avalancheSeed, 'normal', 0, [], SIM_DT, false);
+noOutrunWithoutSkillScoring.z = avalancheZone.end + 1;
+noOutrunWithoutSkillScoring.distance = avalancheZone.end + 1;
+maybeApplyAvalancheCapture(noOutrunWithoutSkillScoring, avalancheSeed, 'normal', 100, [], SIM_DT, false);
+assert.equal(noOutrunWithoutSkillScoring.bonusDistance, 0, 'the avalanche outrun bonus must not apply when skill scoring is disabled');
+
+// --- Mid-air tricks: a clean landing near a multiple of 180 awards a bonus ---
+const cleanTrickPlayer = createInitialPlayerState('socket-y', 'Skier', 'player-y');
+cleanTrickPlayer.isAirborne = true;
+cleanTrickPlayer.y = 0.001;
+cleanTrickPlayer.jumpVelocityY = -1;
+cleanTrickPlayer.trickSpinRad = Math.PI; // exactly 180 degrees - clean
+const cleanTrickEvents = simulatePlayerTick(cleanTrickPlayer, {
+  seq: 1, clientTime: 0, lateralAxis: 0, boost: false, brake: false, jumpPressed: false,
+}, SIM_DT, [], new Set(), 0, true);
+assert.ok(cleanTrickPlayer.bonusDistance > 0, 'a clean 180 landing should award bonus distance');
+assert.ok(cleanTrickEvents.some(e => e.type === 'trick' && e.spinDeg === 180), 'a clean 180 landing should emit a trick event with spinDeg=180');
+assert.equal(cleanTrickPlayer.trickSpinRad, 0, 'trickSpinRad should reset after landing');
+
+// A bad (mid-rotation) landing should stumble instead of paying out.
+const badTrickPlayer = createInitialPlayerState('socket-z', 'Skier', 'player-z');
+badTrickPlayer.isAirborne = true;
+badTrickPlayer.y = 0.001;
+badTrickPlayer.jumpVelocityY = -1;
+badTrickPlayer.speed = 20;
+badTrickPlayer.trickSpinRad = Math.PI * 0.5; // 90 degrees - nowhere near a clean multiple of 180
+const badTrickEvents = simulatePlayerTick(badTrickPlayer, {
+  seq: 1, clientTime: 0, lateralAxis: 0, boost: false, brake: false, jumpPressed: false,
+}, SIM_DT, [], new Set(), 0, true);
+assert.equal(badTrickPlayer.bonusDistance, 0, 'a bad landing should not award bonus distance');
+assert.ok(badTrickPlayer.speed < 20, 'a bad landing should stumble (reduce speed)');
+assert.ok(badTrickEvents.some(e => e.type === 'trick-fail'), 'a bad landing should emit a trick-fail event');
+
+// Skill scoring off must make the whole mid-air trick mechanic inert.
+const noScoringTrickPlayer = createInitialPlayerState('socket-aa', 'Skier', 'player-aa');
+noScoringTrickPlayer.isAirborne = true;
+noScoringTrickPlayer.y = 0.001;
+noScoringTrickPlayer.jumpVelocityY = -1;
+noScoringTrickPlayer.speed = 20;
+noScoringTrickPlayer.trickSpinRad = Math.PI * 0.5;
+const noScoringTrickEvents = simulatePlayerTick(noScoringTrickPlayer, {
+  seq: 1, clientTime: 0, lateralAxis: 0, boost: false, brake: false, jumpPressed: false,
+}, SIM_DT, [], new Set(), 0, false);
+assert.equal(noScoringTrickPlayer.speed, 20, 'tricks must be fully inert (no stumble) when skill scoring is disabled');
+assert.ok(!noScoringTrickEvents.some(e => e.type === 'trick' || e.type === 'trick-fail'), 'no trick events should fire when skill scoring is disabled');
+
+// --- Biomes: obstacle type mix actually differs by z, not just tint ---
+assert.equal(getBiomeKindAtZ(0), 'forest', 'z=0 should be in the forest biome');
+assert.equal(getBiomeKindAtZ(2000), 'alpine', 'z=2000 should be in the alpine biome');
+assert.equal(getBiomeKindAtZ(4000), 'cliffs', 'z=4000 should be in the cliffs biome');
+assert.equal(getBiomeKindAtZ(6000), 'glacier', 'z=6000 should be in the glacier biome');
+assert.deepEqual(
+  [getBiomeKindAtZ(1349), getBiomeKindAtZ(1350), getBiomeKindAtZ(3149), getBiomeKindAtZ(3150), getBiomeKindAtZ(5349), getBiomeKindAtZ(5350)],
+  ['forest', 'alpine', 'alpine', 'cliffs', 'cliffs', 'glacier'],
+  'biome thresholds should switch exactly at the documented z boundaries',
+);
+
+function sampleObstacleTypeCounts(seed, chunkStart, chunkCount) {
+  const counts = { tree: 0, rock: 0 };
+  for (let c = chunkStart; c < chunkStart + chunkCount; c++) {
+    for (const obs of generateGameplayChunk(seed, c, 1, new Set(), false)) {
+      if (obs.type === 'tree' || obs.type === 'rock') counts[obs.type] += 1;
+    }
+  }
+  return counts;
+}
+const biomeSeed = 55555;
+// Fork zones and biome set-pieces only change WHERE obstacles land, not
+// which types get picked (both still call pickBiomeObstacleType with the
+// same per-biome mix), so sampling many chunks and comparing the aggregate
+// tree:rock ratio is robust to either kind of zone overlapping the sample.
+const forestCounts = sampleObstacleTypeCounts(biomeSeed, 1, 16); // z in [80, 1360) - safely forest
+const alpineCounts = sampleObstacleTypeCounts(biomeSeed, 25, 16); // z in [2000, 3280) - safely alpine
+const glacierCounts = sampleObstacleTypeCounts(biomeSeed, 68, 16); // z in [5440, 6720) - safely glacier
+assert.ok(
+  forestCounts.tree + forestCounts.rock > 0 && alpineCounts.tree + alpineCounts.rock > 0 && glacierCounts.tree + glacierCounts.rock > 0,
+  'test setup should sample obstacles in all three biomes',
+);
+assert.ok(
+  (forestCounts.tree / Math.max(1, forestCounts.rock)) > (alpineCounts.tree / Math.max(1, alpineCounts.rock)),
+  'forest chunks should have a higher tree:rock ratio than alpine chunks (BIOME_OBSTACLE_MIX)',
+);
+assert.ok(
+  (alpineCounts.tree / Math.max(1, alpineCounts.rock)) > (glacierCounts.tree / Math.max(1, glacierCounts.rock)),
+  'alpine chunks should have a higher tree:rock ratio than glacier chunks (BIOME_OBSTACLE_MIX)',
+);
+
+// --- Glacier's "crevasse field" set-piece: elevated hole density ---
+let glacierSetPieceChunk = null;
+let glacierPlainChunk = null;
+for (let c = 68; c < 68 + 200; c++) {
+  const zBase = c * 80;
+  if (getBiomeKindAtZ(zBase) !== 'glacier') continue;
+  const chunk = generateGameplayChunk(biomeSeed, c, 1, new Set(), false);
+  const holeCount = chunk.filter(o => o.type === 'hole').length;
+  if (holeCount >= 3 && !glacierSetPieceChunk) glacierSetPieceChunk = { c, holeCount };
+  if (holeCount <= 1 && !glacierPlainChunk) glacierPlainChunk = { c, holeCount };
+  if (glacierSetPieceChunk && glacierPlainChunk) break;
+}
+assert.ok(glacierSetPieceChunk, 'test setup should find a glacier crevasse-field chunk with elevated hole density within the scanned range');
+
+// --- Branching trail forks: lane split, density asymmetry, Bold Line bonus ---
+const forkSeed = 8080;
+let forkZone = null;
+let forkChunkIndex = null;
+for (let c = 1; c < 500; c++) {
+  const zBase = c * 80;
+  const zone = getForkZoneAhead(forkSeed, zBase, 0);
+  if (zone) {
+    forkZone = zone;
+    forkChunkIndex = c;
+    break;
+  }
+}
+assert.ok(forkZone !== null, 'test setup should find a fork zone within the scanned range');
+
+const forkChunk = generateGameplayChunk(forkSeed, forkChunkIndex, 1, new Set(), false);
+assert.ok(forkChunk.length > 0, 'test setup should generate obstacles in the sampled fork chunk');
+for (const obs of forkChunk) {
+  assert.ok(Math.abs(obs.x) >= 6, `fork zone obstacles must not spawn inside the centerline gap (got ${obs.type} at x=${obs.x})`);
+  assert.ok(Math.abs(obs.x) <= 52 + 0.001, `fork zone obstacles must stay within TRACK_LIMIT (got ${obs.type} at x=${obs.x})`);
+}
+const forkHazards = forkChunk.filter(o => ['tree', 'fallen_tree', 'rock', 'stump'].includes(o.type));
+const forkSafeCount = forkHazards.filter(o => o.x < 0).length;
+const forkRiskyCount = forkHazards.filter(o => o.x > 0).length;
+assert.ok(forkRiskyCount > forkSafeCount, 'the risky lane should have denser hazards than the safe lane in a fork zone');
+
+const boldSteps = 12;
+const boldPlayer = createInitialPlayerState('socket-bb', 'Skier', 'player-bb');
+const boldEvents = [];
+for (let i = 0; i <= boldSteps; i++) {
+  boldPlayer.z = forkZone.start + ((forkZone.end - forkZone.start) * i) / boldSteps;
+  boldPlayer.x = 20; // stayed on the risky side throughout
+  maybeApplyForkBonus(boldPlayer, forkSeed, boldEvents, true);
+}
+boldPlayer.z = forkZone.end + 1;
+maybeApplyForkBonus(boldPlayer, forkSeed, boldEvents, true);
+assert.ok(boldPlayer.bonusDistance > 0, 'staying in the risky lane through a fork zone should award the Bold Line bonus on exit');
+assert.ok(boldEvents.some(e => e.type === 'fork-bold-line'), 'the Bold Line bonus should emit a fork-bold-line event');
+
+const timidPlayer = createInitialPlayerState('socket-cc', 'Skier', 'player-cc');
+const timidEvents = [];
+for (let i = 0; i <= boldSteps; i++) {
+  timidPlayer.z = forkZone.start + ((forkZone.end - forkZone.start) * i) / boldSteps;
+  timidPlayer.x = -20; // stayed on the safe side throughout
+  maybeApplyForkBonus(timidPlayer, forkSeed, timidEvents, true);
+}
+timidPlayer.z = forkZone.end + 1;
+maybeApplyForkBonus(timidPlayer, forkSeed, timidEvents, true);
+assert.equal(timidPlayer.bonusDistance, 0, 'staying in the safe lane through a fork zone should not award the Bold Line bonus');
+
+// Fork zones must never occur back to back (readable set-piece pacing, not
+// a constant lane split) across a wide range of zone indices/seeds.
+for (const cooldownSeed of [1, 8080, 424242, 999999]) {
+  let previousWasFork = false;
+  for (let zoneIndex = 0; zoneIndex < 400; zoneIndex++) {
+    const zone = getForkZoneAhead(cooldownSeed, zoneIndex * FORK_ZONE_LENGTH, 0);
+    const isFork = zone !== null;
+    assert.ok(!(isFork && previousWasFork), `fork zones must not appear back to back (seed=${cooldownSeed}, zoneIndex=${zoneIndex})`);
+    previousWasFork = isFork;
+  }
+}
+
+// The safe lane should meaningfully slow the skier relative to the same
+// input outside a fork zone (a real risk/reward tradeoff, not just cosmetic).
+const forkSpeedZ = forkZone.start + 10;
+const boostedInput = { seq: 1, clientTime: 0, lateralAxis: 0, boost: true, brake: false, jumpPressed: false };
+const unslowedPlayer = createInitialPlayerState('socket-dd', 'Skier', 'player-dd');
+unslowedPlayer.z = forkSpeedZ;
+unslowedPlayer.x = -20;
+const slowedPlayer = createInitialPlayerState('socket-ee', 'Skier', 'player-ee');
+slowedPlayer.z = forkSpeedZ;
+slowedPlayer.x = -20;
+for (let i = 0; i < 60; i++) {
+  const tickInput = { ...boostedInput, seq: i + 1, clientTime: i * SIM_DT * 1000 };
+  simulatePlayerTick(unslowedPlayer, tickInput, SIM_DT, [], new Set(), i * SIM_DT * 1000, false, undefined, false);
+  simulatePlayerTick(slowedPlayer, tickInput, SIM_DT, [], new Set(), i * SIM_DT * 1000, false, undefined, true);
+}
+assert.ok(slowedPlayer.speed < unslowedPlayer.speed, 'forkSafeLaneSlow should reduce the converged speed relative to the unslowed case');
+assert.ok(
+  Math.abs(slowedPlayer.speed - unslowedPlayer.speed * FORK_SAFE_LANE_SPEED_MULT) < 0.05,
+  `slowed speed should converge to roughly unslowed * FORK_SAFE_LANE_SPEED_MULT (got ${slowedPlayer.speed} vs expected ~${unslowedPlayer.speed * FORK_SAFE_LANE_SPEED_MULT})`,
 );
 
 console.log('Authoritative simulation checks passed.');

@@ -49,7 +49,13 @@ export class GameCamera {
     const target = playerMesh.position.clone();
 
     // Compute desired camera position: offset in world space (always behind player)
-    const angle = playerMesh.rotation.y;
+    // Uses the ground heading, not the raw mesh yaw - the mesh yaw includes
+    // any in-air trick spin (Player.ts), and if the camera orbited along
+    // with that too it would cancel the spin out on screen (chase cam
+    // silently staying "behind" a spinning character reads as no spin at
+    // all). userData.headingAngle is the pre-trick heading; mesh.rotation.y
+    // itself is only used as a fallback for meshes that never set it.
+    const angle = playerMesh.userData?.headingAngle ?? playerMesh.rotation.y;
     const sinA = Math.sin(-angle);
     const cosA = Math.cos(-angle);
 

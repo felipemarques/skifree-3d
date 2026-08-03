@@ -24,8 +24,11 @@ const defaultHud: HudState = {
   momentum: 0,
   cleanStreakSeconds: 0,
   yetiDangerT: 0,
+  avalancheDangerT: 0,
   iceGripT: 0,
   blizzardT: 0,
+  pingMs: null,
+  trickSpinDeg: 0,
 };
 
 function asGameMode(value: string | undefined): GameMode {
@@ -36,6 +39,7 @@ export class ReactUiAdapter implements UiAdapter {
   private errorTimer = 0;
   private noticeTimer = 0;
   private controlsTimer = 0;
+  private popupSeq = 0;
 
   constructor(private store: UiStore) {}
 
@@ -176,24 +180,44 @@ export class ReactUiAdapter implements UiAdapter {
   }
 
   showLandingFeedback() {
-    this.flashControls('Clean Landing', 'landingFlashKey', 900);
+    this.flashControls('Clean Landing', 'landingFlashKey', 900, 'positive');
   }
 
   showHealFeedback() {
-    this.flashControls('Health +1', 'healFlashKey', 850);
+    this.flashControls('Health +1', 'healFlashKey', 850, 'positive');
   }
 
   showNearMissFeedback(bonus = 1.5) {
-    this.flashControls(`Near Miss +${bonus.toFixed(1)}m`, 'nearMissFlashKey', 700);
+    this.flashControls(`Near Miss +${bonus.toFixed(1)}m`, 'nearMissFlashKey', 700, 'positive');
   }
 
   showJumpChainFeedback(bonus = 4, chainCount = 0) {
     const label = chainCount >= 2 ? `Jump Chain x${chainCount} +${bonus.toFixed(0)}m` : `Jump Chain +${bonus.toFixed(0)}m`;
-    this.flashControls(label, 'jumpChainFlashKey', 900);
+    this.flashControls(label, 'jumpChainFlashKey', 900, 'positive');
   }
 
   showUnstuckFeedback() {
-    this.flashControls('Freed from obstacle', 'unstuckFlashKey', 1100);
+    this.flashControls('Freed from obstacle', 'unstuckFlashKey', 1100, 'neutral');
+  }
+
+  // Reuses jumpChainFlashKey/unstuckFlashKey's flash slots rather than
+  // adding new ones - flashControls only ever shows one notice at a time
+  // regardless (last one wins), so a distinct key per event type isn't
+  // needed for correctness, only the label text is.
+  showTrickFeedback(bonus = 0, spinDeg = 0) {
+    this.flashControls(`${spinDeg}° Spin! +${bonus.toFixed(0)}m`, 'jumpChainFlashKey', 900, 'positive');
+  }
+
+  showTrickFailFeedback(spinDeg = 0) {
+    this.flashControls('Bailed!', 'unstuckFlashKey', 700, 'negative');
+  }
+
+  showAvalancheOutrunFeedback() {
+    this.flashControls('Outran the Avalanche!', 'jumpChainFlashKey', 1100, 'positive');
+  }
+
+  showForkBoldLineFeedback() {
+    this.flashControls('Bold Line!', 'jumpChainFlashKey', 1000, 'positive');
   }
 
   setError(message: string) {
@@ -218,7 +242,16 @@ export class ReactUiAdapter implements UiAdapter {
     this.store.set({ notice: '' });
   }
 
-  private flashControls(notice: string, key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey' | 'unstuckFlashKey', delay: number) {
+  setReconnecting(reconnecting: boolean) {
+    this.store.set({ reconnecting });
+  }
+
+  private flashControls(
+    notice: string,
+    key: 'landingFlashKey' | 'healFlashKey' | 'nearMissFlashKey' | 'jumpChainFlashKey' | 'unstuckFlashKey',
+    delay: number,
+    tone: 'positive' | 'negative' | 'neutral' = 'positive',
+  ) {
     window.clearTimeout(this.controlsTimer);
     this.store.set(state => ({
       ...state,
@@ -228,6 +261,20 @@ export class ReactUiAdapter implements UiAdapter {
     this.controlsTimer = window.setTimeout(() => {
       this.store.set({ controlsNotice: '' });
     }, delay);
+    this.pushPopup(notice, tone);
+  }
+
+  /** Floating text that flies up and fades near the player, alongside (not
+   * instead of) the static HUD flash banner above - reuses the same label
+   * text so a bonus reads as something that just happened at the player
+   * rather than only a corner-of-the-eye HUD update. */
+  private pushPopup(text: string, tone: 'positive' | 'negative' | 'neutral') {
+    const id = ++this.popupSeq;
+    const x = (Math.random() - 0.5) * 34;
+    this.store.set(state => ({ ...state, popups: [...state.popups, { id, text, tone, x }] }));
+    window.setTimeout(() => {
+      this.store.set(state => ({ ...state, popups: state.popups.filter(p => p.id !== id) }));
+    }, 1150);
   }
 
   private clearTransient() {

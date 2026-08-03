@@ -69,8 +69,12 @@ export interface HudState {
   momentum: number;
   cleanStreakSeconds: number;
   yetiDangerT: number;
+  avalancheDangerT: number;
   iceGripT: number;
   blizzardT: number;
+  pingMs: number | null;
+  /** Live in-air trick spin, degrees (0 when grounded or no spin attempted). */
+  trickSpinDeg: number;
 }
 
 export interface YetiThreat {
@@ -145,9 +149,21 @@ export interface UiAdapter {
   showNearMissFeedback(bonus?: number): void;
   showJumpChainFeedback(bonus?: number, chainCount?: number): void;
   showUnstuckFeedback(): void;
+  showTrickFeedback(bonus?: number, spinDeg?: number): void;
+  showTrickFailFeedback(spinDeg?: number): void;
+  showAvalancheOutrunFeedback(): void;
+  showForkBoldLineFeedback(): void;
   setError(message: string): void;
   clearError(): void;
   setNotice(message: string): void;
+  setReconnecting(reconnecting: boolean): void;
+}
+
+export interface BonusPopup {
+  id: number;
+  text: string;
+  tone: 'positive' | 'negative' | 'neutral';
+  x: number;
 }
 
 export interface UiStoreState {
@@ -165,12 +181,14 @@ export interface UiStoreState {
   controlsNotice: string;
   error: string;
   notice: string;
+  reconnecting: boolean;
   hitFlashKey: number;
   healFlashKey: number;
   landingFlashKey: number;
   nearMissFlashKey: number;
   jumpChainFlashKey: number;
   unstuckFlashKey: number;
+  popups: BonusPopup[];
 }
 
 export interface ControllerSnapshot {

@@ -9,6 +9,8 @@ import { Obstacles } from './Obstacles';
 import { YetiManager } from './Yeti';
 import { GameCamera } from './Camera';
 import { SnowParticles } from './Snow';
+import { ForkWindEffect } from './ForkWind';
+import { AvalancheEffect } from './AvalancheEffect';
 import { Input } from './Input';
 import { SeededRandom } from '../utils/SeededRandom';
 import { AudioManager } from './AudioManager';
@@ -35,7 +37,10 @@ import {
   createInitialPlayerState,
   createMultiplayerSpawnXs,
   getChainWindowMs,
+  getAvalancheZoneAhead,
+  getForkZoneAhead,
   getGameplayObstaclesNear,
+  getIceZoneAhead,
   getWeatherAtZ,
   getYetiConfig,
   sanitizePlayerColor,
@@ -52,8 +57,19 @@ const PROJECTILE_LIFETIME = 2.4;
 const PROJECTILE_SPEED = 34;
 const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
 const HITSTOP_TIME_SCALE = 0.05;
-const YETI_DANGER_RADIUS = 16;
 const YETI_PROXIMITY_BONUS_RATE = 3;
+// Mirrors shared/AuthoritativeSim.ts's avalanche constants exactly, same
+// "duplicated on purpose" relationship YETI_PROXIMITY_BONUS_RATE above has
+// with its shared counterpart.
+const AVALANCHE_CHASE_SPEED = { easy: 22, normal: 24, hard: 26, extreme: 27 };
+const AVALANCHE_DANGER_GAP_WINDOW = 80;
+const AVALANCHE_PROXIMITY_BONUS_RATE = 3;
+const AVALANCHE_OUTRUN_BONUS = 6;
+const AVALANCHE_GRACE_DISTANCE = 20;
+// Mirrors shared/AuthoritativeSim.ts's fork constants.
+const FORK_LANE_GAP = 6;
+const FORK_BOLD_LINE_RATIO = 0.65;
+const FORK_BOLD_LINE_BONUS = 5;
 const GHOST_SAMPLE_INTERVAL_S = 0.12;
 // How far ahead of an upcoming blizzard zone the StormWall visual starts
 // fading in - see _updateStormWall.
@@ -161,6 +177,11 @@ export class Game {
     this._hitstopRemaining = 0;
     this._yetiDangerT = 0;
     this._yetiTriggerAtElapsedS = -1;
+    this._avalancheDangerT = 0;
+    this._avalancheTriggerAtElapsedS = -1;
+    this._avalancheTriggerDistance = 0;
+    this._forkZoneRiskyTicks = 0;
+    this._forkZoneTotalTicks = 0;
     this._chainRemainingT = 0;
     this._netTimer = 0;
     this._animFrame = null;
@@ -391,6 +412,23 @@ export class Game {
     ].join('\n');
   }
 
+  /** Player-facing connection-quality signal (see the HUD ping indicator),
+   * not just a dev-overlay stat - runs unconditionally in multiplayer so
+   * players get ambient feedback before the 2s "Connection unstable"
+   * snapshot-timeout watchdog trips. this._devPing/_devPingTimer are shared
+   * with the dev overlay, which just displays whatever this last measured. */
+  _updatePingMeasurement(dt) {
+    if (this.socket?.connected) {
+      this._devPingTimer -= dt;
+      if (this._devPingTimer <= 0) {
+        this._devPingTimer = 1;
+        this.socket.ping(ms => { this._devPing = ms; });
+      }
+    } else {
+      this._devPing = null;
+    }
+  }
+
   _updateDevMode(dt) {
     if (!this._devModeEnabled) return;
 
@@ -400,16 +438,6 @@ export class Game {
       this._devFps = this._devFpsFrames / this._devFpsAccum;
       this._devFpsAccum = 0;
       this._devFpsFrames = 0;
-    }
-
-    if (this.socket?.connected) {
-      this._devPingTimer -= dt;
-      if (this._devPingTimer <= 0) {
-        this._devPingTimer = 1;
-        this.socket.ping(ms => { this._devPing = ms; });
-      }
-    } else {
-      this._devPing = null;
     }
 
     this._rebuildDevHitboxes();
@@ -489,6 +517,7 @@ export class Game {
       : new Terrain(this.scene);
     this.obstacles = new Obstacles(this.scene, {
       volume: this.obstacleVolume,
+      seed,
       authoritativeSeed: this._authoritativeMultiplayer ? seed : null,
       difficultyRamp: this.difficultyRamp,
     });
@@ -528,6 +557,14 @@ export class Game {
       this.ui.showJumpChainFeedback(bonus, chainCount);
       this.audio.playJumpChain();
     };
+    this.player.onTrick = (bonus, spinDeg) => {
+      this.ui.showTrickFeedback(bonus, spinDeg);
+      this.audio.playJumpChain();
+    };
+    this.player.onTrickFail = spinDeg => {
+      this.ui.showTrickFailFeedback(spinDeg);
+      this.audio.playCollision(0);
+    };
     this.player.onUnstuck = () => this.ui.showUnstuckFeedback();
     this.player.onJumpStart = () => this.audio.playJump();
     this.player.onJumpLand = airSeconds => {
@@ -552,6 +589,8 @@ export class Game {
       quality: this.graphicsQuality,
       volume: this.snowVolume,
     });
+    this.forkWind = new ForkWindEffect(this.scene);
+    this.avalancheEffect = new AvalancheEffect(this.scene);
     this.skiTrail = new SkiTrail(this.scene);
     this.impactParticles = new ImpactParticles(this.scene);
     this._skiSprayCooldown = 0;
@@ -575,17 +614,7 @@ export class Game {
     // Distance tracking
     this._startZ = this.player.position.z;
     this._startTime = performance.now();
-    
-    // Yeti capture
-    this.yeti.onCapture(() => {
-      // In authoritative multiplayer the yeti is purely a local, cosmetic
-      // chase sim with no knowledge of the server's actual distance/time
-      // capture math — ending the run from here would desync the client
-      // from the server, which is the sole authority on that death.
-      if (this._authoritativeMultiplayer) return;
-      this._handleGameOver({ capturedByYeti: true });
-    });
-    
+
     // Register score for self (with initial HP)
     this._scores.set('local', {
       id: 'local',
@@ -734,6 +763,7 @@ export class Game {
     }
 
     this._update(dt);
+    this._updatePingMeasurement(dt);
     this._updateDevMode(dt);
     this._render();
   }
@@ -896,6 +926,59 @@ export class Game {
     this.stormWall.setOpacity(t * STORM_WALL_MAX_OPACITY);
   }
 
+  /**
+   * Ice zones get no fog (getWeatherAtZ's ice descriptor has fogIntensity 0),
+   * so unlike blizzard they can never trigger StormWall above - without this
+   * there was no advance warning at all before the grip change. Ground-tints
+   * the terrain itself (SnowTerrain.ts's shader) instead of adding a second
+   * curtain mesh, since SnowTerrain already renders real world-Z ground
+   * several hundred meters ahead every frame.
+   */
+  _updateIceZoneVisual(z) {
+    this.terrain?.setIceZone?.(getIceZoneAhead(this.seed, z));
+  }
+
+  /** Ground-painted divider stripe for an upcoming/current fork zone - same
+   * "tint the real ground ahead" technique as the ice zone above, telegraphed
+   * well before the zone starts so the player can pick a lane in advance. */
+  _updateForkZoneVisual(z) {
+    const zone = getForkZoneAhead(this.seed, z);
+    this.terrain?.setForkZone?.(zone);
+    this.forkWind?.setActive(zone !== null);
+  }
+
+  /**
+   * "Bold Line" bonus tracking - mirrors maybeApplyForkBonus in
+   * shared/AuthoritativeSim.ts locally, same relationship
+   * _updateAvalancheDanger above has with maybeApplyAvalancheCapture: a
+   * running risky-lane dwell ratio while inside a fork zone, paid out once
+   * on exit if the player spent most of the zone on the risky (x > 0) side.
+   */
+  _updateForkBonus() {
+    if (!this.skillScoring || !this.player.isAlive) {
+      this._forkZoneRiskyTicks = 0;
+      this._forkZoneTotalTicks = 0;
+      return;
+    }
+    // maxZonesAhead=0 checks only the zone containing the player's own z.
+    const zone = getForkZoneAhead(this.seed, this.player.position.z, 0);
+    if (!zone) {
+      if (this._forkZoneTotalTicks > 0) {
+        const riskyRatio = this._forkZoneRiskyTicks / this._forkZoneTotalTicks;
+        if (riskyRatio >= FORK_BOLD_LINE_RATIO) {
+          this.player.bonusDistance += FORK_BOLD_LINE_BONUS;
+          this.ui.showForkBoldLineFeedback();
+          this.audio.playJumpChain();
+        }
+      }
+      this._forkZoneRiskyTicks = 0;
+      this._forkZoneTotalTicks = 0;
+      return;
+    }
+    this._forkZoneTotalTicks += 1;
+    if (this.player.position.x > FORK_LANE_GAP) this._forkZoneRiskyTicks += 1;
+  }
+
   /** Fades in a low tension drone as the player nears the yeti trigger range. */
   _updateYetiTension(distance) {
     if (this.yeti.startMode === 'disabled' || this.yeti.active) {
@@ -910,26 +993,140 @@ export class Game {
   }
 
   /**
-   * Solo only: rewards surviving close to an active yeti instead of only
-   * punishing capture. Position-based (uses the real chase sim), which is
-   * only safe here because solo has no server to disagree with - see the
-   * multiplayer version below, which is authoritative-driven instead.
+   * Solo only: the actual yeti capture decision. Uses the same
+   * triggerDistance/chaseSpeed gap formula getYetiConfig and
+   * maybeApplyYetiCapture use server-side (shared/AuthoritativeSim.ts) -
+   * sustaining speed above chaseSpeed always keeps the gap growing, exactly
+   * like multiplayer, instead of the old YETI_CAPTURE_DIST mesh-proximity
+   * check in Yeti.ts, which could catch a player cornered against an
+   * obstacle regardless of how fast they were going. YetiManager still
+   * drives the visual pursuit (steering, jumping obstacles, closing in for
+   * tension) - only the capture/scoring decision lives here now, so a
+   * player who keeps their speed up is provably safe even if the visible
+   * yeti looks close. Mirrors the multiplayer cosmetic gap estimate in
+   * _updateYetiDangerDisplay below, but this one is authoritative (solo has
+   * no server to correct it) so it also triggers real capture, not just a
+   * display value.
    */
-  _updateYetiDangerBonus(dt) {
-    if (!this.skillScoring || !this.yeti.active || !this.player.isAlive) {
+  _updateYetiDangerBonus(dt, distance) {
+    if (this.yetiStartMode === 'disabled' || !this.player.isAlive) {
       this._yetiDangerT = 0;
+      this._yetiTriggerAtElapsedS = -1;
       return;
     }
-    let closest = Infinity;
-    for (const yeti of this.yeti.yetis) {
-      if (yeti.captured) continue;
-      const d = yeti.mesh.position.distanceTo(this.player.position);
-      if (d < closest) closest = d;
+    const config = getYetiConfig({ difficulty: this.difficulty, yetiStartMode: this.yetiStartMode });
+    if (distance < config.triggerDistance) {
+      this._yetiDangerT = 0;
+      this._yetiTriggerAtElapsedS = -1;
+      return;
     }
-    this._yetiDangerT = closest < YETI_DANGER_RADIUS ? clamp(1 - closest / YETI_DANGER_RADIUS, 0, 1) : 0;
-    if (this._yetiDangerT > 0) {
+    if (this._yetiTriggerAtElapsedS < 0) {
+      this._yetiTriggerAtElapsedS = this._elapsedSeconds;
+    }
+    const elapsedSinceTrigger = Math.max(0, this._elapsedSeconds - this._yetiTriggerAtElapsedS);
+    const yetiDistance = config.triggerDistance + config.chaseSpeed * elapsedSinceTrigger;
+    const gap = distance - yetiDistance;
+
+    if (gap <= 0) {
+      this._yetiDangerT = 1;
+      this._handleGameOver({ capturedByYeti: true });
+      return;
+    }
+
+    this._yetiDangerT = clamp(1 - gap / 100, 0, 1);
+    if (this.skillScoring && this._yetiDangerT > 0) {
       this.player.bonusDistance += dt * this._yetiDangerT * YETI_PROXIMITY_BONUS_RATE;
     }
+  }
+
+  /**
+   * Solo only: the actual avalanche capture decision, mirroring
+   * maybeApplyAvalancheCapture in shared/AuthoritativeSim.ts the same way
+   * _updateYetiDangerBonus above mirrors maybeApplyYetiCapture - zone-bounded
+   * (own start/end per getAvalancheZoneAhead) rather than persistent-once-
+   * triggered, so it reads as a self-contained set-piece chase.
+   */
+  _updateAvalancheDanger(dt, distance) {
+    if (!this.player.isAlive) {
+      this._avalancheDangerT = 0;
+      this._avalancheTriggerAtElapsedS = -1;
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
+      return;
+    }
+    // maxZonesAhead=0 checks only the zone containing the player's own z
+    // (floor(z/AVALANCHE_ZONE_LENGTH)), i.e. "am I in one right now" - not a
+    // lookahead search.
+    const zone = getAvalancheZoneAhead(this.seed, this.player.position.z, 0);
+    if (!zone) {
+      if (this._avalancheTriggerAtElapsedS >= 0) {
+        if (this.skillScoring) {
+          this.player.bonusDistance += AVALANCHE_OUTRUN_BONUS;
+          this.ui.showAvalancheOutrunFeedback();
+          this.audio.playJumpChain();
+        }
+      }
+      this._avalancheDangerT = 0;
+      this._avalancheTriggerAtElapsedS = -1;
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
+      return;
+    }
+
+    if (this._avalancheTriggerAtElapsedS < 0) {
+      this._avalancheTriggerAtElapsedS = this._elapsedSeconds;
+      // See shared/AuthoritativeSim.ts's AVALANCHE_GRACE_DISTANCE comment -
+      // without this, gap starts at exactly 0 at the tick of entry and goes
+      // negative the very next tick for anyone not already above chaseSpeed
+      // at that precise instant.
+      this._avalancheTriggerDistance = distance - AVALANCHE_GRACE_DISTANCE;
+    }
+    const elapsedSinceTrigger = Math.max(0, this._elapsedSeconds - this._avalancheTriggerAtElapsedS);
+    const chaseSpeed = AVALANCHE_CHASE_SPEED[this.difficulty] || AVALANCHE_CHASE_SPEED.normal;
+    const avalancheDistance = this._avalancheTriggerDistance + chaseSpeed * elapsedSinceTrigger;
+    const gap = distance - avalancheDistance;
+
+    if (gap <= 0) {
+      this._avalancheDangerT = 1;
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 1, true);
+      this._handleGameOver({ capturedByAvalanche: true });
+      return;
+    }
+
+    this._avalancheDangerT = clamp(1 - gap / AVALANCHE_DANGER_GAP_WINDOW, 0, 1);
+    this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, this._avalancheDangerT, true);
+    if (this.skillScoring && this._avalancheDangerT > 0) {
+      this.player.bonusDistance += dt * this._avalancheDangerT * AVALANCHE_PROXIMITY_BONUS_RATE;
+    }
+  }
+
+  /** Multiplayer only: display-side estimate, cosmetic - mirrors
+   * _updateYetiDangerDisplay below for the same reason. */
+  _updateAvalancheDangerDisplay(dt, distance) {
+    if (!this.skillScoring) {
+      this._avalancheDangerT = 0;
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
+      return;
+    }
+    const zone = getAvalancheZoneAhead(this.seed, this.player.position.z, 0);
+    if (!zone) {
+      this._avalancheDangerT = 0;
+      this._avalancheTriggerAtElapsedS = -1;
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
+      return;
+    }
+    if (this._avalancheTriggerAtElapsedS < 0) {
+      this._avalancheTriggerAtElapsedS = this._elapsedSeconds;
+      // See shared/AuthoritativeSim.ts's AVALANCHE_GRACE_DISTANCE comment -
+      // without this, gap starts at exactly 0 at the tick of entry and goes
+      // negative the very next tick for anyone not already above chaseSpeed
+      // at that precise instant.
+      this._avalancheTriggerDistance = distance - AVALANCHE_GRACE_DISTANCE;
+    }
+    const elapsedSinceTrigger = Math.max(0, this._elapsedSeconds - this._avalancheTriggerAtElapsedS);
+    const chaseSpeed = AVALANCHE_CHASE_SPEED[this.difficulty] || AVALANCHE_CHASE_SPEED.normal;
+    const avalancheDistance = this._avalancheTriggerDistance + chaseSpeed * elapsedSinceTrigger;
+    const gap = distance - avalancheDistance;
+    this._avalancheDangerT = clamp(1 - gap / AVALANCHE_DANGER_GAP_WINDOW, 0, 1);
+    this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, this._avalancheDangerT, true);
   }
 
   /**
@@ -1014,6 +1211,12 @@ export class Game {
         ? (x, z) => getVisualTerrainY(x, z, focusPos.x, focusPos.z, this._biomeReliefMult)
         : null;
       this.player.updateDeathAnimation(dt, visualGroundY);
+      // Once dead, the normal per-frame _updateAvalancheDanger call never
+      // runs again (this whole branch returns before reaching it) - without
+      // this, a cloud that was at full intensity at the moment of capture
+      // would stay frozen on screen through the death animation and
+      // game-over screen forever instead of fading out.
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
 
       if (this.options.multiplayer) {
         this._updateMultiplayerSpectator(dt, visualGroundY, spectator);
@@ -1040,7 +1243,7 @@ export class Game {
     // disagree with anything already rendered/collided against.
     for (let i = currentChunk; i <= currentChunk + 5; i++) {
       if (!this.obstacles.chunks.has(i)) {
-        this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919), this.player.chainCount > 0);
+        this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
       }
     }
 
@@ -1058,7 +1261,10 @@ export class Game {
     this._updateWeatherVisuals(dt, weather);
     this.stormWall?.update(dt);
     this._updateStormWall(pz, weather, this.player.position.y);
-    this.player.update(dt, this.input, nearby, this.skillScoring, weather);
+    this._updateIceZoneVisual(pz);
+    this._updateForkZoneVisual(pz);
+    const forkSafeLaneSlow = this.player.position.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, pz, 0) !== null;
+    this.player.update(dt, this.input, nearby, this.skillScoring, weather, forkSafeLaneSlow);
     if (this._ghostRecording) {
       this._ghostRecording.sampleTimer += dt;
       if (this._ghostRecording.sampleTimer >= GHOST_SAMPLE_INTERVAL_S) {
@@ -1081,7 +1287,7 @@ export class Game {
 
     if (this.player.isAlive) {
       for (const [, rp] of this.remotePlayers) {
-        if (this.player.collideWithSkier(rp.mesh, { id: rp.id, name: rp.name })) break;
+        if (this.player.collideWithSkier(rp.mesh, { id: rp.id, name: rp.name }, nearby)) break;
       }
     }
 
@@ -1124,7 +1330,9 @@ export class Game {
     this.ui.showYetiWarning(yetiNear);
     this.ui.updateYetiRadar(yetiThreats);
     this._updateYetiTension(distance);
-    this._updateYetiDangerBonus(dt);
+    this._updateYetiDangerBonus(dt, distance);
+    this._updateAvalancheDanger(dt, distance);
+    this._updateForkBonus();
     this.camera.update(dt, this.player.mesh, this.player.speed, this._buildCameraEnv(visualGroundY, this.player.position.z));
     this.postFx?.update(this.player.speed);
     this.sky?.update(this.threeCamera.position);
@@ -1132,6 +1340,7 @@ export class Game {
     this.aurora?.update(dt, this.threeCamera.position);
     this.wildlife?.update(dt, this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, this.player.speed);
+    this.forkWind?.update(dt, this.threeCamera.position);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateBreathFog(dt, weather);
@@ -1154,10 +1363,13 @@ export class Game {
       momentum: this.player.momentum || 0,
       cleanStreakSeconds: this.player.cleanStreakSeconds || 0,
       yetiDangerT: this._yetiDangerT || 0,
+      avalancheDangerT: this._avalancheDangerT || 0,
       iceGripT: 1 - weather.grip,
       blizzardT: weather.fogIntensity,
+      pingMs: null,
+      trickSpinDeg: this.player.isAirborne ? Math.abs(this.player._trickSpinRad || 0) * (180 / Math.PI) : 0,
     });
-    
+
     // Update remote players
     for (const [, rp] of this.remotePlayers) {
       rp.update(dt, visualGroundY);
@@ -1248,7 +1460,8 @@ export class Game {
       // static mesh, then re-assert the reconciliation-corrected yaw that
       // applyPresentation's own rotation.y write would otherwise clobber.
       this.player.applyPresentation(dt, this.input.lateralAxis);
-      this.player.mesh.rotation.y = -(this.player.angle + this._authVisualAngleCorrection);
+      this.player.mesh.rotation.y = -(this.player.angle + this._authVisualAngleCorrection + (this.player.isAirborne ? this.player._trickSpinRad : 0));
+      this.player.mesh.userData.headingAngle = -(this.player.angle + this._authVisualAngleCorrection);
       // Cosmetic-only: real capture/death is server-authoritative (see the
       // onCapture guard above). This just gives multiplayer runs the same
       // visible chase presence solo has.
@@ -1262,8 +1475,13 @@ export class Game {
       this.ui.updateYetiRadar(this.yeti.getThreats(this.player.position));
       this._updateYetiTension(focusState.distance);
       this._updateYetiDangerDisplay(focusState.distance, focusState.speed);
+      this._updateAvalancheDangerDisplay(dt, focusState.distance);
     } else {
       this.player.updateDeathAnimation(dt, visualGroundY);
+      // Same fade-on-death fix as the solo dead branch above - this else
+      // means the normal _updateAvalancheDangerDisplay call never runs
+      // again, so without this the cloud freezes at its last intensity.
+      this.avalancheEffect?.update(dt, this.player.position.x, 0, this.player.position.z, 0, false);
     }
 
     // Read-only for rendering - the canonical, physics-affecting weather call
@@ -1273,6 +1491,8 @@ export class Game {
     this._updateWeatherVisuals(dt, weather);
     this.stormWall?.update(dt);
     this._updateStormWall(focusZ, weather, focusMesh.position.y);
+    this._updateIceZoneVisual(focusZ);
+    this._updateForkZoneVisual(focusZ);
 
     this.terrain.update(focusMesh.position.z, this._elapsedSeconds, focusMesh.position.x);
     this.obstacles.update(dt, focusMesh.position.z, visualGroundY, weather.fogIntensity);
@@ -1285,6 +1505,7 @@ export class Game {
     this.aurora?.update(dt, this.threeCamera.position);
     this.wildlife?.update(dt, this.threeCamera.position);
     this.snow.update(dt, this.threeCamera.position, focusSpeed);
+    this.forkWind?.update(dt, this.threeCamera.position);
     this.skiTrail.update(dt, this.player.position, this.player.angle, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateSkiSpray(dt, this.player.mesh, this.player.speed, this.player.isAirborne, visualGroundY);
     this._updateBreathFog(dt, weather);
@@ -1311,8 +1532,11 @@ export class Game {
       momentum: focusState.momentum || 0,
       cleanStreakSeconds: focusState.cleanStreakSeconds || 0,
       yetiDangerT: this._yetiDangerT || 0,
+      avalancheDangerT: this._avalancheDangerT || 0,
       iceGripT: 1 - weather.grip,
       blizzardT: weather.fogIntensity,
+      trickSpinDeg: focusState.isAirborne ? Math.abs(focusState.trickSpinRad || 0) * (180 / Math.PI) : 0,
+      pingMs: this._devPing,
     });
     this.ui.updatePlayerList(this._getScoreList());
     if (performance.now() - this._authLastYetiWarning > 1000) {
@@ -1335,9 +1559,10 @@ export class Game {
       this.difficultyRamp,
     );
     const weather = getWeatherAtZ(this.seed, state.z);
+    const forkSafeLaneSlow = state.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, state.z, 0) !== null;
     if (state.alive) this._predictedDeathRevealAt = 0;
     const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
-    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather);
+    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather, forkSafeLaneSlow);
     if (officiallyAliveBeforePrediction && state.alive === false) {
       // Predicted death: hold the "possibly alive" facade only for a short
       // window (long enough for an in-flight snapshot to override a wrong
@@ -1425,10 +1650,16 @@ export class Game {
     this.player.position.copy(renderPosition);
     this.player.mesh.position.copy(renderPosition);
     this.player.angle = state.angle;
-    this.player.mesh.rotation.y = -(state.angle + this._authVisualAngleCorrection);
+    this.player._trickSpinRad = state.trickSpinRad || 0;
+    this.player.mesh.rotation.y = -(state.angle + this._authVisualAngleCorrection + (state.isAirborne ? this.player._trickSpinRad : 0));
+    this.player.mesh.userData.headingAngle = -(state.angle + this._authVisualAngleCorrection);
     this.player.speed = state.speed;
     this.player.hp = state.hp;
     this.player.isAlive = state.alive;
+    // Solo's _triggerJump sets the takeoff squash directly; the
+    // authoritative path only ever gets isAirborne handed to it from the
+    // snapshot, so the grounded->airborne edge is detected here instead.
+    if (state.isAirborne && !this.player.isAirborne) this.player.triggerTakeoffSquash();
     this.player.isAirborne = state.isAirborne;
     this.player.jumpVelocityY = state.jumpVelocityY || 0;
     this.player.airTime = state.airTime || 0;
@@ -1565,6 +1796,7 @@ export class Game {
         angle: player.angle,
         speed: player.speed,
         alive: player.alive !== false,
+        deathKind: player.deathKind,
       }, serverTick, snapshot.roomTimeMs, receivedAtMs);
     }
 
@@ -1576,7 +1808,10 @@ export class Game {
     }
 
     for (const event of snapshot.events || []) {
-      if (event.socketId !== localId) continue;
+      if (event.socketId !== localId) {
+        this._applyRemotePlayerEventFeedback(event);
+        continue;
+      }
       if (event.type === 'hit') {
         this.ui.showHitFeedback();
         this.audio.playCollision(this._panForObstacleId(event.obstacleId));
@@ -1631,6 +1866,25 @@ export class Game {
         this.ui.showYetiWarning(true);
       } else if (event.type === 'unstuck') {
         this.ui.showUnstuckFeedback();
+      } else if (event.type === 'trick') {
+        this.ui.showTrickFeedback(event.bonus ?? 0, event.spinDeg ?? 0);
+        this.audio.playJumpChain();
+      } else if (event.type === 'trick-fail') {
+        this.ui.showTrickFailFeedback(event.spinDeg ?? 0);
+        this.audio.playCollision(0);
+      } else if (event.type === 'avalanche-warning') {
+        this.audio.playDistantRumble(0);
+      } else if (event.type === 'avalanche-capture') {
+        // Death handling itself comes from the 'death' event/authoritative
+        // alive-flip below (deathKind:'avalanche' already flows through
+        // _handleAuthoritativeLocalDeath generically) - this is feedback only.
+        this.audio.playDistantRumble(0);
+      } else if (event.type === 'avalanche-outrun') {
+        this.ui.showAvalancheOutrunFeedback();
+        this.audio.playJumpChain();
+      } else if (event.type === 'fork-bold-line') {
+        this.ui.showForkBoldLineFeedback();
+        this.audio.playJumpChain();
       }
     }
 
@@ -1638,6 +1892,55 @@ export class Game {
       this._scheduleFinalGameOver(650);
     }
     this._updateNetDebug();
+  }
+
+  /**
+   * Same particle/sound cues the local player gets for hit/near-miss/landing/
+   * jump events, positioned at the remote player instead - but no camera
+   * shake, hitstop, or the shared HUD popup text ("Near Miss +Xm"): those
+   * are first-person effects that would misattribute someone else's event to
+   * the local player if reused here. Sound and particles are the honest
+   * subset - something audible/visible happened over there.
+   */
+  _applyRemotePlayerEventFeedback(event) {
+    const rp = this.remotePlayers.get(event.socketId);
+    if (!rp) return;
+    const pos = rp.mesh.position;
+    const pan = this._panForDx(pos.x - this.player.position.x);
+    if (event.type === 'hit') {
+      this.audio.playCollision(pan);
+      this.impactParticles.burst(pos.x, pos.y + 0.3, pos.z, {
+        count: 16,
+        color: [0.42, 0.36, 0.32],
+        speed: 3.2,
+        spread: 1,
+        upBias: 1.6,
+        life: 0.5,
+        groundY: pos.y,
+      });
+    } else if (event.type === 'landing') {
+      this.audio.playLand();
+      rp.playLandingSquash?.(0.75);
+      this.impactParticles.burst(pos.x, pos.y + 0.05, pos.z, {
+        count: 12,
+        color: [0.5, 0.82, 1],
+        speed: 2.2,
+        spread: 0.9,
+        upBias: 1.3,
+        life: 0.4,
+        groundY: pos.y,
+      });
+    } else if (event.type === 'near-miss') {
+      this.audio.playNearMiss(pan);
+    } else if (event.type === 'jump-chain' || event.type === 'trick' || event.type === 'avalanche-outrun' || event.type === 'fork-bold-line') {
+      this.audio.playJumpChain();
+    } else if (event.type === 'jump') {
+      this.audio.playJump();
+    } else if (event.type === 'trick-fail' || event.type === 'avalanche-capture') {
+      this.audio.playCollision(pan);
+    } else if (event.type === 'avalanche-warning') {
+      this.audio.playDistantRumble(pan);
+    }
   }
 
   _handleAuthoritativeLocalDeath(player) {
@@ -1759,8 +2062,11 @@ export class Game {
       momentum: 0,
       cleanStreakSeconds: 0,
       yetiDangerT: 0,
+      avalancheDangerT: 0,
       iceGripT: 0,
       blizzardT: 0,
+      trickSpinDeg: 0,
+      pingMs: this._devPing,
     });
     this.ui.updatePlayerList(this._getScoreList());
 
@@ -1992,6 +2298,7 @@ export class Game {
     this._gameOverSent = true;
     
     if (context.capturedByYeti) this.player.startDeathAnimation({ kind: 'yeti' });
+    else if (context.capturedByAvalanche) this.player.startDeathAnimation({ kind: 'avalanche' });
     else this.player.startDeathAnimation(context);
     this.audio.stopAll();
     this.audio.playGameOver();
@@ -2076,6 +2383,8 @@ export class Game {
     this.courseDecor.dispose();
     this.player.dispose();
     this.snow.dispose();
+    this.forkWind?.dispose();
+    this.avalancheEffect?.dispose();
     this.skiTrail.dispose();
     this.impactParticles.dispose();
     this.audio.dispose();

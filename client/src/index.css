@@ -145,6 +145,25 @@ select {
   70% { transform: scale(0.92); }
 }
 
+.bonus-popup {
+  animation: bonus-popup-float 1.15s ease-out forwards;
+}
+
+.speed-lines {
+  background: repeating-conic-gradient(from 0deg, rgba(255, 255, 255, 0.75) 0deg 0.35deg, transparent 0.35deg 8deg);
+  -webkit-mask-image: radial-gradient(circle at 50% 55%, transparent 38%, black 88%);
+  mask-image: radial-gradient(circle at 50% 55%, transparent 38%, black 88%);
+  mix-blend-mode: screen;
+  transition: opacity 0.15s ease-out;
+}
+
+@keyframes bonus-popup-float {
+  0% { opacity: 0; transform: translate(-50%, 0) scale(0.85); }
+  12% { opacity: 1; transform: translate(-50%, -6px) scale(1.08); }
+  25% { transform: translate(-50%, -14px) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -78px) scale(1); }
+}
+
 @media (max-width: 640px) {
   .screen-backdrop {
     align-items: flex-start;
