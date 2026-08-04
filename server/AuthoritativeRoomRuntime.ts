@@ -1,5 +1,6 @@
 // @ts-nocheck
 import {
+  CHUNK_SIZE,
   SIM_DT,
   SIM_TICK_HZ,
   SNAPSHOT_HZ,
@@ -21,6 +22,24 @@ import {
 
 const INPUT_STALE_MS = 500;
 
+// A Set that also remembers, in insertion order, which ids were added since
+// the last drainDelta() call - lets emitSnapshot() broadcast only newly-
+// consumed pickup ids each tick instead of the whole match's history, while
+// simulatePlayerTick (shared/AuthoritativeSim.ts) keeps using it as a plain
+// Set (only .has/.add are ever called on it there).
+class TrackingIdSet extends Set {
+  add(id) {
+    if (!this.has(id)) (this._pendingDelta ??= []).push(id);
+    return super.add(id);
+  }
+
+  drainDelta() {
+    const delta = this._pendingDelta || [];
+    this._pendingDelta = [];
+    return delta;
+  }
+}
+
 export class AuthoritativeRoomRuntime {
   constructor(io, roomId, room, rankings, onFinish) {
     this.io = io;
@@ -34,7 +53,21 @@ export class AuthoritativeRoomRuntime {
     this.snapshotAccumulator = 0;
     this.tickClock = new FixedStepClock();
     this.events = [];
-    this.consumedPickupIds = new Set();
+    this.consumedPickupIds = new TrackingIdSet();
+    // Chunk contents are fully determined by (seed, chunkIndex, volume,
+    // difficultyRamp), all constant for a room's whole run - without this,
+    // getGameplayObstaclesNear was re-running generateGameplayChunk's RNG
+    // spawn loops from scratch for the same 4 chunks every sim tick, for
+    // every player, and that recompute gets more expensive the further into
+    // the run (higher chunk index -> higher ramped obstacle counts). Since
+    // sustained boost is exactly what covers distance fastest, holding it
+    // down drove the room into that more-expensive territory fastest -
+    // exactly the "boost held for a long time -> multiplayer lag" symptom.
+    this._chunkCache = new Map();
+    // Forces the very next emitSnapshot() to send the full pickup-id history
+    // instead of a delta - needed on room start and after a reconnect, so a
+    // (re)joining client sees already-collected hearts as already gone.
+    this._forcePickupResync = true;
     this.savedRanking = false;
     this.players = new Map();
     this.inputBuffers = new Map();
@@ -104,6 +137,7 @@ export class AuthoritativeRoomRuntime {
     const buffer = this.inputBuffers.get(oldSocketId);
     this.inputBuffers.delete(oldSocketId);
     this.inputBuffers.set(newSocketId, buffer || new OrderedInputBuffer());
+    this._forcePickupResync = true;
     return true;
   }
 
@@ -127,6 +161,7 @@ export class AuthoritativeRoomRuntime {
         this.room.settings.obstacleVolume,
         this.consumedPickupIds,
         this.room.settings.difficultyRamp,
+        this._chunkCache,
       );
       obstaclesByPlayer.set(socketId, obstacles);
       const weather = getWeatherAtZ(this.room.seed, state.z);
@@ -191,6 +226,23 @@ export class AuthoritativeRoomRuntime {
     if (this.room.started && this.room.allPlayersFinished()) {
       this.finishRun();
     }
+
+    this._pruneChunkCache();
+  }
+
+  // Bounds _chunkCache's growth over a long run/session - only ever drops
+  // chunks every player has already skied well past, so it never evicts
+  // anything the hot per-tick lookup above still needs.
+  _pruneChunkCache() {
+    if (this._chunkCache.size < 48) return;
+    let minChunk = Infinity;
+    for (const state of this.players.values()) {
+      minChunk = Math.min(minChunk, Math.floor(state.z / CHUNK_SIZE));
+    }
+    if (!Number.isFinite(minChunk)) return;
+    for (const chunkIndex of this._chunkCache.keys()) {
+      if (chunkIndex < minChunk - 4) this._chunkCache.delete(chunkIndex);
+    }
   }
 
   getInputForPlayer(socketId, state) {
@@ -201,6 +253,20 @@ export class AuthoritativeRoomRuntime {
   }
 
   emitSnapshot() {
+    // Only the very first snapshot after room start/a reconnect carries the
+    // full cumulative pickup-id history (so a (re)joining client can mark
+    // already-collected hearts as gone); every other tick sends just the ids
+    // consumed since the last snapshot. Without this, consumedPickupIds grew
+    // for the whole match and was fully re-serialized/rebroadcast to the
+    // entire room 30x/sec, getting progressively heavier the longer a match
+    // (or a sustained boost run through pickups) went on.
+    let consumedPickupIdsFull;
+    let consumedPickupIdsDelta = this.consumedPickupIds.drainDelta();
+    if (this._forcePickupResync) {
+      consumedPickupIdsFull = Array.from(this.consumedPickupIds);
+      consumedPickupIdsDelta = [];
+      this._forcePickupResync = false;
+    }
     const snapshot = {
       serverTick: this.serverTick,
       roomTimeMs: Math.round(this.roomTimeMs),
@@ -210,7 +276,8 @@ export class AuthoritativeRoomRuntime {
         .filter(state => this.room.players.has(state.id))
         .map(toSnapshotPlayer),
       events: this.events.splice(0),
-      consumedPickupIds: Array.from(this.consumedPickupIds),
+      consumedPickupIdsDelta,
+      ...(consumedPickupIdsFull ? { consumedPickupIdsFull } : {}),
     };
     this.io.to(this.roomId).volatile.emit('game:snapshot', snapshot);
   }

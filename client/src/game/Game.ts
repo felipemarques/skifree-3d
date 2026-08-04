@@ -248,6 +248,11 @@ export class Game {
     this._authLocalDeathHandled = false;
     this._predictedDeathRevealAt = 0;
     this._authConsumedPickupIds = new Set();
+    // Mirrors AuthoritativeRoomRuntime.ts's server-side chunk cache - same
+    // getGameplayObstaclesNear call, same reasoning for memoizing it (chunk
+    // contents only depend on seed/chunkIndex/volume/difficultyRamp, all
+    // constant for the run).
+    this._predictedChunkCache = new Map();
     this._authLastYetiWarning = 0;
     this._devModeEnabled = false;
     this._devOverlayElement = null;
@@ -1557,6 +1562,7 @@ export class Game {
       this.obstacleVolume,
       consumedPickupIds,
       this.difficultyRamp,
+      this._predictedChunkCache,
     );
     const weather = getWeatherAtZ(this.seed, state.z);
     const forkSafeLaneSlow = state.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, state.z, 0) !== null;
@@ -1728,14 +1734,20 @@ export class Game {
       this._authLastServerTick = serverTick;
     }
 
-    const serverConsumedPickupIds = new Set(Array.isArray(snapshot.consumedPickupIds) ? snapshot.consumedPickupIds : []);
-    if (Array.isArray(snapshot.consumedPickupIds)) {
-      this._authConsumedPickupIds = new Set(snapshot.consumedPickupIds);
-      for (const obs of this.obstacles.active) {
-        if (this._authConsumedPickupIds.has(obs.id)) {
-          obs.dead = true;
-          if (obs.mesh) obs.mesh.visible = false;
-        }
+    // Server sends a full resync only right after this client (re)joins;
+    // every other tick it's a delta of newly-consumed ids merged into the
+    // persistent accumulator, so this never re-clones the whole match's
+    // pickup history each snapshot (see AuthoritativeRoomRuntime.emitSnapshot).
+    if (Array.isArray(snapshot.consumedPickupIdsFull)) {
+      this._authConsumedPickupIds = new Set(snapshot.consumedPickupIdsFull);
+    } else if (Array.isArray(snapshot.consumedPickupIdsDelta) && snapshot.consumedPickupIdsDelta.length) {
+      for (const id of snapshot.consumedPickupIdsDelta) this._authConsumedPickupIds.add(id);
+    }
+    const serverConsumedPickupIds = this._authConsumedPickupIds;
+    for (const obs of this.obstacles.active) {
+      if (serverConsumedPickupIds.has(obs.id)) {
+        obs.dead = true;
+        if (obs.mesh) obs.mesh.visible = false;
       }
     }
 

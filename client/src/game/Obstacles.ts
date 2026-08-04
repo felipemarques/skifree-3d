@@ -38,6 +38,14 @@ const BIOME_SETPIECE_EDGE_BAND = 22;
 const FORK_ZONE_LENGTH = 240;
 const FORK_ZONE_ROLL_CHANCE = 0.26;
 const FORK_LANE_GAP = 6;
+// Rockfall telegraph timing: shadow starts fading in this far ahead of the
+// rock, then the rock itself drops in over the last stretch before impact.
+// Collision is unaffected by any of this - the rock is a solid obstacle at
+// its generated x/z the entire time, this is purely the visual cue.
+const ROCKFALL_WARN_DISTANCE = 42;
+const ROCKFALL_DROP_START_DISTANCE = 8;
+const ROCKFALL_DROP_DURATION = 0.45;
+const ROCKFALL_DROP_HEIGHT = 9;
 
 function pickBiomeObstacleType(mix, roll) {
   let acc = mix.tree;
@@ -83,7 +91,7 @@ const SPAWN_PADDING = 0.75;
 // In a full blizzard, obstacles beyond this z-distance are hidden entirely
 // (not just fogged) so nothing pops through via a shadow, specular hit, or
 // any other fog-blend edge case - matches the fog's own z-distance framing.
-const BLIZZARD_VISIBILITY_RADIUS = 50;
+const BLIZZARD_VISIBILITY_RADIUS = 35;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -368,6 +376,53 @@ export function makeRock(rng, hueShift = 0, radiusOverride = null) {
   group.userData.halfD = radius * 0.85;
   group.userData.type = 'rock';
   return markShadows(group);
+}
+
+// Lazily-built shared texture for the rockfall telegraph decal - a soft dark
+// radial gradient painted flat on the ground, same "canvas -> CanvasTexture"
+// technique AvalancheEffect.ts's puff texture uses.
+let _rockfallShadowTexture = null;
+function getRockfallShadowTexture() {
+  if (_rockfallShadowTexture) return _rockfallShadowTexture;
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, 'rgba(8, 10, 14, 0.65)');
+  gradient.addColorStop(1, 'rgba(8, 10, 14, 0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  _rockfallShadowTexture = new THREE.CanvasTexture(canvas);
+  return _rockfallShadowTexture;
+}
+
+// Cliffs "rockfall" set-piece variant of makeRock: the rock itself starts
+// hidden and a ground shadow decal starts transparent - Obstacles.update()
+// fades the shadow in as the player approaches, then reveals/drops the rock
+// in over a short window. Collision (halfW/halfD) is identical to a normal
+// rock and solid from the moment it's generated - only the visual is delayed.
+function makeRockfallRock(rng, hueShift = 0, radiusOverride = null) {
+  const group = makeRock(rng, hueShift, radiusOverride);
+  const radius = group.userData.halfW / 0.95;
+  for (const child of group.children) child.visible = false;
+
+  const shadow = new THREE.Mesh(
+    new THREE.PlaneGeometry(radius * 2.6, radius * 2.6),
+    new THREE.MeshBasicMaterial({
+      map: getRockfallShadowTexture(),
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    }),
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = 0.03;
+  group.add(shadow);
+  group.userData.rockfallShadow = shadow;
+  group.userData.rockfallParts = group.children.filter(child => child !== shadow);
+
+  return group;
 }
 
 function makeStump(rng) {
@@ -1066,6 +1121,9 @@ export class Obstacles {
     const obstacleMix = BIOME_OBSTACLE_MIX[biome];
     const setPiece = isBiomeSetPieceZone(this.seed, chunkIndex);
     const isCrevasseField = setPiece && biome === 'glacier';
+    // Cliffs' "rockfall" set-piece - mirrors shared/AuthoritativeSim.ts's
+    // matching isRockfallField block.
+    const isRockfallField = setPiece && biome === 'cliffs';
     const setPieceHazardVolume = setPiece
       ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
       : hazardVolume;
@@ -1082,7 +1140,7 @@ export class Obstacles {
       bearChance: clamp(BEAR_CHANCE_PER_CHUNK * this.volume, 0, 0.85),
     };
 
-    const spawnObs = (mesh, x, z) => {
+    const spawnObs = (mesh, x, z, subtype) => {
       mesh.position.set(x, 0, z);
       group.add(mesh);
       chunkObstacles.push({
@@ -1091,6 +1149,9 @@ export class Obstacles {
         halfW: mesh.userData.halfW,
         halfD: mesh.userData.halfD,
         type: mesh.userData.type,
+        subtype,
+        fallState: subtype === 'rockfall' ? 'pending' : undefined,
+        fallTimer: 0,
         mesh,
         dead: false,
         speed: mesh.userData.speed || 0,
@@ -1136,6 +1197,7 @@ export class Obstacles {
         requireClear = true,
         minDistanceFromType = null,
         minDistance = 0,
+        subtype = undefined,
       } = options;
 
       for (let attempt = 0; attempt < attempts; attempt++) {
@@ -1152,7 +1214,7 @@ export class Obstacles {
             !isTooCloseToType(x, z, minDistanceFromType, minDistance, [chunkObstacles, this.active])
           )
         ) {
-          spawnObs(mesh, x, z);
+          spawnObs(mesh, x, z, subtype);
           return true;
         }
         disposeGroup(mesh);
@@ -1224,6 +1286,22 @@ export class Obstacles {
           spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
         }
       }
+      // Cliffs' "rockfall" set-piece: tight clusters of extra rocks tagged
+      // 'rockfall' for the shadow/drop telegraph in update() - mirrors
+      // shared/AuthoritativeSim.ts's matching isRockfallField block.
+      if (isRockfallField) {
+        const clusterCount = 2 + (rng.next() < 0.5 ? 1 : 0);
+        for (let c = 0; c < clusterCount; c++) {
+          const clusterX = rng.range(-TRACK_LIMIT + 6, TRACK_LIMIT - 6);
+          const clusterZ = rng.range(16, CHUNK_SIZE - 16);
+          const rocksInCluster = rng.next() < 0.5 ? 1 : 2;
+          for (let r = 0; r < rocksInCluster; r++) {
+            spawnPlaced(() => makeRockfallRock(rng, rockHueShift), [clusterX - 3, clusterX + 3], [clusterZ - 3, clusterZ + 3], {
+              attempts: 10, padding: 0.6, subtype: 'rockfall',
+            });
+          }
+        }
+      }
 
       for (let i = 0; i < counts.holes; i++) {
         spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], {
@@ -1287,7 +1365,11 @@ export class Obstacles {
       const type = record.type;
       if (type === 'tree') return makeTree(rng, treeHueShift, record.halfW / 0.72);
       if (type === 'fallen_tree') return makeFallenTree(rng, record.visual || null);
-      if (type === 'rock') return makeRock(rng, rockHueShift, record.halfW / 0.95);
+      if (type === 'rock') {
+        return record.subtype === 'rockfall'
+          ? makeRockfallRock(rng, rockHueShift, record.halfW / 0.95)
+          : makeRock(rng, rockHueShift, record.halfW / 0.95);
+      }
       if (type === 'stump') return makeStump(rng);
       if (type === 'ramp') return makeRamp(rng);
       if (type === 'hole') return makeHole(rng, { halfW: record.halfW, halfD: record.halfD });
@@ -1306,6 +1388,9 @@ export class Obstacles {
         halfW: record.halfW,
         halfD: record.halfD,
         type: record.type,
+        subtype: record.subtype,
+        fallState: record.subtype === 'rockfall' ? 'pending' : undefined,
+        fallTimer: 0,
         mesh,
         dead: false,
         speed: 0,
@@ -1489,12 +1574,39 @@ export class Obstacles {
         obs.mesh.rotation.y += dt * 1.8;
       }
 
+      let rockfallDrop = 0;
+      if (obs.subtype === 'rockfall' && obs.fallState !== 'landed') {
+        const distToImpact = obs.z - playerZ;
+        if (obs.fallState === 'pending' && distToImpact <= ROCKFALL_WARN_DISTANCE) {
+          obs.fallState = 'warning';
+        }
+        if (obs.fallState === 'warning' && distToImpact <= ROCKFALL_DROP_START_DISTANCE) {
+          obs.fallState = 'falling';
+          obs.fallTimer = 0;
+          for (const part of obs.mesh.userData.rockfallParts || []) part.visible = true;
+        }
+        const shadow = obs.mesh.userData.rockfallShadow;
+        if (obs.fallState === 'warning') {
+          const warnT = THREE.MathUtils.clamp(1 - distToImpact / ROCKFALL_WARN_DISTANCE, 0, 1);
+          if (shadow) shadow.material.opacity = THREE.MathUtils.lerp(0, 0.5, warnT);
+        } else if (obs.fallState === 'falling') {
+          obs.fallTimer += dt;
+          const t = Math.min(1, obs.fallTimer / ROCKFALL_DROP_DURATION);
+          rockfallDrop = (1 - t) * ROCKFALL_DROP_HEIGHT;
+          if (shadow) shadow.material.opacity = THREE.MathUtils.lerp(0.5, 0.3, t);
+          if (t >= 1) {
+            obs.fallState = 'landed';
+            if (shadow) shadow.material.opacity = 0.22;
+          }
+        }
+      }
+
       const groundY = groundYAt ? groundYAt(obs.x, obs.z) : 0;
       const bob = obs.type === 'heart' ? Math.sin(obs.animTime * 3.2 + obs.phase) * 0.12 : 0;
       const jumpLift = (obs.type === 'npc' || obs.type === 'dog' || obs.type === 'bear') && obs.jumpTimer > 0
         ? Math.sin((1 - obs.jumpTimer / Math.max(obs.jumpDuration, 0.001)) * Math.PI) * obs.jumpHeight
         : 0;
-      obs.mesh.position.set(obs.x, groundY + obs.visualYOffset + bob + jumpLift, obs.z);
+      obs.mesh.position.set(obs.x, groundY + obs.visualYOffset + bob + jumpLift + rockfallDrop, obs.z);
       obs.mesh.visible = Math.abs(obs.z - playerZ) <= cullRadius;
     }
 

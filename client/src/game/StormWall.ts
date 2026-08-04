@@ -54,10 +54,12 @@ const WALL_FRAG = /* glsl */`
 // what actually reads as "a real 3D mass out there" instead of a flat
 // overlay that just switches on.
 const LAYER_CONFIGS = [
+   {zOffset: -36, scale: 0.66, opacityMult: 0.45, phase: 10 },
   { zOffset: -26, scale: 0.86, opacityMult: 0.5, phase: 0 },
   { zOffset: -8, scale: 0.95, opacityMult: 0.8, phase: 2.4 },
   { zOffset: 10, scale: 1.0, opacityMult: 1.0, phase: 5.1 },
   { zOffset: 30, scale: 0.9, opacityMult: 0.6, phase: 7.8 },
+  { zOffset: 48, scale: 0.86, opacityMult: 0.5, phase: 0 },
 ];
 
 /**

@@ -241,6 +241,14 @@ export interface ObstacleRecord {
    * (tree scale, rock radius, hole box) recover cleanly from halfW/halfD.
    */
   visual?: { length: number; radius: number; angle: number };
+  /**
+   * Purely cosmetic tag some obstacles carry alongside `type` - doesn't
+   * affect collision/near-miss logic (those only ever check `type`). Used
+   * by the cliffs "rockfall" set-piece so the client can play a shadow/drop
+   * telegraph on these specific rocks while collision stays identical to an
+   * ordinary rock from the moment it's generated.
+   */
+  subtype?: string;
 }
 
 export interface PlayerSimState {
@@ -353,7 +361,11 @@ export interface RoomSnapshot {
   settings: RoomSettings;
   players: RoomSnapshotPlayer[];
   events: SimEvent[];
-  consumedPickupIds: string[];
+  // Only present right after a client (re)joins - the full cumulative
+  // history of consumed pickup ids. Every other tick omits this and sends
+  // consumedPickupIdsDelta instead (see AuthoritativeRoomRuntime.emitSnapshot).
+  consumedPickupIdsFull?: string[];
+  consumedPickupIdsDelta: string[];
 }
 
 class SimRandom {
@@ -463,7 +475,7 @@ function obstacleExtents(type: ObstacleType, rng: SimRandom) {
   return { halfW: rng.range(1.45, 2.1) * 0.62, halfD: rng.range(2.8, 4.15) * 0.62 };
 }
 
-function createObstacle(id: string, type: ObstacleType, chunkIndex: number, zBase: number, rng: SimRandom, xRange: [number, number], zRange: [number, number]) {
+function createObstacle(id: string, type: ObstacleType, chunkIndex: number, zBase: number, rng: SimRandom, xRange: [number, number], zRange: [number, number], subtype?: string) {
   const extents = obstacleExtents(type, rng);
   return {
     id,
@@ -472,6 +484,7 @@ function createObstacle(id: string, type: ObstacleType, chunkIndex: number, zBas
     z: zBase + rng.range(zRange[0], zRange[1]),
     chunkIndex,
     ...extents,
+    ...(subtype ? { subtype } : {}),
   };
 }
 
@@ -750,6 +763,11 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   // through extra holes/ramps rather than static obstacles, so its own
   // baseline density is toned down to match, not stacked on top.
   const isCrevasseField = setPiece && biome === 'glacier';
+  // Cliffs' own set-piece flavor: a couple of tight rock clusters (tagged
+  // `subtype: 'rockfall'` purely for the client's shadow/drop telegraph)
+  // instead of the frozen-lake sparse breather stacking with anything else -
+  // reads as "danger from above" rather than raising ambient density.
+  const isRockfallField = setPiece && biome === 'cliffs';
   const setPieceHazardVolume = setPiece
     ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
     : hazardVolume;
@@ -758,10 +776,10 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   // player-facing mechanic of the two.
   const isFork = forkZoneDescriptor(seed, Math.floor(zBase / FORK_ZONE_LENGTH));
 
-  const trySpawn = (type: ObstacleType, xRange: [number, number], zRange: [number, number], options: { attempts?: number; padding?: number; heartSpacing?: boolean } = {}) => {
+  const trySpawn = (type: ObstacleType, xRange: [number, number], zRange: [number, number], options: { attempts?: number; padding?: number; heartSpacing?: boolean; subtype?: string } = {}) => {
     const attempts = options.attempts ?? 12;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const obs = createObstacle(`${chunkIndex}:${type}:${records.length}:${attempt}`, type, chunkIndex, zBase, rng, xRange, zRange);
+      const obs = createObstacle(`${chunkIndex}:${type}:${records.length}:${attempt}`, type, chunkIndex, zBase, rng, xRange, zRange, options.subtype);
       if (overlapsExisting(obs.x, obs.z, obs.halfW, obs.halfD, records, options.padding ?? 0.75)) continue;
       if (options.heartSpacing && tooCloseToHeart(obs.x, obs.z, records, consumedPickupIds)) continue;
       records.push(obs);
@@ -829,6 +847,25 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
         trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
       }
     }
+    // Cliffs' "rockfall" set-piece: 2-3 tight clusters of extra rocks (1-2
+    // each) instead of scattering them evenly across the chunk, so they read
+    // as falling from a specific overhang rather than generic clutter.
+    if (isRockfallField) {
+      const clusterCount = 2 + (rng.next() < 0.5 ? 1 : 0);
+      for (let c = 0; c < clusterCount; c++) {
+        const clusterX = rng.range(-TRACK_LIMIT + 6, TRACK_LIMIT - 6);
+        const clusterZ = rng.range(16, CHUNK_SIZE - 16);
+        const rocksInCluster = rng.next() < 0.5 ? 1 : 2;
+        for (let r = 0; r < rocksInCluster; r++) {
+          trySpawn(
+            'rock',
+            [clusterX - 3, clusterX + 3],
+            [clusterZ - 3, clusterZ + 3],
+            { attempts: 10, padding: 0.6, subtype: 'rockfall' },
+          );
+        }
+      }
+    }
 
     for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume); i++) {
       trySpawn('hole', [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
@@ -842,12 +879,31 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   return records;
 }
 
-export function getGameplayObstaclesNear(seed: number, z: number, radius: number, obstacleVolume: number, consumedPickupIds: Set<string>, difficultyRamp = false) {
+// Optional `chunkCache` lets repeat callers (the server's per-tick, per-
+// player hot path in AuthoritativeRoomRuntime.ts, called dozens of times a
+// second per player) skip re-running generateGameplayChunk's RNG-driven
+// spawn loops for a chunk it already generated - chunk contents are fully
+// determined by (seed, chunkIndex, obstacleVolume, difficultyRamp), which
+// stay constant for a room's whole run, so this is safe to memoize forever.
+export function getGameplayObstaclesNear(
+  seed: number,
+  z: number,
+  radius: number,
+  obstacleVolume: number,
+  consumedPickupIds: Set<string>,
+  difficultyRamp = false,
+  chunkCache: Map<number, ObstacleRecord[]> | null = null,
+) {
   const currentChunk = Math.floor(z / CHUNK_SIZE);
   const result: ObstacleRecord[] = [];
   for (let chunk = currentChunk - 1; chunk <= currentChunk + 2; chunk++) {
     if (chunk < 0) continue;
-    for (const obs of generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds, difficultyRamp)) {
+    let chunkRecords = chunkCache?.get(chunk);
+    if (!chunkRecords) {
+      chunkRecords = generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds, difficultyRamp);
+      chunkCache?.set(chunk, chunkRecords);
+    }
+    for (const obs of chunkRecords) {
       if (consumedPickupIds.has(obs.id)) continue;
       if (Math.abs(obs.z - z) <= radius) result.push(obs);
     }
