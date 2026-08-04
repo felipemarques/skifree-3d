@@ -429,12 +429,12 @@ export class GameController {
   /**
    * Mid-race disconnect: freeze the local run (setSimulationPaused, not
    * pauseCurrentGame - same reasoning as OrientationGate, don't navigate to
-   * the 'pause' screen) and give socket.io's own auto-reconnect a window to
-   * land, instead of tearing the run down on the first dropped packet. The
-   * server holds this player's seat for a matching window (see
-   * DISCONNECT_GRACE_MS, server/index.ts) - the existing 'connect' handler
-   * below already re-fires room:join with the same playerId, which the
-   * server recognizes as a resume rather than a fresh join.
+   * the 'pause' screen) and give SocketClient's own reconnect-token retry
+   * loop (client.reconnect(), see net/SocketClient.ts's _attemptReconnect)
+   * a window to land, instead of tearing the run down on the first dropped
+   * packet. The server holds this player's seat for a matching window (see
+   * DISCONNECT_GRACE_SECONDS, server/SkiRoom.ts) - a successful resume
+   * fires 'room:joined' with resumed:true (below), which clears this.
    */
   private startReconnecting() {
     if (this.isReconnecting) return;
@@ -752,6 +752,12 @@ export class GameController {
       });
     });
 
+    // SocketClient's Colyseus adapter resolves a mid-race drop entirely on
+    // its own (client.reconnect() with a saved token - see
+    // net/SocketClient.ts's _attemptReconnect) and never re-emits 'connect',
+    // so this handler is effectively inert today. Left in place as a no-op-
+    // safe fallback rather than removed, in case a future transport does
+    // emit it.
     this.socket.on('connect', () => {
       if (this.roomId && this.isMultiplayer) {
         this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
@@ -776,8 +782,8 @@ export class GameController {
       if (screen === 'game' || screen === 'pause') {
         // Mid-race: the server holds this seat for a grace window instead
         // of ending the run on the first dropped packet (see
-        // DISCONNECT_GRACE_MS, server/index.ts) - give socket.io's own
-        // auto-reconnect the same window before giving up.
+        // DISCONNECT_GRACE_SECONDS, server/SkiRoom.ts) - give SocketClient's
+        // own reconnect-token retry loop the same window before giving up.
         this.startReconnecting();
         this.emit();
         return;

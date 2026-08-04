@@ -218,7 +218,7 @@ export class CourseDecor {
     // enough to actually stay in view as the player passes. Reuses
     // Obstacles.ts's tree/rock factories for visual continuity with the
     // on-track props, but these never join any collision array.
-    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(zBase);
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.seed, zBase);
     const innerCount = this.quality === 'high' ? 14 : 6;
     const midCount = this.quality === 'high' ? 7 : 3;
     const outerCount = this.quality === 'high' ? 4 : 2;
@@ -243,13 +243,33 @@ export class CourseDecor {
 
     this.scene.add(group);
     this.chunks.set(chunkIndex, { group, items });
+    return group;
   }
 
   update(dt, playerZ, groundYAt = null) {
     const currentChunk = Math.floor(playerZ / CHUNK_SIZE);
 
-    for (let i = currentChunk - 1; i <= currentChunk + 5; i++) {
-      this.generateChunk(i);
+    // Capped to 2 new chunks per frame - if the player suddenly covers a lot
+    // of ground in one update (sustained boost, or catching up after some
+    // other stall), several chunks in this window can still be missing at
+    // once; generating them all synchronously was a real measured ~86ms
+    // single-frame spike that could push cumulative frame time toward the
+    // multiplayer snapshot-timeout watchdog (Game.ts, 5s). Spreading any
+    // backlog across a couple of frames instead keeps this bounded - see
+    // the matching obstacle-generation cap in Game.ts for the same fix.
+    // Newly created groups are returned so Game.ts can shader-prewarm just
+    // that group (renderer.compile is a full scene traversal - doing that
+    // for the whole world every time one small chunk is added was itself a
+    // measured ~50-70ms regression, worse than the spike it was meant to
+    // avoid).
+    const newGroups = [];
+    let generatedThisFrame = 0;
+    for (let i = currentChunk - 1; i <= currentChunk + 5 && generatedThisFrame < 2; i++) {
+      if (!this.chunks.has(i)) {
+        const group = this.generateChunk(i);
+        if (group) newGroups.push(group);
+        generatedThisFrame++;
+      }
     }
 
     const t = performance.now() * 0.004;
@@ -275,6 +295,8 @@ export class CourseDecor {
         this.chunks.delete(idx);
       }
     }
+
+    return newGroups;
   }
 
   dispose() {

@@ -7,7 +7,7 @@ import { RemotePlayer } from './RemotePlayer';
 import { GhostPlayer } from './GhostPlayer';
 import { Obstacles } from './Obstacles';
 import { YetiManager } from './Yeti';
-import { GameCamera } from './Camera';
+import { GameCamera, FOV_WIDEN_DEGREES } from './Camera';
 import { SnowParticles } from './Snow';
 import { ForkWindEffect } from './ForkWind';
 import { AvalancheEffect } from './AvalancheEffect';
@@ -39,6 +39,7 @@ import {
   getChainWindowMs,
   getAvalancheZoneAhead,
   getForkZoneAhead,
+  getWindPushAtZ,
   getGameplayObstaclesNear,
   getIceZoneAhead,
   getWeatherAtZ,
@@ -81,8 +82,19 @@ const STORM_WALL_MAX_OPACITY = 0.62;
 // unreachable: the client would otherwise keep predicting from stale state
 // forever and reveal a crash that happened seconds ago. Warn once, then hand
 // the teardown to the controller (same path as a disconnect).
-const SNAPSHOT_WARNING_MS = 2000;
-const SNAPSHOT_TIMEOUT_MS = 5000;
+//
+// Confirmed via the Long Tasks API (see _setupLongTaskObserver) that this
+// client can have entirely legitimate, live-connection runs of ~300-500ms
+// main-thread stalls back to back during heavy sustained load (e.g. boost)
+// - a train of those alone can eat 5s without the connection ever actually
+// breaking. The original 2s/5s thresholds were tuned for a genuinely dead
+// server, not a client that's briefly (if repeatedly) too busy to process
+// what's arriving; they were firing this watchdog - a real, self-inflicted
+// disconnect, `[socket] room:onLeave code=4000 ... intentional=true` - while
+// socket.connected was still true the whole time. Widened so a slow-but-
+// alive stretch survives; a truly dead server still gets caught, just later.
+const SNAPSHOT_WARNING_MS = 4000;
+const SNAPSHOT_TIMEOUT_MS = 10000;
 // Legacy (non-authoritative) multiplayer broadcasts player state at this
 // rate. Was referenced but never defined → `1 / undefined` = NaN, silently
 // disabling the path (minor list).
@@ -171,7 +183,7 @@ export class Game {
       : socketClient;
     this.options = options; // { seed, playerName, roomId, multiplayer }
     this.audio = new AudioManager(); // Initialize audio manager
-    
+
     this._running = false;
     this._lastTime = 0;
     this._hitstopRemaining = 0;
@@ -269,6 +281,31 @@ export class Game {
 
     this._setup();
     this._createNetDebugOverlay();
+    this._setupLongTaskObserver();
+  }
+
+  /** Logs any main-thread block >50ms straight to the console, with exact
+   * duration/timing from the browser's own Long Tasks API - ground truth,
+   * no rAF-gap guessing. Always on (near-zero cost when idle) so a stall
+   * that leads to a snapshot-timeout disconnect (see
+   * _updateSnapshotWatchdog) leaves a trail in the console showing exactly
+   * when and how long the main thread was blocked, without needing to
+   * reproduce it under a manual DevTools recording. */
+  _setupLongTaskObserver() {
+    if (typeof PerformanceObserver === 'undefined') return;
+    try {
+      const observer = new PerformanceObserver(list => {
+        for (const entry of list.getEntries()) {
+          const attribution = entry.attribution?.[0];
+          const where = attribution?.name || attribution?.containerType || '';
+          console.warn(`[longtask] ${entry.duration.toFixed(0)}ms at t=${entry.startTime.toFixed(0)}ms${where ? ` (${where})` : ''}`);
+        }
+      });
+      observer.observe({ entryTypes: ['longtask'] });
+      this._longTaskObserver = observer;
+    } catch {
+      // 'longtask' entryType unsupported in this browser - nothing to do.
+    }
   }
 
   /**
@@ -570,6 +607,15 @@ export class Game {
       this.ui.showTrickFailFeedback(spinDeg);
       this.audio.playCollision(0);
     };
+    this.player.onLandingPrecision = bonus => this.ui.showLandingPrecisionFeedback(bonus);
+    this.player.onAirClear = (bonus, pan = 0) => {
+      this.ui.showAirClearFeedback(bonus);
+      this.audio.playWindGust(pan);
+    };
+    this.player.onAirBoost = () => {
+      this.ui.showAirBoostFeedback();
+      this.audio.playJumpChain();
+    };
     this.player.onUnstuck = () => this.ui.showUnstuckFeedback();
     this.player.onJumpStart = () => this.audio.playJump();
     this.player.onJumpLand = airSeconds => {
@@ -651,14 +697,21 @@ export class Game {
       this._boundRemoteUpdate = data => this._onRemoteUpdate(data);
       this._boundPlayerLeft = data => this._onPlayerLeft(data);
       this._boundRemoteGameOver = data => this._onRemoteGameOver(data);
-      this._boundCombatThrow = data => this._onCombatThrow(data);
       this._boundGameSnapshot = data => this._onGameSnapshot(data);
+      // Incrementally maintains _authConsumedPickupIds (used both to mark
+      // dead obstacles and as the base Set local prediction speculatively
+      // adds to between snapshots) at O(1) per newly-consumed id, fed by
+      // SocketClient's schema SetSchema onAdd callback - see
+      // net/SocketClient.ts's _bindRoom. Never re-derived from a full clone
+      // per tick, which is what avoids re-introducing the earlier
+      // "boost held for a long time causes lag" bug.
+      this._boundPickupAdd = id => this._authConsumedPickupIds.add(id);
 
       this.socket.on('player:update', this._boundRemoteUpdate);
       this.socket.on('player:left', this._boundPlayerLeft);
       this.socket.on('player:gameover', this._boundRemoteGameOver);
-      this.socket.on('combat:throw', this._boundCombatThrow);
       this.socket.on('game:snapshot', this._boundGameSnapshot);
+      this.socket.on('pickup:add', this._boundPickupAdd);
     }
 
     if (this._authoritativeMultiplayer) {
@@ -727,7 +780,56 @@ export class Game {
     this._running = true;
     this._lastTime = performance.now();
     this.ui.showGame({ gameMode: this.gameMode });
+    this._prewarmShaders();
     this._loop(this._lastTime);
+  }
+
+  // Three.js compiles a material's shader program lazily, the first time it
+  // is actually drawn - normally invisible, but the camera widens its FOV
+  // as speed approaches boost (Camera.ts), pulling previously off-screen/
+  // culled geometry into view all at once. The first time a player boosts,
+  // that's a burst of first-ever draws (and therefore compiles) landing in
+  // a single frame, which reads as a real (if one-shot) hitch and an
+  // inflated ping reading right at that moment - not present on later
+  // boosts since everything's already compiled by then. Rendering one throw-
+  // away frame at the fully-widened FOV up front (right as gameplay starts,
+  // before the player can be moving fast enough to notice) forces that
+  // compile burst to happen here instead of mid-boost.
+  _prewarmShaders() {
+    const camera = this.threeCamera;
+    const baseFov = camera.fov;
+    camera.fov = baseFov + FOV_WIDEN_DEGREES;
+    camera.updateProjectionMatrix();
+    this.renderer.compile(this.scene, camera);
+    camera.fov = baseFov;
+    camera.updateProjectionMatrix();
+  }
+
+  // The one-shot prewarm above only covers materials that exist in the
+  // scene at game start (near spawn). Course decor/landmarks/obstacle
+  // chunks generated later, as the player actually skis into new territory,
+  // introduce materials that were never in that pass - their shader compile
+  // cost was landing inside a real render() call instead (measured live:
+  // ~500-800ms single-frame spikes immediately following a chunk
+  // generation, e.g. CourseDecor's per-chunk fence/decor materials).
+  //
+  // First attempt here called renderer.compile(this.scene, camera) on a
+  // timer - that's a full scene-graph traversal every call, and even though
+  // it's a no-op for already-cached materials, walking the WHOLE world
+  // (every obstacle/decor/landmark chunk ever generated) every 0.5s was
+  // itself a measured ~50-70ms regression landing on a steady, predictable
+  // cadence - worse than the spike it replaced, and the direct cause of the
+  // rubberbanding it introduced (a steady drumbeat of hitches disrupting
+  // client-side prediction/reconciliation). Fixed by compiling ONLY the
+  // specific newly-created group right when it's generated (see
+  // _prewarmNewChunkGroups, called from each of the three chunk-generation
+  // call sites below) - proportional to what's actually new (tens of
+  // objects), not the whole accumulated world (thousands).
+  _prewarmNewChunkGroups(groups) {
+    if (!groups) return;
+    for (const group of groups) {
+      if (group) this.renderer.compile(group, this.threeCamera, this.scene);
+    }
   }
 
   pause() {
@@ -834,7 +936,7 @@ export class Game {
    * blends further from toward its own blizzard target that same frame.
    */
   _updateBiomeVisuals(z) {
-    const biome = getBiomeAtZ(z, this._biomeBlend);
+    const biome = getBiomeAtZ(this.seed, z, this._biomeBlend);
 
     // Slow time-of-day drift toward golden hour, layered on top of the
     // biome-resolved colors before anything below reads them - see
@@ -863,7 +965,7 @@ export class Game {
     this.terrain?.setReliefMult?.(biome.terrainReliefMult);
     this.aurora?.setIntensity(biome.auroraIntensity);
     this._biomeReliefMult = biome.terrainReliefMult;
-    this._currentBiome = getDominantBiome(z);
+    this._currentBiome = getDominantBiome(this.seed, z);
   }
 
   /** Purely cosmetic - tweens fog/snow toward the current weather zone's targets. */
@@ -1246,9 +1348,18 @@ export class Game {
     // ramp density boost - safe here because solo caches each chunk forever
     // once generated (see Obstacles.chunks), so this can never retroactively
     // disagree with anything already rendered/collided against.
-    for (let i = currentChunk; i <= currentChunk + 5; i++) {
+    // Capped to 2 new chunks per frame (nearest first, loop order below) - a
+    // sudden speed increase (first boost of a run) can otherwise find several
+    // chunks in the lookahead window still missing all at once, forcing a
+    // burst of real mesh/geometry creation into a single frame. Spreading
+    // any backlog across a couple of frames instead keeps each frame's cost
+    // bounded; the nearest chunk (needed immediately) is always covered.
+    let generatedThisFrame = 0;
+    for (let i = currentChunk; i <= currentChunk + 5 && generatedThisFrame < 2; i++) {
       if (!this.obstacles.chunks.has(i)) {
         this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
+        this._prewarmNewChunkGroups([this.obstacles.chunks.get(i)?.group]);
+        generatedThisFrame++;
       }
     }
 
@@ -1269,7 +1380,8 @@ export class Game {
     this._updateIceZoneVisual(pz);
     this._updateForkZoneVisual(pz);
     const forkSafeLaneSlow = this.player.position.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, pz, 0) !== null;
-    this.player.update(dt, this.input, nearby, this.skillScoring, weather, forkSafeLaneSlow);
+    const windPush = getWindPushAtZ(this.seed, pz);
+    this.player.update(dt, this.input, nearby, this.skillScoring, weather, forkSafeLaneSlow, windPush);
     if (this._ghostRecording) {
       this._ghostRecording.sampleTimer += dt;
       if (this._ghostRecording.sampleTimer >= GHOST_SAMPLE_INTERVAL_S) {
@@ -1316,9 +1428,9 @@ export class Game {
     
     // Update subsystems
     this.terrain.update(pz, this._elapsedSeconds, this.player.position.x);
-    this.obstacles.update(dt, pz, visualGroundY, weather.fogIntensity);
-    this.courseDecor.update(dt, pz, visualGroundY);
-    this.landmarks?.update(dt, pz, visualGroundY);
+    this.obstacles.update(dt, pz, visualGroundY, weather.fogIntensity, this.player.speed);
+    this._prewarmNewChunkGroups(this.courseDecor.update(dt, pz, visualGroundY));
+    this._prewarmNewChunkGroups(this.landmarks?.update(dt, pz, visualGroundY));
     this.yeti.update(
       dt,
       this.player.position,
@@ -1411,6 +1523,7 @@ export class Game {
       brake: this.input.brake || (mouseSpeedFraction !== null && mouseSpeedFraction < 0.42),
       jumpPressed: this.input.jump,
       firePressed: this.input.fire,
+      aimAngle: this._computeSkyMarioAimAngle(),
     };
   }
 
@@ -1432,9 +1545,14 @@ export class Game {
     const focusX = focusState.alive ? focusState.x : focusMesh.position.x;
     const focusZ = focusState.alive ? focusState.z : focusMesh.position.z;
     const currentChunk = Math.floor(focusZ / CHUNK_SIZE);
-    for (let i = currentChunk; i <= currentChunk + 5; i++) {
+    // Capped to 2 new chunks per frame - see the matching comment on the
+    // solo-mode lookahead loop above for why.
+    let generatedThisFrame = 0;
+    for (let i = currentChunk; i <= currentChunk + 5 && generatedThisFrame < 2; i++) {
       if (!this.obstacles.chunks.has(i)) {
         this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
+        this._prewarmNewChunkGroups([this.obstacles.chunks.get(i)?.group]);
+        generatedThisFrame++;
       }
     }
 
@@ -1442,6 +1560,12 @@ export class Game {
     const visualGroundY = this._useHighGraphics
       ? (x, z) => getVisualTerrainY(x, z, focusX, focusZ, this._biomeReliefMult)
       : null;
+    // Runs regardless of spectating/alive state - other players' thrown
+    // projectiles keep flying whether or not the local player is currently
+    // one of the targets, and firePressed itself already rides along on
+    // the normal player:input send above (_buildAuthoritativeInput), so
+    // this only needs to animate whatever's already in flight.
+    this._updateSkyMarioCombat(dt, visualGroundY);
 
     if (focusState.alive) {
       this._authPredictionAccumulator = Math.min(this._authPredictionAccumulator + dt, SIM_DT * 4);
@@ -1500,9 +1624,9 @@ export class Game {
     this._updateForkZoneVisual(focusZ);
 
     this.terrain.update(focusMesh.position.z, this._elapsedSeconds, focusMesh.position.x);
-    this.obstacles.update(dt, focusMesh.position.z, visualGroundY, weather.fogIntensity);
-    this.courseDecor.update(dt, focusMesh.position.z, visualGroundY);
-    this.landmarks?.update(dt, focusMesh.position.z, visualGroundY);
+    this.obstacles.update(dt, focusMesh.position.z, visualGroundY, weather.fogIntensity, focusSpeed);
+    this._prewarmNewChunkGroups(this.courseDecor.update(dt, focusMesh.position.z, visualGroundY));
+    this._prewarmNewChunkGroups(this.landmarks?.update(dt, focusMesh.position.z, visualGroundY));
     this.camera.update(dt, focusMesh, focusSpeed, this._buildCameraEnv(visualGroundY, focusZ));
     this.postFx?.update(focusSpeed);
     this.sky?.update(this.threeCamera.position);
@@ -1568,7 +1692,7 @@ export class Game {
     const forkSafeLaneSlow = state.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, state.z, 0) !== null;
     if (state.alive) this._predictedDeathRevealAt = 0;
     const officiallyAliveBeforePrediction = this._authLocalSnapshotAlive !== false && !this._authLocalDeathHandled;
-    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather, forkSafeLaneSlow);
+    simulatePlayerTick(state, input, SIM_DT, obstacles, consumedPickupIds, performance.now() - this._startTime, this.skillScoring, weather, forkSafeLaneSlow, this.seed);
     if (officiallyAliveBeforePrediction && state.alive === false) {
       // Predicted death: hold the "possibly alive" facade only for a short
       // window (long enough for an in-flight snapshot to override a wrong
@@ -1717,9 +1841,11 @@ export class Game {
     const age = performance.now() - this._authLastSnapshotAt;
     if (age >= SNAPSHOT_TIMEOUT_MS && !this._authSnapshotTimeoutFired) {
       this._authSnapshotTimeoutFired = true;
+      console.warn(`[snapshot-watchdog] TIMEOUT fired - ${age.toFixed(0)}ms since last snapshot (limit ${SNAPSHOT_TIMEOUT_MS}ms), socket.connected=${this.socket?.connected}`);
       this.options.onSnapshotTimeout?.();
     } else if (age >= SNAPSHOT_WARNING_MS && !this._authSnapshotWarningFired) {
       this._authSnapshotWarningFired = true;
+      console.warn(`[snapshot-watchdog] warning - ${age.toFixed(0)}ms since last snapshot (limit ${SNAPSHOT_WARNING_MS}ms), socket.connected=${this.socket?.connected}`);
       this.ui.setError('Connection unstable — waiting for server…');
     }
   }
@@ -1734,15 +1860,10 @@ export class Game {
       this._authLastServerTick = serverTick;
     }
 
-    // Server sends a full resync only right after this client (re)joins;
-    // every other tick it's a delta of newly-consumed ids merged into the
-    // persistent accumulator, so this never re-clones the whole match's
-    // pickup history each snapshot (see AuthoritativeRoomRuntime.emitSnapshot).
-    if (Array.isArray(snapshot.consumedPickupIdsFull)) {
-      this._authConsumedPickupIds = new Set(snapshot.consumedPickupIdsFull);
-    } else if (Array.isArray(snapshot.consumedPickupIdsDelta) && snapshot.consumedPickupIdsDelta.length) {
-      for (const id of snapshot.consumedPickupIdsDelta) this._authConsumedPickupIds.add(id);
-    }
+    // _authConsumedPickupIds is kept up to date incrementally by the
+    // 'pickup:add' listener registered in start() (fed by the schema
+    // SetSchema's onAdd callback in SocketClient.ts) - nothing to merge
+    // here, it's already current by the time any snapshot arrives.
     const serverConsumedPickupIds = this._authConsumedPickupIds;
     for (const obs of this.obstacles.active) {
       if (serverConsumedPickupIds.has(obs.id)) {
@@ -1820,6 +1941,26 @@ export class Game {
     }
 
     for (const event of snapshot.events || []) {
+      if (event.type === 'combat-throw') {
+        // Spawned for whoever threw it, local or remote alike - unlike
+        // every other event type here, this isn't feedback about something
+        // that already happened, it's the sole authoritative source of the
+        // projectile itself (see shared/AuthoritativeSim.ts's comment on
+        // the combat-throw event fields). Hit/damage resolution is separate
+        // and arrives later as an ordinary 'hit'/'death' event once the
+        // server's own copy of the projectile actually connects.
+        this._spawnProjectile({
+          ownerId: event.socketId,
+          x: Number(event.x) || 0,
+          y: Number(event.y) || 0.8,
+          z: Number(event.z) || 0,
+          vx: Number(event.vx) || 0,
+          vy: Number(event.vy) || 0,
+          vz: Number(event.vz) || PROJECTILE_SPEED,
+          remote: event.socketId !== localId,
+        });
+        continue;
+      }
       if (event.socketId !== localId) {
         this._applyRemotePlayerEventFeedback(event);
         continue;
@@ -1884,6 +2025,14 @@ export class Game {
       } else if (event.type === 'trick-fail') {
         this.ui.showTrickFailFeedback(event.spinDeg ?? 0);
         this.audio.playCollision(0);
+      } else if (event.type === 'landing-precision') {
+        this.ui.showLandingPrecisionFeedback(event.bonus ?? 0);
+      } else if (event.type === 'air-clear') {
+        this.ui.showAirClearFeedback(event.bonus ?? 0);
+        this.audio.playWindGust(this._panForObstacleId(event.obstacleId));
+      } else if (event.type === 'air-boost') {
+        this.ui.showAirBoostFeedback();
+        this.audio.playJumpChain();
       } else if (event.type === 'avalanche-warning') {
         this.audio.playDistantRumble(0);
       } else if (event.type === 'avalanche-capture') {
@@ -1942,9 +2091,9 @@ export class Game {
         life: 0.4,
         groundY: pos.y,
       });
-    } else if (event.type === 'near-miss') {
+    } else if (event.type === 'near-miss' || event.type === 'air-clear') {
       this.audio.playNearMiss(pan);
-    } else if (event.type === 'jump-chain' || event.type === 'trick' || event.type === 'avalanche-outrun' || event.type === 'fork-bold-line') {
+    } else if (event.type === 'jump-chain' || event.type === 'trick' || event.type === 'avalanche-outrun' || event.type === 'fork-bold-line' || event.type === 'air-boost') {
       this.audio.playJumpChain();
     } else if (event.type === 'jump') {
       this.audio.playJump();
@@ -2047,15 +2196,20 @@ export class Game {
     const focusZ = focusMesh.position.z;
     const focusX = focusMesh.position.x;
     const currentChunk = Math.floor(focusZ / CHUNK_SIZE);
-    for (let i = currentChunk; i <= currentChunk + 5; i++) {
+    // Capped to 2 new chunks per frame - see the matching comment on the
+    // solo-mode lookahead loop earlier in this file for why.
+    let generatedThisFrame = 0;
+    for (let i = currentChunk; i <= currentChunk + 5 && generatedThisFrame < 2; i++) {
       if (!this.obstacles.chunks.has(i)) {
         this.obstacles.generateChunk(i, new SeededRandom(this.seed + i * 7919));
+        this._prewarmNewChunkGroups([this.obstacles.chunks.get(i)?.group]);
+        generatedThisFrame++;
       }
     }
 
     this.terrain.update(focusZ, this._elapsedSeconds, focusX);
-    this.obstacles.update(dt, focusZ, visualGroundY);
-    this.courseDecor.update(dt, focusZ, visualGroundY);
+    this.obstacles.update(dt, focusZ, visualGroundY, 0, focusSpeed);
+    this._prewarmNewChunkGroups(this.courseDecor.update(dt, focusZ, visualGroundY));
     this.camera.update(dt, focusMesh, focusSpeed, this._buildCameraEnv(visualGroundY, focusZ));
     this.sky?.update(this.threeCamera.position);
     this.mountains?.update(this.threeCamera.position);
@@ -2169,40 +2323,59 @@ export class Game {
     }
   }
 
-  _onCombatThrow(data) {
-    if (this.gameMode !== 'sky_mario') return;
-    if (data.ownerId === this.socket?.id) return;
-    this._spawnProjectile({
-      ownerId: data.ownerId,
-      x: Number(data.x) || 0,
-      y: Number(data.y) || 0.8,
-      z: Number(data.z) || 0,
-      vx: Number(data.vx) || 0,
-      vy: Number(data.vy) || 0,
-      vz: Number(data.vz) || PROJECTILE_SPEED,
-      remote: true,
-    });
-  }
-
+  // Solo-only trigger path: reads local input directly and spawns
+  // immediately, same as it always has. In authoritative multiplayer,
+  // firePressed already rides along on the normal player:input message
+  // (see the outgoing input payload below) and the server is the sole
+  // source of the actual throw (see the combat-throw handling in
+  // _onGameSnapshot's event loop) - triggering locally here too would
+  // double-spawn a projectile for the thrower's own throw.
   _updateSkyMarioCombat(dt, groundYAt = null) {
     if (this.gameMode !== 'sky_mario') return;
-    this._throwCooldown = Math.max(0, this._throwCooldown - dt);
-    const firePressed = this.input.fire;
-    if (firePressed && !this._fireHeld && this._throwCooldown <= 0) {
-      this._throwCooldown = SKY_MARIO_THROW_COOLDOWN;
-      this._throwProjectile();
+    if (!this.options.multiplayer) {
+      this._throwCooldown = Math.max(0, this._throwCooldown - dt);
+      const firePressed = this.input.fire;
+      if (firePressed && !this._fireHeld && this._throwCooldown <= 0) {
+        this._throwCooldown = SKY_MARIO_THROW_COOLDOWN;
+        this._throwProjectile();
+      }
+      this._fireHeld = firePressed;
     }
-    this._fireHeld = firePressed;
     this._updateProjectiles(dt, groundYAt);
   }
 
+  // Points from the player straight at the mouse cursor's target on the
+  // ground, entirely independent of player.angle/steering - see
+  // ControlInput.aimAngle's comment. Raycasts the cursor's NDC position
+  // (this.input.mouse.x/y, already tracked regardless of controlMode)
+  // through the current camera onto a horizontal plane at the player's own
+  // height, then returns the angle from the player to that point using the
+  // same sin=x/cos=z convention as state.angle. Returns null if the ray
+  // doesn't hit anything in front of the camera (e.g. cursor near the top
+  // of the screen, pointed at the sky) - callers fall back to the current
+  // heading in that case.
+  _computeSkyMarioAimAngle() {
+    if (this.gameMode !== 'sky_mario') return null;
+    if (!this._aimRaycaster) this._aimRaycaster = new THREE.Raycaster();
+    this._aimRaycaster.setFromCamera({ x: this.input.mouse.x, y: this.input.mouse.y }, this.threeCamera);
+    const ray = this._aimRaycaster.ray;
+    if (Math.abs(ray.direction.y) < 1e-5) return null;
+    const planeY = this.player.position.y;
+    const t = (planeY - ray.origin.y) / ray.direction.y;
+    if (t <= 0) return null;
+    const dx = (ray.origin.x + ray.direction.x * t) - this.player.position.x;
+    const dz = (ray.origin.z + ray.direction.z * t) - this.player.position.z;
+    if (Math.abs(dx) < 1e-4 && Math.abs(dz) < 1e-4) return null;
+    return Math.atan2(dx, dz);
+  }
+
   _throwProjectile() {
-    const angle = this.player.angle;
+    const angle = this._computeSkyMarioAimAngle() ?? this.player.angle;
     const launchSpeed = PROJECTILE_SPEED + this.player.speed * 0.22;
     const vx = Math.sin(angle) * launchSpeed;
     const vz = Math.cos(angle) * launchSpeed;
-    const projectile = {
-      ownerId: this.socket?.id || 'local',
+    this._spawnProjectile({
+      ownerId: 'local',
       x: this.player.position.x + Math.sin(angle) * 0.65,
       y: this.player.position.y + 0.82,
       z: this.player.position.z + Math.cos(angle) * 1.0,
@@ -2210,11 +2383,7 @@ export class Game {
       vy: 1.2,
       vz,
       remote: false,
-    };
-    this._spawnProjectile(projectile);
-    if (this.socket && this.options.multiplayer) {
-      this.socket.sendCombatThrow(projectile);
-    }
+    });
   }
 
   _spawnProjectile(data) {
@@ -2255,7 +2424,15 @@ export class Game {
       p.mesh.rotation.x += dt * 8;
       p.mesh.rotation.z += dt * 5;
 
-      if (p.ownerId !== 'local' && p.ownerId !== this.socket?.id && this.player.isAlive) {
+      // Solo-only: in authoritative multiplayer the server runs its own
+      // parallel copy of every projectile (see shared/AuthoritativeSim.ts's
+      // simulateProjectilesTick) and is the sole source of truth for HP -
+      // deducting it here too from this purely cosmetic client-side copy
+      // would double up (a locally-applied hit, then the real 'hit' event
+      // arriving moments later) and get silently overwritten by the next
+      // snapshot regardless. The local ball still flies past visually; only
+      // solo needs a client-detected hit at all, since it has no server.
+      if (!this.options.multiplayer && p.ownerId !== 'local' && this.player.isAlive) {
         const dx = Math.abs(this.player.position.x - p.x);
         const dz = Math.abs(this.player.position.z - p.z);
         const dy = Math.abs((this.player.position.y + 0.65) - p.y);
@@ -2386,6 +2563,7 @@ export class Game {
   destroy() {
     this._running = false;
     if (this._animFrame) cancelAnimationFrame(this._animFrame);
+    this._longTaskObserver?.disconnect();
     window.removeEventListener('keydown', this._boundDevModeKeydown);
     this._destroyDevOverlay();
     this._destroyDevHitboxGroup();
@@ -2421,8 +2599,8 @@ export class Game {
       this.socket.off('player:update', this._boundRemoteUpdate);
       this.socket.off('player:left', this._boundPlayerLeft);
       this.socket.off('player:gameover', this._boundRemoteGameOver);
-      this.socket.off('combat:throw', this._boundCombatThrow);
       this.socket.off('game:snapshot', this._boundGameSnapshot);
+      this.socket.off('pickup:add', this._boundPickupAdd);
     }
   }
 }

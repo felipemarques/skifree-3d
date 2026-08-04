@@ -151,6 +151,9 @@ export interface UiAdapter {
   showUnstuckFeedback(): void;
   showTrickFeedback(bonus?: number, spinDeg?: number): void;
   showTrickFailFeedback(spinDeg?: number): void;
+  showLandingPrecisionFeedback(bonus?: number): void;
+  showAirClearFeedback(bonus?: number): void;
+  showAirBoostFeedback(): void;
   showAvalancheOutrunFeedback(): void;
   showForkBoldLineFeedback(): void;
   setError(message: string): void;
@@ -164,6 +167,7 @@ export interface BonusPopup {
   text: string;
   tone: 'positive' | 'negative' | 'neutral';
   x: number;
+  y: number;
 }
 
 export interface UiStoreState {

@@ -6,7 +6,14 @@ export const MAX_HP = 3;
 export const BASE_SPEED = 14;
 export const BOOST_SPEED = 28;
 export const MIN_SPEED = BASE_SPEED * 0.22;
+// Manual jumps now scale mildly with approach speed too (same lerp/
+// smoothstep shape ramps already used) - a smaller range than ramps since
+// a manual jump should stay the "safe, predictable" option, but boosting
+// into one should still visibly pay off rather than always launching
+// identically regardless of speed.
 export const MANUAL_JUMP_VELOCITY = 7.2;
+export const MANUAL_JUMP_MIN_VELOCITY = 6.0;
+export const MANUAL_JUMP_MAX_VELOCITY = 8.4;
 export const RAMP_JUMP_MIN_VELOCITY = 4.8;
 export const RAMP_JUMP_MAX_VELOCITY = 9.6;
 export const GRAVITY = 18;
@@ -14,6 +21,21 @@ export const PLAYER_TURN_RATE = 1.8;
 export const PLAYER_MAX_TURN_ANGLE = Math.PI * 0.42;
 export const INVINCIBILITY_TIME = 1.8;
 export const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
+// Sky Mario combat - mirrors client/src/game/Game.ts's own projectile
+// constants exactly (PROJECTILE_SPEED/PROJECTILE_LIFETIME/
+// SKY_MARIO_THROW_COOLDOWN, and the gravity/bounce/hitbox numbers inside
+// _updateProjectiles) so the server's authoritative hit detection lands on
+// the same trajectory the client is already rendering, not a diverging one.
+export const SKY_MARIO_THROW_COOLDOWN = 0.75;
+export const PROJECTILE_SPEED = 34;
+export const PROJECTILE_LIFETIME = 2.4;
+const PROJECTILE_GRAVITY = 7.5;
+const PROJECTILE_GROUND_CLEARANCE = 0.18;
+const PROJECTILE_BOUNCE_MULT = 0.28;
+const PROJECTILE_HIT_HALF_X = 0.65;
+const PROJECTILE_HIT_HALF_Z = 0.9;
+const PROJECTILE_HIT_HALF_Y = 1.0;
+const PROJECTILE_TARGET_Y_OFFSET = 0.65;
 // Anti-softlock: "stuck" means actual forward progress is far below what
 // the player's own current speed/heading implies (i.e. something is
 // physically blocking them - wedged against obstacles), not just moving
@@ -163,6 +185,14 @@ export interface ControlInput {
   brake: boolean;
   jumpPressed: boolean;
   firePressed?: boolean;
+  // Sky Mario combat - absolute world-space throw angle (same sin/cos
+  // convention as state.angle: x = sin, z = cos), computed client-side by
+  // raycasting the mouse cursor onto the ground and pointing from the
+  // player toward that point - entirely independent of state.angle/
+  // lateralAxis/steering (see Game.ts's _computeSkyMarioAimAngle). null
+  // means no aim override is available this tick (e.g. the raycast missed
+  // the ground plane); the throw then falls back to state.angle.
+  aimAngle?: number | null;
 }
 
 export const MAX_BUFFERED_INPUTS = 120;
@@ -278,6 +308,9 @@ export interface PlayerSimState {
   airVelocityZ: number;
   airTime: number;
   jumpHeld: boolean;
+  // Sky Mario combat - see SKY_MARIO_THROW_COOLDOWN's comment.
+  fireHeld: boolean;
+  throwCooldownRemaining: number;
   invincibilityRemaining: number;
   distance: number;
   bonusDistance: number;
@@ -307,11 +340,20 @@ export interface PlayerSimState {
   // exact tick of the hit, so without this an obstacle you just crashed
   // into can still pay out a "near miss" once you clear it.
   hitObstacleHistory: Set<string>;
+  // Same lifetime-of-run dedupe as hitObstacleHistory above, but for the
+  // air-clear bonus (see AIR_CLEAR_TYPES) - an obstacle already rewarded
+  // for a direct mid-air overflight shouldn't pay out again if its z keeps
+  // re-qualifying across ticks near the crossing boundary.
+  airClearHistory: Set<string>;
+  // One-shot mid-air resource, refreshed every triggerJump - see
+  // AIR_BOOST_VELOCITY_Y's comment.
+  airBoostAvailable: boolean;
 }
 
 export interface SimEvent {
   type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck'
-    | 'avalanche-warning' | 'avalanche-capture' | 'avalanche-outrun' | 'trick' | 'trick-fail' | 'fork-bold-line';
+    | 'avalanche-warning' | 'avalanche-capture' | 'avalanche-outrun' | 'trick' | 'trick-fail' | 'fork-bold-line'
+    | 'landing-precision' | 'air-clear' | 'air-boost' | 'combat-throw';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -322,6 +364,17 @@ export interface SimEvent {
   chainCount?: number;
   bonus?: number;
   spinDeg?: number;
+  // combat-throw only - spawn parameters for the client's own cosmetic
+  // projectile physics/rendering (see PostFX-adjacent client code in
+  // Game.ts's _spawnProjectile). Hit detection itself is authoritative
+  // (see simulateProjectilesTick) and reports back as ordinary 'hit'/
+  // 'death' events, so this is purely visual spawn data.
+  x?: number;
+  y?: number;
+  z?: number;
+  vx?: number;
+  vy?: number;
+  vz?: number;
 }
 
 export interface RoomSnapshotPlayer {
@@ -682,19 +735,88 @@ export function maybeApplyForkBonus(state: PlayerSimState, seed: number, events:
   if (state.x > FORK_LANE_GAP) state.forkZoneRiskyTicks += 1;
 }
 
-// Same z-threshold table client/src/game/Biome.ts's getDominantBiome uses
-// for its (purely cosmetic) palette switch - defined here as the single
-// source of truth since obstacle generation below needs it too and must
-// stay deterministic/shared. Biome.ts's getDominantBiome is now a thin
-// wrapper over this export instead of duplicating the thresholds.
-export type BiomeKind = 'forest' | 'alpine' | 'cliffs' | 'glacier';
-const BIOME_DOMINANT_THRESHOLDS: [number, BiomeKind][] = [[1350, 'forest'], [3150, 'alpine'], [5350, 'cliffs']];
+// Biome progression: forest is always the starting/tutorial zone (zone 0);
+// the remaining three biomes are then visited in a seed-shuffled order,
+// reshuffled every full cycle (one pass through BIOME_CYCLE_POOL), instead
+// of the old fixed
+// forest -> alpine -> cliffs -> glacier sequence. That fixed order let
+// players (and enemies of "fun") memorize exactly when the next set-piece/
+// hazard-mix was coming; shuffling per seed (and per cycle, for runs long
+// enough to loop back around) keeps it unpredictable while staying fully
+// deterministic - same seed always produces the same order, which the
+// authoritative multiplayer sim and every client need.
+// Defined here as the single source of truth since obstacle generation
+// below needs it too and must stay deterministic/shared. client/src/game/
+// Biome.ts's palette blend reuses getBiomeZoneBlend below instead of
+// duplicating this zoning.
+export type BiomeKind = 'forest' | 'alpine' | 'cliffs' | 'glacier' | 'windswept' | 'deadwood';
+const BIOME_ZONE_CORE_LENGTH = 1500;
+const BIOME_ZONE_TRANSITION_LENGTH = 300;
+const BIOME_ZONE_PERIOD = BIOME_ZONE_CORE_LENGTH + BIOME_ZONE_TRANSITION_LENGTH;
+const BIOME_CYCLE_POOL: BiomeKind[] = ['alpine', 'cliffs', 'glacier', 'windswept', 'deadwood'];
 
-export function getBiomeKindAtZ(z: number): BiomeKind {
-  for (const [upTo, name] of BIOME_DOMINANT_THRESHOLDS) {
-    if (z < upTo) return name;
+function shuffledBiomeCycle(seed: number, cycleIndex: number): BiomeKind[] {
+  const pool = [...BIOME_CYCLE_POOL];
+  const rng = new SimRandom((seed + cycleIndex * 104729 + 17) >>> 0);
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(rng.next() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
   }
-  return 'glacier';
+  return pool;
+}
+
+function biomeAtZoneIndex(seed: number, zoneIndex: number): BiomeKind {
+  if (zoneIndex <= 0) return 'forest';
+  const idx = zoneIndex - 1;
+  const cycleIndex = Math.floor(idx / BIOME_CYCLE_POOL.length);
+  const posInCycle = idx % BIOME_CYCLE_POOL.length;
+  return shuffledBiomeCycle(seed, cycleIndex)[posInCycle];
+}
+
+export function getBiomeKindAtZ(seed: number, z: number): BiomeKind {
+  const zoneIndex = Math.floor(Math.max(0, z) / BIOME_ZONE_PERIOD);
+  const zoneStart = zoneIndex * BIOME_ZONE_PERIOD;
+  // Switches at the transition band's midpoint, matching the "dominant"
+  // read of the old fixed-threshold table (which switched partway through
+  // the old STOPS blend band rather than at either endpoint).
+  const dominantSwitch = zoneStart + BIOME_ZONE_CORE_LENGTH + BIOME_ZONE_TRANSITION_LENGTH / 2;
+  return z < dominantSwitch ? biomeAtZoneIndex(seed, zoneIndex) : biomeAtZoneIndex(seed, zoneIndex + 1);
+}
+
+// Exposed for Biome.ts's cosmetic palette blend, which needs the same
+// zoning/order plus the transition progress `t` and both endpoint biomes to
+// interpolate palettes across - kept here so the two never drift apart.
+export function getBiomeZoneBlend(seed: number, z: number): { a: BiomeKind; b: BiomeKind; t: number } {
+  const zoneIndex = Math.floor(Math.max(0, z) / BIOME_ZONE_PERIOD);
+  const zoneStart = zoneIndex * BIOME_ZONE_PERIOD;
+  const coreEnd = zoneStart + BIOME_ZONE_CORE_LENGTH;
+  const a = biomeAtZoneIndex(seed, zoneIndex);
+  const b = biomeAtZoneIndex(seed, zoneIndex + 1);
+  const t = z <= coreEnd ? 0 : clamp((z - coreEnd) / BIOME_ZONE_TRANSITION_LENGTH, 0, 1);
+  return { a, b, t };
+}
+
+// Windswept ridge's signature danger: a real lateral force (not just a
+// speed/steering multiplier like weather's grip) that pushes the grounded
+// player sideways, deterministically as a function of z alone (never wall
+// clock time, so it stays bit-identical for client prediction/replay and
+// the authoritative server). Strength fades in/out across the biome's own
+// transition band via getBiomeZoneBlend, and each zone gets its own seeded
+// gust direction so it's not just "wind always blows right" - the whole
+// point is punishing complacent steering with something other players
+// can't out-jump or dodge, the way every other biome's danger works today.
+const WIND_PUSH_STRENGTH = 5.5;
+const WIND_GUST_WAVELENGTH = 55;
+
+export function getWindPushAtZ(seed: number, z: number): number {
+  const { a, b, t } = getBiomeZoneBlend(seed, z);
+  const strengthA = a === 'windswept' ? 1 : 0;
+  const strengthB = b === 'windswept' ? 1 : 0;
+  const strength = lerp(strengthA, strengthB, t) * WIND_PUSH_STRENGTH;
+  if (strength <= 0) return 0;
+  const zoneIndex = Math.floor(Math.max(0, z) / BIOME_ZONE_PERIOD);
+  const dir = new SimRandom((seed + zoneIndex * 55411 + 3) >>> 0).next() < 0.5 ? -1 : 1;
+  return dir * strength * Math.sin(z / WIND_GUST_WAVELENGTH);
 }
 
 // Per-biome static-hazard type mix (tree/fallen_tree/rock/stump weights,
@@ -704,11 +826,18 @@ export function getBiomeKindAtZ(z: number): BiomeKind {
 // biome's real distinguishing feature is its set-piece (see below), not
 // its baseline mix. Glacier is almost bare rock/ice (barely any trees at
 // all) - its own distinguishing feature is the crevasse-field set-piece.
+// Windswept is a bare, above-treeline ridge (even sparser trees than
+// alpine, mostly rock/stump) - its distinguishing feature is the crosswind
+// (see getWindPushAtZ) rather than its density. Deadwood is a burnt/dead
+// forest - tree-dense like forest but weighted hard toward fallen_tree,
+// reading as dense clutter rather than a healthy treeline.
 const BIOME_OBSTACLE_MIX: Record<BiomeKind, { tree: number; fallen_tree: number; rock: number; stump: number }> = {
   forest: { tree: 0.44, fallen_tree: 0.18, rock: 0.18, stump: 0.20 },
   alpine: { tree: 0.12, fallen_tree: 0.10, rock: 0.50, stump: 0.28 },
   cliffs: { tree: 0.18, fallen_tree: 0.12, rock: 0.45, stump: 0.25 },
   glacier: { tree: 0.03, fallen_tree: 0.05, rock: 0.58, stump: 0.34 },
+  windswept: { tree: 0.08, fallen_tree: 0.12, rock: 0.46, stump: 0.34 },
+  deadwood: { tree: 0.28, fallen_tree: 0.44, rock: 0.10, stump: 0.18 },
 };
 
 function pickBiomeObstacleType(mix: { tree: number; fallen_tree: number; rock: number; stump: number }, roll: number): ObstacleType {
@@ -742,6 +871,18 @@ function isBiomeSetPieceZone(seed: number, chunkIndex: number): boolean {
   return roll < BIOME_SETPIECE_ROLL_CHANCE;
 }
 
+// Glacier's own extra, independent (per-chunk, not per-set-piece-zone) low
+// chance of a rockfall cluster - distinct seed multiplier so it doesn't
+// correlate with isBiomeSetPieceZone's own roll, and low enough that it
+// reads as an occasional extra danger layered on an already rock-dense
+// biome, not a rework of its crevasse-field identity.
+const GLACIER_ROCKFALL_ROLL_CHANCE = 0.15;
+
+function isGlacierRockfallChunk(seed: number, chunkIndex: number): boolean {
+  const roll = new SimRandom((seed + chunkIndex * 88651) >>> 0).next();
+  return roll < GLACIER_ROCKFALL_ROLL_CHANCE;
+}
+
 export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false) {
   const rng = new SimRandom((seed + chunkIndex * 7919) >>> 0);
   const zBase = chunkIndex * CHUNK_SIZE;
@@ -754,7 +895,7 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   const hazardVolume = getRampedHazardVolume(volume, chunkIndex, difficultyRamp);
   const rampVolume = getRampedRampVolume(volume, chunkIndex, difficultyRamp);
 
-  const biome = getBiomeKindAtZ(zBase);
+  const biome = getBiomeKindAtZ(seed, zBase);
   const obstacleMix = BIOME_OBSTACLE_MIX[biome];
   const setPiece = isBiomeSetPieceZone(seed, chunkIndex);
   // Cliffs' set-piece is a "frozen lake crossing" - sparse, high-speed,
@@ -763,13 +904,26 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
   // through extra holes/ramps rather than static obstacles, so its own
   // baseline density is toned down to match, not stacked on top.
   const isCrevasseField = setPiece && biome === 'glacier';
-  // Cliffs' own set-piece flavor: a couple of tight rock clusters (tagged
-  // `subtype: 'rockfall'` purely for the client's shadow/drop telegraph)
-  // instead of the frozen-lake sparse breather stacking with anything else -
-  // reads as "danger from above" rather than raising ambient density.
-  const isRockfallField = setPiece && biome === 'cliffs';
+  // Cliffs' and alpine's own set-piece flavor: a couple of tight rock
+  // clusters (tagged `subtype: 'rockfall'` purely for the client's
+  // shadow/drop telegraph) instead of the frozen-lake sparse breather /
+  // edge-squeeze stacking with anything else - reads as "danger from above"
+  // rather than raising ambient density. Glacier also gets an independent,
+  // rarer rockfall roll below (isGlacierRockfallChunk) so it can layer on
+  // top of its own crevasse-field set-piece without double-booking a zone.
+  const isRockfallField = setPiece && (biome === 'cliffs' || biome === 'alpine');
+  const isGlacierRockfall = !isCrevasseField && biome === 'glacier' && isGlacierRockfallChunk(seed, chunkIndex);
+  // Forest's (and any other non-rockfall/non-glacier) set-piece flavor: on
+  // top of the existing edge-band scatter below, a physical chokepoint gate
+  // - fence-post/rock walls funneling from both edges down to one narrow
+  // gap partway through the zone. Every other set-piece danger here is
+  // purely reactive (dodge what's in front of you); this is the one hazard
+  // that punishes *commitment* - the gap is narrow enough that a player has
+  // to line up on it well before arriving, so taking the approach at full
+  // speed leaves no room left to correct a bad line.
+  const isChokepoint = setPiece && !isRockfallField && biome !== 'glacier';
   const setPieceHazardVolume = setPiece
-    ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
+    ? (isRockfallField ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
     : hazardVolume;
   // Fork zones take precedence over the biome set-piece edge-banding when
   // both happen to land on the same chunk - the lane split is the more
@@ -824,7 +978,7 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
       // TRACK_LIMIT or the player's own position clamp (the physical width
       // stays constant everywhere on purpose - see the biome plan's explicit
       // scope note on why).
-      const xRange: [number, number] = (setPiece && biome !== 'cliffs' && biome !== 'glacier')
+      const xRange: [number, number] = isChokepoint
         ? (i % 2 === 0 ? [-TRACK_LIMIT, -BIOME_SETPIECE_EDGE_BAND] : [BIOME_SETPIECE_EDGE_BAND, TRACK_LIMIT])
         : [-TRACK_LIMIT, TRACK_LIMIT];
       trySpawn(type, xRange, [8, CHUNK_SIZE - 8]);
@@ -847,10 +1001,11 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
         trySpawn('ramp', lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
       }
     }
-    // Cliffs' "rockfall" set-piece: 2-3 tight clusters of extra rocks (1-2
-    // each) instead of scattering them evenly across the chunk, so they read
-    // as falling from a specific overhang rather than generic clutter.
-    if (isRockfallField) {
+    // Cliffs'/alpine's "rockfall" set-piece (plus glacier's independent
+    // extra roll): 2-3 tight clusters of extra rocks (1-2 each) instead of
+    // scattering them evenly across the chunk, so they read as falling from
+    // a specific overhang rather than generic clutter.
+    if (isRockfallField || isGlacierRockfall) {
       const clusterCount = 2 + (rng.next() < 0.5 ? 1 : 0);
       for (let c = 0; c < clusterCount; c++) {
         const clusterX = rng.range(-TRACK_LIMIT + 6, TRACK_LIMIT - 6);
@@ -863,6 +1018,27 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
             [clusterZ - 3, clusterZ + 3],
             { attempts: 10, padding: 0.6, subtype: 'rockfall' },
           );
+        }
+      }
+    }
+
+    // Chokepoint gate: two gap-marker rocks plus a short run of funnel posts
+    // per side, stepping the safe x-band in from near TRACK_LIMIT down to
+    // the gap at gateZ. Tight xRange/zRange windows (matching the rockfall
+    // cluster's own `[x-3, x+3]` technique above) place each post close to
+    // its intended spot rather than scattering it across the chunk.
+    if (isChokepoint) {
+      const gateZ = rng.range(CHUNK_SIZE * 0.45, CHUNK_SIZE * 0.62);
+      const gapHalf = 8;
+      const funnelPosts = 3;
+      for (const side of [-1, 1] as const) {
+        trySpawn('rock', [side * gapHalf - 1, side * gapHalf + 1], [gateZ - 1, gateZ + 1], { attempts: 14, padding: 0.5, subtype: 'chokepoint' });
+        for (let p = 1; p <= funnelPosts; p++) {
+          const t = p / (funnelPosts + 1);
+          const fx = side * (TRACK_LIMIT - 6 - t * (TRACK_LIMIT - 6 - gapHalf));
+          const fz = gateZ - 5 - p * 5;
+          if (fz < 6) continue;
+          trySpawn('stump', [fx - 1.2, fx + 1.2], [fz - 1.2, fz + 1.2], { attempts: 10, padding: 0.5, subtype: 'chokepoint' });
         }
       }
     }
@@ -953,6 +1129,8 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     airVelocityZ: 0,
     airTime: 0,
     jumpHeld: false,
+    fireHeld: false,
+    throwCooldownRemaining: 0,
     invincibilityRemaining: MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS,
     distance: 0,
     bonusDistance: 0,
@@ -970,6 +1148,8 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     trickSpinRad: 0,
     stuckTimer: 0,
     hitObstacleHistory: new Set(),
+    airClearHistory: new Set(),
+    airBoostAvailable: false,
   };
 }
 
@@ -982,6 +1162,7 @@ export function sanitizeControlInput(input: Partial<ControlInput> = {}): Control
     brake: !!input.brake,
     jumpPressed: !!input.jumpPressed,
     firePressed: !!input.firePressed,
+    aimAngle: Number.isFinite(input.aimAngle) ? Number(input.aimAngle) : null,
   };
 }
 
@@ -994,7 +1175,16 @@ function triggerJump(state: PlayerSimState, force = MANUAL_JUMP_VELOCITY, source
   state.trickSpinRad = 0;
   state.airVelocityX = Math.sin(state.angle) * state.speed;
   state.airVelocityZ = Math.cos(state.angle) * state.speed;
+  // Every jump - manual or ramp - refreshes the one-shot air-boost charge
+  // (see AIR_BOOST_VELOCITY_Y). It's per-jump, not a regenerating resource:
+  // spend it mid-air for a second-wind height kick, or lose it on landing.
+  state.airBoostAvailable = true;
   return true;
+}
+
+function getManualJumpVelocity(speed: number) {
+  const t = clamp((speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
+  return lerp(MANUAL_JUMP_MIN_VELOCITY, MANUAL_JUMP_MAX_VELOCITY, smoothstep(t));
 }
 
 function getRampJumpVelocity(speed: number) {
@@ -1002,7 +1192,39 @@ function getRampJumpVelocity(speed: number) {
   return lerp(RAMP_JUMP_MIN_VELOCITY, RAMP_JUMP_MAX_VELOCITY, smoothstep(t));
 }
 
-function damagePlayer(state: PlayerSimState, obstacle: ObstacleRecord, impactSpeed: number, events: SimEvent[]) {
+// Double-jump-style resource: while airborne, a second jumpPressed edge
+// spends the current jump's one-shot airBoostAvailable charge for a
+// second-wind upward kick (smaller than any real jump launch) instead of
+// doing nothing the way holding/mashing jump mid-air always has. Gives
+// players a limited, deliberate way to extend/save a jump instead of it
+// being purely a function of takeoff speed.
+const AIR_BOOST_VELOCITY_Y = 4.5;
+
+// Airborne obstacle interaction: obstacles that are otherwise entirely
+// ignored while airborne (see the isAirborne-continue branch further down)
+// now pay a bonus for a direct mid-air overflight - literally jumping the
+// gap over/between hazards rather than just avoiding them, distinct from
+// the ground-level near-miss's "close graze" reward.
+const AIR_CLEAR_TYPES = new Set<ObstacleType>(['tree', 'rock', 'stump', 'fallen_tree']);
+const AIR_CLEAR_MIN_BONUS = 0.8;
+const AIR_CLEAR_MAX_BONUS = 2.6;
+const AIR_CLEAR_HEIGHT_FOR_MAX = 1.6;
+
+// Landing precision: a bonus on top of a trick attempt for keeping the
+// steering angle tight (small state.angle) while spinning, rather than a
+// standalone reward. state.angle is frozen for the whole flight (it's only
+// updated while grounded - see the steer branch above), so it's really the
+// *takeoff* angle, not something that changes mid-air; scoring it on its
+// own would just reward jumping while going perfectly straight, which is
+// the default idle state, not a skill. Gating on the same trick-attempt
+// deadzone as trick scoring means this only ever pays out alongside an
+// actual deliberate spin attempt (successful or not).
+const LANDING_PRECISION_MAX_ANGLE_DEG = 26;
+const LANDING_PRECISION_MIN_AIRTIME = 0.18;
+const LANDING_PRECISION_MAX_BONUS = 2.2;
+const LANDING_PRECISION_AIRTIME_FOR_MAX = 0.9;
+
+function damagePlayer(state: PlayerSimState, obstacle: { id: string; type: string }, impactSpeed: number, events: SimEvent[]) {
   if (state.invincibilityRemaining > 0 || !state.alive) return;
   state.hp = Math.max(0, state.hp - 1);
   state.chainCount = 0;
@@ -1023,7 +1245,9 @@ function damagePlayer(state: PlayerSimState, obstacle: ObstacleRecord, impactSpe
       ? 'hole'
       : obstacle.type === 'tree'
         ? 'tree'
-        : 'tumble';
+        : obstacle.type === 'sky_mario_projectile'
+          ? 'skier'
+          : 'tumble';
     events.push({ ...baseEvent, type: 'death', kind: state.deathKind });
   } else {
     state.invincibilityRemaining = INVINCIBILITY_TIME;
@@ -1045,6 +1269,61 @@ export function getChainWindowMs(momentum: number): number {
   return JUMP_CHAIN_WINDOW_MS * (1 + clamp(momentum, 0, 1) * JUMP_CHAIN_MOMENTUM_WINDOW_BONUS);
 }
 
+export interface ProjectileSimState {
+  id: string;
+  ownerId: string;
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number;
+  hit: boolean;
+}
+
+export function createProjectile(id: string, ownerId: string, spawn: { x: number; y: number; z: number; vx: number; vy: number; vz: number }): ProjectileSimState {
+  return { id, ownerId, x: spawn.x, y: spawn.y, z: spawn.z, vx: spawn.vx, vy: spawn.vy, vz: spawn.vz, life: PROJECTILE_LIFETIME, hit: false };
+}
+
+// Authoritative Sky Mario combat hit detection - advances every live
+// projectile one tick (same gravity/bounce as the client's own cosmetic
+// physics in Game.ts's _updateProjectiles, kept in sync so trajectories
+// look the same) and damages the first non-owner living player it overlaps.
+// Ground is always y=0 in this sim (see PlayerSimState.y's comment on jump
+// physics not modeling terrain height), so no groundYAt lookup is needed
+// here, unlike the client's cosmetic copy which samples visual terrain
+// height for its bounce.
+export function simulateProjectilesTick(projectiles: ProjectileSimState[], playerStates: Iterable<PlayerSimState>, dt: number, events: SimEvent[]): void {
+  for (const p of projectiles) {
+    if (p.hit) continue;
+    p.life -= dt;
+    if (p.life <= 0) {
+      p.hit = true;
+      continue;
+    }
+    p.vy -= PROJECTILE_GRAVITY * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.z += p.vz * dt;
+    if (p.y < PROJECTILE_GROUND_CLEARANCE) {
+      p.y = PROJECTILE_GROUND_CLEARANCE;
+      p.vy = Math.abs(p.vy) * PROJECTILE_BOUNCE_MULT;
+    }
+    for (const state of playerStates) {
+      if (state.id === p.ownerId || !state.alive) continue;
+      const dx = Math.abs(state.x - p.x);
+      const dz = Math.abs(state.z - p.z);
+      const dy = Math.abs((state.y + PROJECTILE_TARGET_Y_OFFSET) - p.y);
+      if (dx < PROJECTILE_HIT_HALF_X && dz < PROJECTILE_HIT_HALF_Z && dy < PROJECTILE_HIT_HALF_Y) {
+        p.hit = true;
+        damagePlayer(state, { id: p.id, type: 'sky_mario_projectile' }, PROJECTILE_SPEED, events);
+        break;
+      }
+    }
+  }
+}
+
 export function simulatePlayerTick(
   state: PlayerSimState,
   input: ControlInput,
@@ -1055,6 +1334,8 @@ export function simulatePlayerTick(
   skillScoring = false,
   weather: WeatherAtZ = CLEAR_WEATHER,
   forkSafeLaneSlow = false,
+  seed = 0,
+  gameMode: GameMode = 'classic',
 ): SimEvent[] {
   const events: SimEvent[] = [];
   if (!state.alive) return events;
@@ -1087,13 +1368,47 @@ export function simulatePlayerTick(
   }
 
   if (cleanInput.jumpPressed && !state.jumpHeld) {
-    if (triggerJump(state, MANUAL_JUMP_VELOCITY, 'manual')) {
+    if (triggerJump(state, getManualJumpVelocity(state.speed), 'manual')) {
       events.push({ type: 'jump', playerId: state.playerId, socketId: state.id, distance: state.distance });
+    } else if (state.isAirborne && state.airBoostAvailable) {
+      state.airBoostAvailable = false;
+      state.jumpVelocityY = Math.max(state.jumpVelocityY, 0) + AIR_BOOST_VELOCITY_Y;
+      events.push({ type: 'air-boost', playerId: state.playerId, socketId: state.id, distance: state.distance });
     }
   }
   state.jumpHeld = cleanInput.jumpPressed;
 
-  const moveX = state.isAirborne ? state.airVelocityX : Math.sin(state.angle) * state.speed;
+  // Sky Mario combat - throw is a fire-and-forget spawn event (position/
+  // velocity only); the actual hit detection happens once per tick across
+  // all live projectiles in simulateProjectilesTick, run by the caller
+  // after every player has taken their movement tick, not here (a thrown
+  // projectile can hit a player other than the one who just processed input
+  // this iteration, so it can't be resolved inline per-player).
+  if (gameMode === 'sky_mario') {
+    state.throwCooldownRemaining = Math.max(0, state.throwCooldownRemaining - dt);
+    if (cleanInput.firePressed && !state.fireHeld && state.throwCooldownRemaining <= 0) {
+      state.throwCooldownRemaining = SKY_MARIO_THROW_COOLDOWN;
+      const aimAngle = cleanInput.aimAngle !== null && cleanInput.aimAngle !== undefined ? cleanInput.aimAngle : state.angle;
+      const launchSpeed = PROJECTILE_SPEED + state.speed * 0.22;
+      const vx = Math.sin(aimAngle) * launchSpeed;
+      const vz = Math.cos(aimAngle) * launchSpeed;
+      events.push({
+        type: 'combat-throw',
+        playerId: state.playerId,
+        socketId: state.id,
+        distance: state.distance,
+        x: state.x + Math.sin(aimAngle) * 0.65,
+        y: state.y + 0.82,
+        z: state.z + Math.cos(aimAngle) * 1.0,
+        vx,
+        vy: 1.2,
+        vz,
+      });
+    }
+    state.fireHeld = cleanInput.firePressed;
+  }
+
+  const moveX = state.isAirborne ? state.airVelocityX : Math.sin(state.angle) * state.speed + getWindPushAtZ(seed, state.z);
   const moveZ = state.isAirborne ? state.airVelocityZ : Math.cos(state.angle) * state.speed;
 
   let newX = clamp(state.x + moveX * dt, -55, 55);
@@ -1211,6 +1526,25 @@ export function simulatePlayerTick(
     }
   }
 
+  // Airborne obstacle interaction - see AIR_CLEAR_TYPES's comment. Mirrors
+  // the near-miss loop's z-crossing detection, but rewards a direct
+  // overflight (lateral overlap) instead of a close-but-clear graze.
+  if (skillScoring && state.isAirborne) {
+    for (const obs of obstacles) {
+      if (!AIR_CLEAR_TYPES.has(obs.type)) continue;
+      if (hitObstacleIds.has(obs.id) || consumedPickupIds.has(obs.id) || state.hitObstacleHistory.has(obs.id) || state.airClearHistory.has(obs.id)) continue;
+      if (!(obs.z >= previousZ && obs.z < state.z)) continue;
+      const lateralOverlap = (PLAYER_HALF_W + obs.halfW) - Math.abs(state.x - obs.x);
+      if (lateralOverlap <= 0) continue;
+      state.airClearHistory.add(obs.id);
+      const centerT = clamp(lateralOverlap / (PLAYER_HALF_W + obs.halfW), 0, 1);
+      const heightT = clamp(state.y / AIR_CLEAR_HEIGHT_FOR_MAX, 0, 1);
+      const bonus = AIR_CLEAR_MIN_BONUS + (centerT * 0.5 + heightT * 0.5) * (AIR_CLEAR_MAX_BONUS - AIR_CLEAR_MIN_BONUS);
+      state.bonusDistance += bonus;
+      events.push({ type: 'air-clear', playerId: state.playerId, socketId: state.id, obstacleId: obs.id, obstacleType: obs.type, distance: state.distance, bonus });
+    }
+  }
+
   if (skillScoring && state.alive) {
     const speed01 = clamp((state.speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
     const momentumTarget = state.isAirborne ? state.momentum : speed01;
@@ -1237,6 +1571,7 @@ export function simulatePlayerTick(
     state.y += state.jumpVelocityY * dt;
     state.jumpVelocityY -= GRAVITY * dt;
     if (state.y <= 0) {
+      const airTimeAtLanding = state.airTime;
       state.y = 0;
       state.isAirborne = false;
       state.airborneFromRamp = false;
@@ -1251,7 +1586,23 @@ export function simulatePlayerTick(
       // never enabled skill scoring never sees a surprise stumble either.
       if (skillScoring) {
         const spinDeg = Math.abs(state.trickSpinRad) * (180 / Math.PI);
-        if (spinDeg > TRICK_ATTEMPT_DEADZONE_DEG) {
+        const attemptedTrick = spinDeg > TRICK_ATTEMPT_DEADZONE_DEG;
+
+        // Landing precision - see LANDING_PRECISION_MAX_ANGLE_DEG's comment
+        // on why this is gated on attemptedTrick rather than scored on its
+        // own.
+        if (attemptedTrick && airTimeAtLanding >= LANDING_PRECISION_MIN_AIRTIME) {
+          const angleDeg = Math.abs(state.angle) * (180 / Math.PI);
+          if (angleDeg <= LANDING_PRECISION_MAX_ANGLE_DEG) {
+            const precisionT = 1 - angleDeg / LANDING_PRECISION_MAX_ANGLE_DEG;
+            const airTimeT = clamp(airTimeAtLanding / LANDING_PRECISION_AIRTIME_FOR_MAX, 0, 1);
+            const bonus = LANDING_PRECISION_MAX_BONUS * precisionT * (0.5 + 0.5 * airTimeT);
+            state.bonusDistance += bonus;
+            events.push({ type: 'landing-precision', playerId: state.playerId, socketId: state.id, distance: state.distance, bonus });
+          }
+        }
+
+        if (attemptedTrick) {
           const halfSpins = Math.min(Math.round(spinDeg / 180), TRICK_MAX_HALF_SPINS);
           const offFromClean = Math.abs(spinDeg - halfSpins * 180);
           if (halfSpins > 0 && offFromClean <= TRICK_LANDING_TOLERANCE_DEG) {

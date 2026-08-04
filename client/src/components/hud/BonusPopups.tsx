@@ -18,7 +18,7 @@ export function BonusPopups({ popups }: { popups: BonusPopup[] }) {
         <div
           key={p.id}
           className={`bonus-popup absolute whitespace-nowrap text-lg font-black uppercase tracking-wide ${TONE_CLASS[p.tone]}`}
-          style={{ left: `${p.x}px` }}
+          style={{ left: `${p.x}px`, top: `${p.y}px` }}
         >
           {p.text}
         </div>

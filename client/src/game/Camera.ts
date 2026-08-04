@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 
 const FOV_MAX_SPEED = 28; // matches BOOST_SPEED in Player.ts / shared sim
-const FOV_WIDEN_DEGREES = 7;
+export const FOV_WIDEN_DEGREES = 7;
 const FOV_SMOOTHING_RATE = 3;
 // Obstacle/terrain avoidance (M12): the camera rides a fixed offset
 // (0, 7, -10) behind the skier, which clips through trees and dips under

@@ -212,6 +212,18 @@ export class ReactUiAdapter implements UiAdapter {
     this.flashControls('Bailed!', 'unstuckFlashKey', 700, 'negative');
   }
 
+  showLandingPrecisionFeedback(bonus = 0) {
+    this.flashControls(`Clean Landing +${bonus.toFixed(1)}m`, 'landingFlashKey', 800, 'positive');
+  }
+
+  showAirClearFeedback(bonus = 0) {
+    this.flashControls(`Air Clear +${bonus.toFixed(1)}m`, 'nearMissFlashKey', 700, 'positive');
+  }
+
+  showAirBoostFeedback() {
+    this.flashControls('Air Boost!', 'jumpChainFlashKey', 700, 'positive');
+  }
+
   showAvalancheOutrunFeedback() {
     this.flashControls('Outran the Avalanche!', 'jumpChainFlashKey', 1100, 'positive');
   }
@@ -267,11 +279,20 @@ export class ReactUiAdapter implements UiAdapter {
   /** Floating text that flies up and fades near the player, alongside (not
    * instead of) the static HUD flash banner above - reuses the same label
    * text so a bonus reads as something that just happened at the player
-   * rather than only a corner-of-the-eye HUD update. */
+   * rather than only a corner-of-the-eye HUD update. Landing now commonly
+   * fires several of these in the same instant (landing/landing-precision/
+   * trick/jump-chain can all land on one tick) - each new popup is stacked
+   * a line above however many are already showing so they read top-to-
+   * bottom instead of piling up illegibly on top of each other.
+   */
   private pushPopup(text: string, tone: 'positive' | 'negative' | 'neutral') {
     const id = ++this.popupSeq;
     const x = (Math.random() - 0.5) * 34;
-    this.store.set(state => ({ ...state, popups: [...state.popups, { id, text, tone, x }] }));
+    this.store.set(state => {
+      const stackSlot = state.popups.length % 4;
+      const y = -stackSlot * 30;
+      return { ...state, popups: [...state.popups, { id, text, tone, x, y }] };
+    });
     window.setTimeout(() => {
       this.store.set(state => ({ ...state, popups: state.popups.filter(p => p.id !== id) }));
     }, 1150);

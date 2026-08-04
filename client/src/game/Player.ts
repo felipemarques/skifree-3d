@@ -8,9 +8,22 @@ const BASE_SPEED = 14;
 const BOOST_SPEED = 28;
 const MIN_SPEED = BASE_SPEED * 0.22;
 const MANUAL_JUMP_VELOCITY = 7.2;
+const MANUAL_JUMP_MIN_VELOCITY = 6.0;
+const MANUAL_JUMP_MAX_VELOCITY = 8.4;
 const RAMP_JUMP_MIN_VELOCITY = 4.8;
 const RAMP_JUMP_MAX_VELOCITY = 9.6;
 const GRAVITY = 18;
+// Mirrors shared/AuthoritativeSim.ts's AIR_BOOST_VELOCITY_Y/AIR_CLEAR_*/
+// LANDING_PRECISION_* - see their comments there.
+const AIR_BOOST_VELOCITY_Y = 4.5;
+const AIR_CLEAR_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree']);
+const AIR_CLEAR_MIN_BONUS = 0.8;
+const AIR_CLEAR_MAX_BONUS = 2.6;
+const AIR_CLEAR_HEIGHT_FOR_MAX = 1.6;
+const LANDING_PRECISION_MAX_ANGLE_DEG = 26;
+const LANDING_PRECISION_MIN_AIRTIME = 0.18;
+const LANDING_PRECISION_MAX_BONUS = 2.2;
+const LANDING_PRECISION_AIRTIME_FOR_MAX = 0.9;
 const INVINCIBILITY_TIME = 1.8;
 const HIT_BLINK_RATE = 0.08;
 const UNSTUCK_PUSH = 5.0;
@@ -180,6 +193,12 @@ export class Player {
     // hit, so without this an obstacle you just crashed into can still
     // pay out a "near miss" once you clear it.
     this._hitObstacleHistory = new Set();
+    // Same lifetime-of-run dedupe, but for the air-clear bonus - see
+    // shared/AuthoritativeSim.ts's airClearHistory comment.
+    this._airClearHistory = new Set();
+    // One-shot mid-air resource, refreshed every _triggerJump - see
+    // AIR_BOOST_VELOCITY_Y's comment.
+    this._airBoostAvailable = false;
 
     this.onHit = null;
     this.onDie = null;
@@ -191,6 +210,9 @@ export class Player {
     this.onJumpChain = null;
     this.onTrick = null;
     this.onTrickFail = null;
+    this.onAirBoost = null;
+    this.onAirClear = null;
+    this.onLandingPrecision = null;
   }
 
   get x() { return this.position.x; }
@@ -247,7 +269,7 @@ export class Player {
     if (this.onUnstuck) this.onUnstuck();
   }
 
-  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER, forkSafeLaneSlow = false) {
+  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER, forkSafeLaneSlow = false, windPush = 0) {
     if (!this.isAlive) {
       this.updateDeathAnimation(dt);
       return;
@@ -303,11 +325,17 @@ export class Player {
 
     const jumpPressed = input.jump;
     if (jumpPressed && !this._jumpHeld) {
-      this._triggerJump();
+      if (!this.isAirborne) {
+        this._triggerJump(this._getManualJumpVelocity());
+      } else if (this._airBoostAvailable) {
+        this._airBoostAvailable = false;
+        this.jumpVelocityY = Math.max(this.jumpVelocityY, 0) + AIR_BOOST_VELOCITY_Y;
+        if (this.onAirBoost) this.onAirBoost();
+      }
     }
     this._jumpHeld = jumpPressed;
 
-    const moveX = this.isAirborne ? this._airVelocityX : Math.sin(this.angle) * this.speed;
+    const moveX = this.isAirborne ? this._airVelocityX : Math.sin(this.angle) * this.speed + windPush;
     const moveZ = this.isAirborne ? this._airVelocityZ : Math.cos(this.angle) * this.speed;
 
     let newX = THREE.MathUtils.clamp(this.position.x + moveX * dt, -55, 55);
@@ -448,6 +476,28 @@ export class Player {
       }
     }
 
+    // Airborne obstacle interaction - mirrors shared/AuthoritativeSim.ts's
+    // AIR_CLEAR_TYPES loop: obstacles otherwise entirely ignored while
+    // airborne (see the isAirborne-continue branch above) pay a bonus for a
+    // direct mid-air overflight instead.
+    if (skillScoring && this.isAirborne) {
+      for (const obs of obstacles) {
+        if (obs.dead) continue;
+        if (!AIR_CLEAR_TYPES.has(obs.type)) continue;
+        if (hitObstacles && hitObstacles.has(obs)) continue;
+        if (this._hitObstacleHistory.has(obs) || this._airClearHistory.has(obs)) continue;
+        if (!(obs.z >= previousZ && obs.z < this.position.z)) continue;
+        const lateralOverlap = (this.halfW + obs.halfW) - Math.abs(this.position.x - obs.x);
+        if (lateralOverlap <= 0) continue;
+        this._airClearHistory.add(obs);
+        const centerT = THREE.MathUtils.clamp(lateralOverlap / (this.halfW + obs.halfW), 0, 1);
+        const heightT = THREE.MathUtils.clamp(this.position.y / AIR_CLEAR_HEIGHT_FOR_MAX, 0, 1);
+        const bonus = AIR_CLEAR_MIN_BONUS + (centerT * 0.5 + heightT * 0.5) * (AIR_CLEAR_MAX_BONUS - AIR_CLEAR_MIN_BONUS);
+        this.bonusDistance += bonus;
+        if (this.onAirClear) this.onAirClear(bonus, this._panFrom(obs.x));
+      }
+    }
+
     if (skillScoring && this.isAlive) {
       const speed01 = THREE.MathUtils.clamp((this.speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
       const momentumTarget = this.isAirborne ? this.momentum : speed01;
@@ -490,7 +540,26 @@ export class Player {
         // a surprise stumble either.
         if (skillScoring) {
           const spinDeg = Math.abs(this._trickSpinRad) * (180 / Math.PI);
-          if (spinDeg > TRICK_ATTEMPT_DEADZONE_DEG) {
+          const attemptedTrick = spinDeg > TRICK_ATTEMPT_DEADZONE_DEG;
+
+          // Landing precision - mirrors shared/AuthoritativeSim.ts's matching
+          // block. this.angle is frozen for the whole flight (only updated
+          // while grounded), so on its own this would just reward jumping
+          // while going perfectly straight - the default idle state, not a
+          // skill. Gating on attemptedTrick makes it a bonus for keeping the
+          // steering angle tight while spinning, not a standalone freebie.
+          if (attemptedTrick && landed >= LANDING_PRECISION_MIN_AIRTIME) {
+            const angleDeg = Math.abs(this.angle) * (180 / Math.PI);
+            if (angleDeg <= LANDING_PRECISION_MAX_ANGLE_DEG) {
+              const precisionT = 1 - angleDeg / LANDING_PRECISION_MAX_ANGLE_DEG;
+              const airTimeT = THREE.MathUtils.clamp(landed / LANDING_PRECISION_AIRTIME_FOR_MAX, 0, 1);
+              const bonus = LANDING_PRECISION_MAX_BONUS * precisionT * (0.5 + 0.5 * airTimeT);
+              this.bonusDistance += bonus;
+              if (this.onLandingPrecision) this.onLandingPrecision(bonus);
+            }
+          }
+
+          if (attemptedTrick) {
             const halfSpins = Math.min(Math.round(spinDeg / 180), TRICK_MAX_HALF_SPINS);
             const offFromClean = Math.abs(spinDeg - halfSpins * 180);
             if (halfSpins > 0 && offFromClean <= TRICK_LANDING_TOLERANCE_DEG) {
@@ -914,7 +983,14 @@ export class Player {
     this._airAngle = this.angle;
     this._airVelocityX = Math.sin(this._airAngle) * this.speed;
     this._airVelocityZ = Math.cos(this._airAngle) * this.speed;
+    this._airBoostAvailable = true;
     if (this.onJumpStart) this.onJumpStart(source);
+  }
+
+  _getManualJumpVelocity() {
+    const t = THREE.MathUtils.clamp((this.speed - MIN_SPEED) / (BOOST_SPEED - MIN_SPEED), 0, 1);
+    const eased = t * t * (3 - 2 * t);
+    return THREE.MathUtils.lerp(MANUAL_JUMP_MIN_VELOCITY, MANUAL_JUMP_MAX_VELOCITY, eased);
   }
 
   /** Multiplayer's authoritative path sets isAirborne directly from the

@@ -1,14 +1,13 @@
 // @ts-nocheck
 import * as THREE from 'three';
-import { getBiomeKindAtZ } from '../../../shared/AuthoritativeSim';
+import { getBiomeKindAtZ, getBiomeZoneBlend } from '../../../shared/AuthoritativeSim';
 
-// Ordered distance stops - the world's palette/lighting slowly evolves with
-// z, purely for atmosphere (no gameplay/physics/determinism implications,
-// unlike the weather system's grip). "Hold" stops (1200/3000) repeat the
-// previous stop's values so the palette stays put until the transition band
-// actually starts, rather than blending continuously from z=0. Transition
-// bands are short (300m) and the shifts are large/saturated on purpose -
-// this is meant to read as a clear change, not a barely-there drift.
+// Per-biome palette/lighting values, purely for atmosphere (no gameplay/
+// physics/determinism implications, unlike the weather system's grip). The
+// order biomes appear in is now seed-shuffled (see shared/AuthoritativeSim.ts's
+// getBiomeZoneBlend) rather than a fixed forest->alpine->cliffs->glacier
+// sequence, so this file only needs the palette-per-kind lookup plus the
+// shared zoning/blend-progress helper - no local stop table or thresholds.
 const FOREST = {
   skyTop: 0x426b92, skyHorizon: 0xb6cada, skyGround: 0xd6e1e8, fogColor: 0xaec7dc,
   mountainTint: 0x9bb4c9, mountainTintT: 0, sunColor: 0xfffbec, sunIntensityMult: 1.0,
@@ -34,29 +33,20 @@ const GLACIER = {
   terrainReliefMult: 1.6, auroraIntensity: 1.3,
 };
 
-const STOPS = [
-  { at: 0, ...FOREST },
-  { at: 1200, ...FOREST },
-  { at: 1500, ...ALPINE },
-  { at: 3000, ...ALPINE },
-  { at: 3300, ...CLIFFS },
-  { at: 5200, ...CLIFFS },
-  { at: 5500, ...GLACIER },
-];
+const WINDSWEPT = {
+  skyTop: 0x5a6b78, skyHorizon: 0xc9d6dc, skyGround: 0xe4ecef, fogColor: 0xb0bec5,
+  mountainTint: 0xaab8c2, mountainTintT: 0.7, sunColor: 0xf5f5f0, sunIntensityMult: 0.85,
+  hemiSky: 0xd7e3e8, hemiGround: 0x94a3ab, treeHueShift: 0.02, rockHueShift: 0.08, snowTint: 0xd8e2e5,
+  terrainReliefMult: 1.3, auroraIntensity: 0.3,
+};
+const DEADWOOD = {
+  skyTop: 0x2e3a34, skyHorizon: 0x6b7a6e, skyGround: 0x8a9a8a, fogColor: 0x5f6f62,
+  mountainTint: 0x3c463e, mountainTintT: 0.55, sunColor: 0xd9d9c8, sunIntensityMult: 0.65,
+  hemiSky: 0x7d8c7f, hemiGround: 0x3a4038, treeHueShift: -0.22, rockHueShift: -0.05, snowTint: 0xc9d0c4,
+  terrainReliefMult: 0.85, auroraIntensity: 0.15,
+};
 
-function findBracket(z) {
-  if (z <= STOPS[0].at) return { a: STOPS[0], b: STOPS[0], t: 0 };
-  for (let i = 1; i < STOPS.length; i++) {
-    if (z <= STOPS[i].at) {
-      const a = STOPS[i - 1];
-      const b = STOPS[i];
-      const span = Math.max(1, b.at - a.at);
-      return { a, b, t: THREE.MathUtils.clamp((z - a.at) / span, 0, 1) };
-    }
-  }
-  const last = STOPS[STOPS.length - 1];
-  return { a: last, b: last, t: 0 };
-}
+const BIOME_PALETTES = { forest: FOREST, alpine: ALPINE, cliffs: CLIFFS, glacier: GLACIER, windswept: WINDSWEPT, deadwood: DEADWOOD };
 
 export function createBiomeBlendTarget() {
   return {
@@ -76,8 +66,10 @@ export function createBiomeBlendTarget() {
   };
 }
 
-export function getBiomeAtZ(z, target) {
-  const { a, b, t } = findBracket(z);
+export function getBiomeAtZ(seed, z, target) {
+  const { a: aKind, b: bKind, t } = getBiomeZoneBlend(seed, z);
+  const a = BIOME_PALETTES[aKind];
+  const b = BIOME_PALETTES[bKind];
   target.skyTop.set(a.skyTop).lerp(new THREE.Color(b.skyTop), t);
   target.skyHorizon.set(a.skyHorizon).lerp(new THREE.Color(b.skyHorizon), t);
   target.skyGround.set(a.skyGround).lerp(new THREE.Color(b.skyGround), t);
@@ -94,17 +86,19 @@ export function getBiomeAtZ(z, target) {
   return target;
 }
 
-export function getBiomeHueShiftAtZ(z) {
-  const { a, b, t } = findBracket(z);
+export function getBiomeHueShiftAtZ(seed, z) {
+  const { a: aKind, b: bKind, t } = getBiomeZoneBlend(seed, z);
+  const a = BIOME_PALETTES[aKind];
+  const b = BIOME_PALETTES[bKind];
   return {
     treeHueShift: THREE.MathUtils.lerp(a.treeHueShift, b.treeHueShift, t),
     rockHueShift: THREE.MathUtils.lerp(a.rockHueShift, b.rockHueShift, t),
   };
 }
 
-// Thin wrapper - the actual thresholds now live in shared/AuthoritativeSim.ts
-// (getBiomeKindAtZ) since obstacle generation needs them too and must stay
+// Thin wrapper - the actual zoning/order lives in shared/AuthoritativeSim.ts
+// (getBiomeKindAtZ) since obstacle generation needs it too and must stay
 // deterministic/shared; this keeps the two from ever drifting apart.
-export function getDominantBiome(z) {
-  return getBiomeKindAtZ(z);
+export function getDominantBiome(seed, z) {
+  return getBiomeKindAtZ(seed, z);
 }

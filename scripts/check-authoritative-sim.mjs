@@ -12,6 +12,7 @@ import {
   getAvalancheChaseSpeed,
   getAvalancheZoneAhead,
   getBiomeKindAtZ,
+  getWindPushAtZ,
   getChainWindowMs,
   getForkZoneAhead,
   getWeatherAtZ,
@@ -486,16 +487,42 @@ const noScoringTrickEvents = simulatePlayerTick(noScoringTrickPlayer, {
 assert.equal(noScoringTrickPlayer.speed, 20, 'tricks must be fully inert (no stumble) when skill scoring is disabled');
 assert.ok(!noScoringTrickEvents.some(e => e.type === 'trick' || e.type === 'trick-fail'), 'no trick events should fire when skill scoring is disabled');
 
-// --- Biomes: obstacle type mix actually differs by z, not just tint ---
-assert.equal(getBiomeKindAtZ(0), 'forest', 'z=0 should be in the forest biome');
-assert.equal(getBiomeKindAtZ(2000), 'alpine', 'z=2000 should be in the alpine biome');
-assert.equal(getBiomeKindAtZ(4000), 'cliffs', 'z=4000 should be in the cliffs biome');
-assert.equal(getBiomeKindAtZ(6000), 'glacier', 'z=6000 should be in the glacier biome');
-assert.deepEqual(
-  [getBiomeKindAtZ(1349), getBiomeKindAtZ(1350), getBiomeKindAtZ(3149), getBiomeKindAtZ(3150), getBiomeKindAtZ(5349), getBiomeKindAtZ(5350)],
-  ['forest', 'alpine', 'alpine', 'cliffs', 'cliffs', 'glacier'],
-  'biome thresholds should switch exactly at the documented z boundaries',
+// --- Biomes: seed-shuffled order, but zone 0 is always forest, and the
+// order/thresholds are fully deterministic for a given seed ---
+const biomeSeed = 55555;
+assert.equal(getBiomeKindAtZ(biomeSeed, 0), 'forest', 'z=0 should always be in the forest starter biome');
+assert.equal(
+  getBiomeKindAtZ(biomeSeed, 2000),
+  getBiomeKindAtZ(biomeSeed, 2000),
+  'getBiomeKindAtZ should be deterministic for the same seed/z',
 );
+
+// Zone boundaries (BIOME_ZONE_PERIOD=1800) are fixed regardless of seed -
+// only which biome is assigned to each zone index shuffles. z = zoneIndex*
+// 1800 + 900 lands safely mid-zone (well past the ~1650 dominant-switch
+// point and well before the next), so this reads zone N's assigned biome
+// without needing to know the shuffle itself.
+function biomeOfZone(seed, zoneIndex) {
+  return getBiomeKindAtZ(seed, zoneIndex * 1800 + 900);
+}
+const zone1 = biomeOfZone(biomeSeed, 1);
+const zone2 = biomeOfZone(biomeSeed, 2);
+const zone3 = biomeOfZone(biomeSeed, 3);
+const nonForestPool = ['alpine', 'cliffs', 'glacier', 'windswept', 'deadwood'];
+for (const kind of [zone1, zone2, zone3]) {
+  assert.ok(nonForestPool.includes(kind), `zone biomes should come from the non-forest pool (got ${kind})`);
+}
+assert.equal(new Set([zone1, zone2, zone3, biomeOfZone(biomeSeed, 4), biomeOfZone(biomeSeed, 5)]).size >= 2, true,
+  'a 5-biome pool sampled across 5 zones should show more than one distinct biome');
+assert.equal(new Set([zone1, zone2, zone3]).size, 3, 'a single cycle of BIOME_CYCLE_POOL.length zones should never repeat a biome');
+
+// Shuffling should actually vary the order across seeds - not just be a
+// differently-labeled fixed sequence. Sampling enough seeds makes it
+// vanishingly unlikely (but not impossible) for zone 1 to always land on
+// the same biome if the shuffle were broken/inert.
+const zone1Biomes = new Set();
+for (let s = 0; s < 20; s++) zone1Biomes.add(biomeOfZone(1000 + s * 7919, 1));
+assert.ok(zone1Biomes.size > 1, 'zone 1s biome should vary across different seeds (order is seed-shuffled, not fixed)');
 
 function sampleObstacleTypeCounts(seed, chunkStart, chunkCount) {
   const counts = { tree: 0, rock: 0 };
@@ -506,33 +533,28 @@ function sampleObstacleTypeCounts(seed, chunkStart, chunkCount) {
   }
   return counts;
 }
-const biomeSeed = 55555;
 // Fork zones and biome set-pieces only change WHERE obstacles land, not
 // which types get picked (both still call pickBiomeObstacleType with the
 // same per-biome mix), so sampling many chunks and comparing the aggregate
 // tree:rock ratio is robust to either kind of zone overlapping the sample.
-const forestCounts = sampleObstacleTypeCounts(biomeSeed, 1, 16); // z in [80, 1360) - safely forest
-const alpineCounts = sampleObstacleTypeCounts(biomeSeed, 25, 16); // z in [2000, 3280) - safely alpine
-const glacierCounts = sampleObstacleTypeCounts(biomeSeed, 68, 16); // z in [5440, 6720) - safely glacier
+const forestCounts = sampleObstacleTypeCounts(biomeSeed, 1, 16); // z in [80, 1360) - safely forest (zone 0)
+const zone1ChunkStart = Math.round((1800 * 1 + 900) / 80);
+const zone1Counts = sampleObstacleTypeCounts(biomeSeed, zone1ChunkStart, 16);
 assert.ok(
-  forestCounts.tree + forestCounts.rock > 0 && alpineCounts.tree + alpineCounts.rock > 0 && glacierCounts.tree + glacierCounts.rock > 0,
-  'test setup should sample obstacles in all three biomes',
+  forestCounts.tree + forestCounts.rock > 0 && zone1Counts.tree + zone1Counts.rock > 0,
+  'test setup should sample obstacles in both the forest starter zone and zone 1',
 );
 assert.ok(
-  (forestCounts.tree / Math.max(1, forestCounts.rock)) > (alpineCounts.tree / Math.max(1, alpineCounts.rock)),
-  'forest chunks should have a higher tree:rock ratio than alpine chunks (BIOME_OBSTACLE_MIX)',
-);
-assert.ok(
-  (alpineCounts.tree / Math.max(1, alpineCounts.rock)) > (glacierCounts.tree / Math.max(1, glacierCounts.rock)),
-  'alpine chunks should have a higher tree:rock ratio than glacier chunks (BIOME_OBSTACLE_MIX)',
+  (forestCounts.tree / Math.max(1, forestCounts.rock)) > (zone1Counts.tree / Math.max(1, zone1Counts.rock)),
+  `forest should have a higher tree:rock ratio than zone 1 (${zone1} - BIOME_OBSTACLE_MIX)`,
 );
 
 // --- Glacier's "crevasse field" set-piece: elevated hole density ---
 let glacierSetPieceChunk = null;
 let glacierPlainChunk = null;
-for (let c = 68; c < 68 + 200; c++) {
+for (let c = 1; c < 1 + 400; c++) {
   const zBase = c * 80;
-  if (getBiomeKindAtZ(zBase) !== 'glacier') continue;
+  if (getBiomeKindAtZ(biomeSeed, zBase) !== 'glacier') continue;
   const chunk = generateGameplayChunk(biomeSeed, c, 1, new Set(), false);
   const holeCount = chunk.filter(o => o.type === 'hole').length;
   if (holeCount >= 3 && !glacierSetPieceChunk) glacierSetPieceChunk = { c, holeCount };
@@ -540,6 +562,23 @@ for (let c = 68; c < 68 + 200; c++) {
   if (glacierSetPieceChunk && glacierPlainChunk) break;
 }
 assert.ok(glacierSetPieceChunk, 'test setup should find a glacier crevasse-field chunk with elevated hole density within the scanned range');
+
+// --- Windswept ridge: lateral wind push is a real deterministic force,
+// zero outside windswept zones, and its z-only formula is bit-identical
+// given the same seed (required for authoritative-sim determinism) ---
+let windsweptZoneStartZ = null;
+for (let c = 1; c < 1 + 400; c++) {
+  const zBase = c * 80;
+  if (getBiomeKindAtZ(biomeSeed, zBase) === 'windswept') { windsweptZoneStartZ = zBase; break; }
+}
+assert.ok(windsweptZoneStartZ !== null, 'test setup should find a windswept chunk within the scanned range');
+assert.notEqual(getWindPushAtZ(biomeSeed, windsweptZoneStartZ + 40), 0, 'wind push should be nonzero inside a windswept zone');
+assert.equal(getWindPushAtZ(biomeSeed, 0), 0, 'wind push should be zero in the forest starter zone');
+assert.equal(
+  getWindPushAtZ(biomeSeed, windsweptZoneStartZ + 40),
+  getWindPushAtZ(biomeSeed, windsweptZoneStartZ + 40),
+  'wind push should be a deterministic function of (seed, z)',
+);
 
 // --- Branching trail forks: lane split, density asymmetry, Bold Line bonus ---
 const forkSeed = 8080;

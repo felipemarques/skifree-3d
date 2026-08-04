@@ -30,6 +30,8 @@ const BIOME_OBSTACLE_MIX = {
   alpine: { tree: 0.12, fallen_tree: 0.10, rock: 0.50, stump: 0.28 },
   cliffs: { tree: 0.18, fallen_tree: 0.12, rock: 0.45, stump: 0.25 },
   glacier: { tree: 0.03, fallen_tree: 0.05, rock: 0.58, stump: 0.34 },
+  windswept: { tree: 0.08, fallen_tree: 0.12, rock: 0.46, stump: 0.34 },
+  deadwood: { tree: 0.28, fallen_tree: 0.44, rock: 0.10, stump: 0.18 },
 };
 const BIOME_SETPIECE_ZONE_LENGTH = 240;
 const BIOME_SETPIECE_ROLL_CHANCE = 0.3;
@@ -70,6 +72,14 @@ function isBiomeSetPieceZone(seed, chunkIndex) {
   const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / BIOME_SETPIECE_ZONE_LENGTH);
   if (zoneIndex <= 0) return false;
   return seededRoll(seed, zoneIndex * 621547) < BIOME_SETPIECE_ROLL_CHANCE;
+}
+
+// Glacier's own extra, independent (per-chunk) low chance of a rockfall
+// cluster - mirrors shared/AuthoritativeSim.ts's isGlacierRockfallChunk.
+const GLACIER_ROCKFALL_ROLL_CHANCE = 0.15;
+
+function isGlacierRockfallChunk(seed, chunkIndex) {
+  return seededRoll(seed, chunkIndex * 88651) < GLACIER_ROCKFALL_ROLL_CHANCE;
 }
 
 function isForkZoneIndex(seed, zoneIndex) {
@@ -1106,7 +1116,7 @@ export class Obstacles {
     }
 
     const zBase = chunkIndex * CHUNK_SIZE;
-    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(zBase);
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.seed, zBase);
     const group = new THREE.Group();
     const chunkObstacles = [];
     // Only the hazard categories that also exist in the shared authoritative
@@ -1117,15 +1127,19 @@ export class Obstacles {
     const rampVolume = getRampedRampVolume(this.volume, chunkIndex, this.difficultyRamp);
     // Mirrors shared/AuthoritativeSim.ts's generateGameplayChunk biome logic
     // exactly (see BIOME_OBSTACLE_MIX's comment above).
-    const biome = getBiomeKindAtZ(zBase);
+    const biome = getBiomeKindAtZ(this.seed, zBase);
     const obstacleMix = BIOME_OBSTACLE_MIX[biome];
     const setPiece = isBiomeSetPieceZone(this.seed, chunkIndex);
     const isCrevasseField = setPiece && biome === 'glacier';
-    // Cliffs' "rockfall" set-piece - mirrors shared/AuthoritativeSim.ts's
-    // matching isRockfallField block.
-    const isRockfallField = setPiece && biome === 'cliffs';
+    // Cliffs'/alpine's "rockfall" set-piece (plus glacier's independent
+    // extra roll) - mirrors shared/AuthoritativeSim.ts's matching block.
+    const isRockfallField = setPiece && (biome === 'cliffs' || biome === 'alpine');
+    const isGlacierRockfall = !isCrevasseField && biome === 'glacier' && isGlacierRockfallChunk(this.seed, chunkIndex);
+    // Forest's (and any other non-rockfall/non-glacier) set-piece flavor -
+    // mirrors shared/AuthoritativeSim.ts's matching isChokepoint const.
+    const isChokepoint = setPiece && !isRockfallField && biome !== 'glacier';
     const setPieceHazardVolume = setPiece
-      ? (biome === 'cliffs' ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
+      ? (isRockfallField ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
       : hazardVolume;
     // Fork zones take precedence over the biome set-piece edge-banding when
     // both land on the same chunk - mirrors shared/AuthoritativeSim.ts.
@@ -1262,7 +1276,7 @@ export class Obstacles {
         // Forest tunnel / alpine canyon squeeze set-piece: obstacles
         // concentrated toward both edges instead of spread across the full
         // width - see shared/AuthoritativeSim.ts's matching comment.
-        const xRange = (setPiece && biome !== 'cliffs' && biome !== 'glacier')
+        const xRange = isChokepoint
           ? (i % 2 === 0 ? [-TRACK_LIMIT, -BIOME_SETPIECE_EDGE_BAND] : [BIOME_SETPIECE_EDGE_BAND, TRACK_LIMIT])
           : [-TRACK_LIMIT, TRACK_LIMIT];
         spawnHazardType(type, xRange);
@@ -1286,10 +1300,11 @@ export class Obstacles {
           spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
         }
       }
-      // Cliffs' "rockfall" set-piece: tight clusters of extra rocks tagged
-      // 'rockfall' for the shadow/drop telegraph in update() - mirrors
-      // shared/AuthoritativeSim.ts's matching isRockfallField block.
-      if (isRockfallField) {
+      // Cliffs'/alpine's "rockfall" set-piece (plus glacier's independent
+      // extra roll): tight clusters of extra rocks tagged 'rockfall' for the
+      // shadow/drop telegraph in update() - mirrors shared/AuthoritativeSim.ts's
+      // matching block.
+      if (isRockfallField || isGlacierRockfall) {
         const clusterCount = 2 + (rng.next() < 0.5 ? 1 : 0);
         for (let c = 0; c < clusterCount; c++) {
           const clusterX = rng.range(-TRACK_LIMIT + 6, TRACK_LIMIT - 6);
@@ -1298,6 +1313,29 @@ export class Obstacles {
           for (let r = 0; r < rocksInCluster; r++) {
             spawnPlaced(() => makeRockfallRock(rng, rockHueShift), [clusterX - 3, clusterX + 3], [clusterZ - 3, clusterZ + 3], {
               attempts: 10, padding: 0.6, subtype: 'rockfall',
+            });
+          }
+        }
+      }
+
+      // Chokepoint gate: two gap-marker rocks plus a short run of funnel
+      // posts per side, stepping the safe x-band in toward the gap at
+      // gateZ - mirrors shared/AuthoritativeSim.ts's matching block.
+      if (isChokepoint) {
+        const gateZ = rng.range(CHUNK_SIZE * 0.45, CHUNK_SIZE * 0.62);
+        const gapHalf = 8;
+        const funnelPosts = 3;
+        for (const side of [-1, 1]) {
+          spawnPlaced(() => makeRock(rng, rockHueShift), [side * gapHalf - 1, side * gapHalf + 1], [gateZ - 1, gateZ + 1], {
+            attempts: 14, padding: 0.5, subtype: 'chokepoint',
+          });
+          for (let p = 1; p <= funnelPosts; p++) {
+            const t = p / (funnelPosts + 1);
+            const fx = side * (TRACK_LIMIT - 6 - t * (TRACK_LIMIT - 6 - gapHalf));
+            const fz = gateZ - 5 - p * 5;
+            if (fz < 6) continue;
+            spawnPlaced(() => makeStump(rng), [fx - 1.2, fx + 1.2], [fz - 1.2, fz + 1.2], {
+              attempts: 10, padding: 0.5, subtype: 'chokepoint',
             });
           }
         }
@@ -1352,7 +1390,7 @@ export class Obstacles {
     const group = new THREE.Group();
     const chunkObstacles = [];
     const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp);
-    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(chunkIndex * CHUNK_SIZE);
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.authoritativeSeed, chunkIndex * CHUNK_SIZE);
 
     // Meshes are built from the authoritative records' own extents so the
     // rendered obstacle is exactly as big as its collision box (M2): tree
@@ -1434,7 +1472,7 @@ export class Obstacles {
     this.active.push(...chunkObstacles);
   }
 
-  update(dt, playerZ, groundYAt = null, blizzardT = 0) {
+  update(dt, playerZ, groundYAt = null, blizzardT = 0, playerSpeed = 0) {
     const currentChunk = Math.floor(playerZ / CHUNK_SIZE);
     const now = performance.now() * 0.004;
     const blockers = this.getAvoidanceBlockers(playerZ, CHUNK_SIZE * 2.2);
@@ -1577,17 +1615,26 @@ export class Obstacles {
       let rockfallDrop = 0;
       if (obs.subtype === 'rockfall' && obs.fallState !== 'landed') {
         const distToImpact = obs.z - playerZ;
-        if (obs.fallState === 'pending' && distToImpact <= ROCKFALL_WARN_DISTANCE) {
+        // At boost speeds the player can cover ROCKFALL_DROP_START_DISTANCE
+        // faster than the drop animation finishes, so the rock is still
+        // mid-air (looks like it never actually reaches/hits the player)
+        // by the time they arrive. Scale both trigger distances up with
+        // current speed (how far the player travels during the drop, plus
+        // a margin) so the rock always finishes landing before the player
+        // gets there, same relative warning/fall timing as at low speed.
+        const dropStartDistance = Math.max(ROCKFALL_DROP_START_DISTANCE, playerSpeed * ROCKFALL_DROP_DURATION * 1.2);
+        const warnDistance = Math.max(ROCKFALL_WARN_DISTANCE, dropStartDistance * (ROCKFALL_WARN_DISTANCE / ROCKFALL_DROP_START_DISTANCE));
+        if (obs.fallState === 'pending' && distToImpact <= warnDistance) {
           obs.fallState = 'warning';
         }
-        if (obs.fallState === 'warning' && distToImpact <= ROCKFALL_DROP_START_DISTANCE) {
+        if (obs.fallState === 'warning' && distToImpact <= dropStartDistance) {
           obs.fallState = 'falling';
           obs.fallTimer = 0;
           for (const part of obs.mesh.userData.rockfallParts || []) part.visible = true;
         }
         const shadow = obs.mesh.userData.rockfallShadow;
         if (obs.fallState === 'warning') {
-          const warnT = THREE.MathUtils.clamp(1 - distToImpact / ROCKFALL_WARN_DISTANCE, 0, 1);
+          const warnT = THREE.MathUtils.clamp(1 - distToImpact / warnDistance, 0, 1);
           if (shadow) shadow.material.opacity = THREE.MathUtils.lerp(0, 0.5, warnT);
         } else if (obs.fallState === 'falling') {
           obs.fallTimer += dt;

@@ -201,7 +201,7 @@ export class Landmarks {
     const items = [];
 
     if (rng.next() < SPAWN_CHANCE) {
-      const biome = getDominantBiome(zBase + LANDMARK_CHUNK_SIZE / 2);
+      const biome = getDominantBiome(this.seed, zBase + LANDMARK_CHUNK_SIZE / 2);
       const pool = BIOME_FACTORIES[biome] || BIOME_FACTORIES.forest;
       const factory = pool[Math.floor(rng.next() * pool.length) % pool.length];
 
@@ -222,13 +222,26 @@ export class Landmarks {
 
     this.scene.add(group);
     this.chunks.set(chunkIndex, { group, items });
+    return group;
   }
 
   update(dt, playerZ, groundYAt = null) {
     const currentChunk = Math.floor(playerZ / LANDMARK_CHUNK_SIZE);
 
-    for (let i = currentChunk; i <= currentChunk + 2; i++) {
-      this.generateChunk(i);
+    // Capped to 2 new chunks per frame - see the matching comment on
+    // CourseDecor.ts's update() for why (unbounded generation here can
+    // spike a single frame long enough to trip the multiplayer snapshot-
+    // timeout watchdog during sustained boosting). Newly created groups are
+    // returned so Game.ts can shader-prewarm just that group instead of the
+    // whole scene - see the matching comment on CourseDecor.ts's update().
+    const newGroups = [];
+    let generatedThisFrame = 0;
+    for (let i = currentChunk; i <= currentChunk + 2 && generatedThisFrame < 2; i++) {
+      if (!this.chunks.has(i)) {
+        const group = this.generateChunk(i);
+        if (group) newGroups.push(group);
+        generatedThisFrame++;
+      }
     }
 
     for (const mesh of this.active) {
@@ -247,6 +260,8 @@ export class Landmarks {
         this.chunks.delete(idx);
       }
     }
+
+    return newGroups;
   }
 
   dispose() {
