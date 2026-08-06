@@ -243,7 +243,7 @@ const gameServer = new Server({
 });
 gameServer.define(ROOM_NAME, SkiRoom);
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3002;
 gameServer.listen(PORT).then(() => {
   console.log(`SkiFree 3D server running on http://localhost:${PORT}`);
 });

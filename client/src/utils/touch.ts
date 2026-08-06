@@ -18,6 +18,30 @@ export function isTouchActive() {
   return window.matchMedia('(pointer: coarse)').matches;
 }
 
+const TOUCH_ACTIVE_QUERY = '(pointer: coarse)';
+
+/** Reactive version of isTouchActive() - see its own comment for the
+ * 'auto'/'on'/'off' precedence. Settings has no change-subscription
+ * mechanism of its own, so this only re-evaluates on the media query
+ * changing (e.g. a mouse gets plugged into a tablet) or on remount: callers
+ * that re-render on every frame anyway (GameHud) already pick up a
+ * touchControls setting change for free without this, since isTouchActive()
+ * is called fresh on each of those renders regardless. */
+export function useTouchActive() {
+  const [active, setActive] = useState(isTouchActive);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia(TOUCH_ACTIVE_QUERY);
+    const handler = () => setActive(isTouchActive());
+    handler();
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+
+  return active;
+}
+
 export function isPortraitOrientation() {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
   return window.matchMedia('(orientation: portrait)').matches;

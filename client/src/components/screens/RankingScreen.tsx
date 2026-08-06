@@ -12,6 +12,7 @@ interface RankingScreenProps {
   controller: GameController;
   entries: RankingEntry[];
   detail: RankingPlayerSummary | null;
+  loading?: boolean;
 }
 
 function formatMode(mode: string) {
@@ -28,7 +29,7 @@ function dateText(value: number) {
   return new Date(value).toLocaleDateString();
 }
 
-export function RankingScreen({ controller, entries, detail }: RankingScreenProps) {
+export function RankingScreen({ controller, entries, detail, loading = false }: RankingScreenProps) {
   const [tab, setTab] = useState<'all' | 'today'>('all');
   const [dailyEntries, setDailyEntries] = useState<RankingEntry[]>([]);
   const [dailyLoading, setDailyLoading] = useState(false);
@@ -100,7 +101,10 @@ export function RankingScreen({ controller, entries, detail }: RankingScreenProp
           {tab === 'today' && dailyLoading && !dailyEntries.length && (
             <div className="my-4 text-sm text-[#aab9cf]">Loading today's runs…</div>
           )}
-          {!displayedEntries.length && !dailyError && !dailyLoading && (
+          {tab === 'all' && loading && !displayedEntries.length && (
+            <div className="my-4 text-sm text-[#aab9cf]">Loading rankings…</div>
+          )}
+          {!displayedEntries.length && !dailyError && !dailyLoading && !(tab === 'all' && loading) && (
             <div className="my-4 text-sm text-[#aab9cf]">No runs recorded yet.</div>
           )}
           <ScrollArea className="max-h-[52vh]">
@@ -142,10 +146,15 @@ export function RankingScreen({ controller, entries, detail }: RankingScreenProp
             }
             setConfirmClear(false);
             controller.clearRanking();
+            // Today's tab is fetched separately (rankingStore.getDaily) and
+            // clearRanking() only updates the all-time entries the store
+            // passes down - without this, stale "Today" rows keep showing
+            // until some unrelated state change happens to re-run the fetch.
+            setDailyEntries([]);
           }}
         >
           <RotateCcw className="h-4 w-4" />
-          {confirmClear ? 'Confirm' : 'Clear'}
+          {confirmClear ? 'Confirm - clears all-time & today' : 'Clear'}
         </Button>
       </div>
     </ScreenFrame>

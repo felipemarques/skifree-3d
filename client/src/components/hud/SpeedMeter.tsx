@@ -1,4 +1,7 @@
-const MAX_DISPLAY_SPEED_KMH = 105;
+// True max is BOOST_SPEED(28 m/s) * 3.6 = 100.8 km/h (shared/AuthoritativeSim.ts,
+// client/src/game/Player.ts) - was 105, which meant the bar could never
+// actually reach full even at max boost.
+const MAX_DISPLAY_SPEED_KMH = 101;
 // Mirrors MOMENTUM_BONUS_THRESHOLD/MOMENTUM_MAX_BONUS_RATE in
 // shared/AuthoritativeSim.ts and Player.ts - display only, doesn't affect
 // scoring, just needs to describe the same numbers the game actually uses.

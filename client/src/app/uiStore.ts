@@ -40,6 +40,7 @@ const initialState: UiStoreState = {
   },
   rankingEntries: [],
   rankingDetail: null,
+  rankingLoading: false,
   gameOver: {
     distance: 0,
     scores: [],

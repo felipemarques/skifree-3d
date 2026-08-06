@@ -1,7 +1,7 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
-import { generateGameplayChunk, getBiomeKindAtZ, getRampedHazardVolume, getRampedRampVolume } from '../../../shared/AuthoritativeSim';
+import { generateGameplayChunk, getBiomeKindAtZ, getRampedHazardVolume, getRampedRampVolume, SNOWBALL_THROWER_ROLL_CHANCE, THROWER_TELEGRAPH_LEAD } from '../../../shared/AuthoritativeSim';
 import { getBiomeHueShiftAtZ } from './Biome';
 
 const CHUNK_SIZE = 80;
@@ -854,6 +854,36 @@ function makeNPCSkier(rng) {
   return group;
 }
 
+// Snowball NPC hazard - a stationary trailside figure that winds up (its
+// held snowball glows/grows) as the player approaches, then throws. The
+// actual throw trigger/physics live in Player.ts (solo) and
+// shared/AuthoritativeSim.ts (multiplayer) - this mesh only plays the
+// telegraph, driven locally off distance-to-player in update() below, so it
+// stays in sync with the real trigger without needing any network state.
+function makeSnowballThrower(rng) {
+  const jacket = new THREE.Color().setHSL(0.0, 0.55, 0.32);
+  const group = buildSkierMesh(jacket, {
+    helmetColor: new THREE.Color().setHSL(0.0, 0.4, 0.22),
+    scarfColor: new THREE.Color().setHSL(0.02, 0.6, 0.4),
+    scale: 0.92,
+  });
+
+  const snowball = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 8, 6),
+    new THREE.MeshStandardMaterial({ color: 0xf5fbff, emissive: 0x8ed8ff, emissiveIntensity: 0.1, roughness: 0.55 }),
+  );
+  snowball.position.set(0.32, 0.8, 0.18);
+  snowball.scale.setScalar(0.001);
+  group.add(snowball);
+  group.userData.snowball = snowball;
+  group.userData.windState = 'idle';
+
+  group.userData.halfW = 0.4;
+  group.userData.halfD = 0.4;
+  group.userData.type = 'thrower';
+  return group;
+}
+
 function makeDog(rng) {
   const group = new THREE.Group();
   const parts = {
@@ -1104,6 +1134,7 @@ export class Obstacles {
     // obstacle placement sequence outside set-piece zones).
     this.seed = Number(options.seed) || 0;
     this.difficultyRamp = !!options.difficultyRamp;
+    this.snowballNpcs = !!options.snowballNpcs;
     this.chunks = new Map();
     this.active = [];
   }
@@ -1379,6 +1410,16 @@ export class Obstacles {
       });
     }
 
+    // Snowball NPC hazard - mirrors shared/AuthoritativeSim.ts's matching
+    // roll in generateGameplayChunk, independent of biome/set-piece.
+    if (this.snowballNpcs && rng.next() < SNOWBALL_THROWER_ROLL_CHANCE) {
+      const side = rng.next() < 0.5 ? -1 : 1;
+      spawnPlaced(() => makeSnowballThrower(rng), [side * (TRACK_LIMIT - 8), side * (TRACK_LIMIT - 2)], [16, CHUNK_SIZE - 16], {
+        attempts: 10,
+        padding: 1.5,
+      });
+    }
+
     this.scene.add(group);
     this.chunks.set(chunkIndex, { group, obstacles: chunkObstacles });
     this.active.push(...chunkObstacles);
@@ -1389,7 +1430,7 @@ export class Obstacles {
 
     const group = new THREE.Group();
     const chunkObstacles = [];
-    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp);
+    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp, this.snowballNpcs);
     const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.authoritativeSeed, chunkIndex * CHUNK_SIZE);
 
     // Meshes are built from the authoritative records' own extents so the
@@ -1412,6 +1453,7 @@ export class Obstacles {
       if (type === 'ramp') return makeRamp(rng);
       if (type === 'hole') return makeHole(rng, { halfW: record.halfW, halfD: record.halfD });
       if (type === 'heart') return makeHeartPickup(rng);
+      if (type === 'thrower') return makeSnowballThrower(rng);
       return makeRock(rng, rockHueShift);
     };
 
@@ -1610,6 +1652,25 @@ export class Obstacles {
       } else if (obs.type === 'heart') {
         obs.animTime += dt;
         obs.mesh.rotation.y += dt * 1.8;
+      } else if (obs.type === 'thrower') {
+        // Purely cosmetic wind-up telegraph, driven locally off distance to
+        // the player - see makeSnowballThrower's comment on why this doesn't
+        // need to read any network/server state to stay in sync with the
+        // real (server- or Player.ts-triggered) throw.
+        const snowball = obs.mesh.userData.snowball;
+        if (snowball && obs.windState !== 'thrown') {
+          const distToImpact = obs.z - playerZ;
+          if (distToImpact < 0) {
+            obs.windState = 'thrown';
+            snowball.scale.setScalar(0.001);
+          } else if (distToImpact <= THROWER_TELEGRAPH_LEAD) {
+            const t = 1 - distToImpact / THROWER_TELEGRAPH_LEAD;
+            snowball.scale.setScalar(THREE.MathUtils.lerp(0.15, 1, t));
+            snowball.material.emissiveIntensity = THREE.MathUtils.lerp(0.1, 0.6, t) * (0.75 + 0.25 * Math.sin(now * 6));
+          } else {
+            snowball.scale.setScalar(0.001);
+          }
+        }
       }
 
       let rockfallDrop = 0;

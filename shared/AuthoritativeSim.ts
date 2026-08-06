@@ -104,6 +104,16 @@ const MULTIPLAYER_SPAWN_SPACING = 8;
 const MULTIPLAYER_SPAWN_JITTER = 1.15;
 const NEAR_MISS_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree', 'npc', 'dog', 'bear']);
 const NEAR_MISS_MARGIN = 0.4;
+// Snowball NPC hazard (togglable via RoomSettings.snowballNpcs / the solo
+// Settings equivalent) - a stationary trailside "thrower" obstacle that
+// throws one snowball as an approaching player crosses a trigger line ahead
+// of it. THROWER_TRIGGER_DISTANCE is where the actual throw fires (kept in
+// AuthoritativeSim.ts so server and client agree bit-for-bit on timing);
+// THROWER_TELEGRAPH_LEAD is purely a client-side visual wind-up cue and
+// isn't read here.
+export const SNOWBALL_THROWER_ROLL_CHANCE = 0.35;
+export const THROWER_TRIGGER_DISTANCE = 14;
+export const THROWER_TELEGRAPH_LEAD = 24;
 const NEAR_MISS_MIN_BONUS = 0.5;
 const NEAR_MISS_MAX_BONUS = 3;
 const JUMP_CHAIN_WINDOW_MS = 4500;
@@ -253,7 +263,7 @@ export class OrderedInputBuffer {
   }
 }
 
-export type ObstacleType = 'tree' | 'fallen_tree' | 'rock' | 'stump' | 'ramp' | 'hole' | 'heart';
+export type ObstacleType = 'tree' | 'fallen_tree' | 'rock' | 'stump' | 'ramp' | 'hole' | 'heart' | 'thrower';
 
 export interface ObstacleRecord {
   id: string;
@@ -279,6 +289,12 @@ export interface ObstacleRecord {
    * ordinary rock from the moment it's generated.
    */
   subtype?: string;
+  /**
+   * One-shot latch for the `thrower` hazard: set once it has fired its
+   * snowball at an approaching player, so it never throws twice. Unused by
+   * every other obstacle type.
+   */
+  hasThrown?: boolean;
 }
 
 export interface PlayerSimState {
@@ -353,7 +369,7 @@ export interface PlayerSimState {
 export interface SimEvent {
   type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck'
     | 'avalanche-warning' | 'avalanche-capture' | 'avalanche-outrun' | 'trick' | 'trick-fail' | 'fork-bold-line'
-    | 'landing-precision' | 'air-clear' | 'air-boost' | 'combat-throw';
+    | 'landing-precision' | 'air-clear' | 'air-boost' | 'combat-throw' | 'npc-throw';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -364,9 +380,9 @@ export interface SimEvent {
   chainCount?: number;
   bonus?: number;
   spinDeg?: number;
-  // combat-throw only - spawn parameters for the client's own cosmetic
-  // projectile physics/rendering (see PostFX-adjacent client code in
-  // Game.ts's _spawnProjectile). Hit detection itself is authoritative
+  // combat-throw/npc-throw only - spawn parameters for the client's own
+  // cosmetic projectile physics/rendering (see PostFX-adjacent client code
+  // in Game.ts's _spawnProjectile). Hit detection itself is authoritative
   // (see simulateProjectilesTick) and reports back as ordinary 'hit'/
   // 'death' events, so this is purely visual spawn data.
   x?: number;
@@ -375,6 +391,10 @@ export interface SimEvent {
   vx?: number;
   vy?: number;
   vz?: number;
+  // npc-throw only - the id of the thrower obstacle that fired, so the
+  // spawned projectile's ownerId (`npc:${throwerId}`) never collides with a
+  // real player's socket id.
+  throwerId?: string;
 }
 
 export interface RoomSnapshotPlayer {
@@ -512,6 +532,10 @@ function obstacleExtents(type: ObstacleType, rng: SimRandom) {
   }
   if (type === 'stump') return { halfW: 0.3, halfD: 0.3 };
   if (type === 'ramp') return { halfW: 1.85, halfD: 1.35 };
+  // Non-solid (see the `obs.type === 'thrower'` skip in simulatePlayerTick's
+  // collision loop) - this footprint is only used for overlap padding
+  // against other spawned obstacles, never for player collision.
+  if (type === 'thrower') return { halfW: 0.4, halfD: 0.4 };
   // 0.46 matches the client's heart pickup visual (Obstacles.ts) so touching
   // the rendered heart always collects it — was 0.34, which left a ring of
   // "visually touching, not collecting" around every pickup in multiplayer.
@@ -883,7 +907,7 @@ function isGlacierRockfallChunk(seed: number, chunkIndex: number): boolean {
   return roll < GLACIER_ROCKFALL_ROLL_CHANCE;
 }
 
-export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false) {
+export function generateGameplayChunk(seed: number, chunkIndex: number, obstacleVolume = 1, consumedPickupIds: Set<string> = new Set(), difficultyRamp = false, snowballNpcs = false) {
   const rng = new SimRandom((seed + chunkIndex * 7919) >>> 0);
   const zBase = chunkIndex * CHUNK_SIZE;
   const records: ObstacleRecord[] = [];
@@ -1052,6 +1076,16 @@ export function generateGameplayChunk(seed: number, chunkIndex: number, obstacle
     }
   }
 
+  // Snowball NPC hazard - a low per-chunk chance of one stationary trailside
+  // thrower, independent of biome/set-piece so it can occur anywhere. Only
+  // rolled when the room/solo setting is on, so chunk layouts are bit-
+  // identical to today whenever the feature is off.
+  if (snowballNpcs && rng.next() < SNOWBALL_THROWER_ROLL_CHANCE) {
+    const side = rng.next() < 0.5 ? -1 : 1;
+    const edgeX: [number, number] = [side * (TRACK_LIMIT - 8), side * (TRACK_LIMIT - 2)];
+    trySpawn('thrower', edgeX, [16, CHUNK_SIZE - 16], { attempts: 10, padding: 1.5 });
+  }
+
   return records;
 }
 
@@ -1069,6 +1103,7 @@ export function getGameplayObstaclesNear(
   consumedPickupIds: Set<string>,
   difficultyRamp = false,
   chunkCache: Map<number, ObstacleRecord[]> | null = null,
+  snowballNpcs = false,
 ) {
   const currentChunk = Math.floor(z / CHUNK_SIZE);
   const result: ObstacleRecord[] = [];
@@ -1076,7 +1111,7 @@ export function getGameplayObstaclesNear(
     if (chunk < 0) continue;
     let chunkRecords = chunkCache?.get(chunk);
     if (!chunkRecords) {
-      chunkRecords = generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds, difficultyRamp);
+      chunkRecords = generateGameplayChunk(seed, chunk, obstacleVolume, consumedPickupIds, difficultyRamp, snowballNpcs);
       chunkCache?.set(chunk, chunkRecords);
     }
     for (const obs of chunkRecords) {
@@ -1245,7 +1280,7 @@ function damagePlayer(state: PlayerSimState, obstacle: { id: string; type: strin
       ? 'hole'
       : obstacle.type === 'tree'
         ? 'tree'
-        : obstacle.type === 'sky_mario_projectile'
+        : obstacle.type === 'sky_mario_projectile' || obstacle.type === 'npc_snowball'
           ? 'skier'
           : 'tumble';
     events.push({ ...baseEvent, type: 'death', kind: state.deathKind });
@@ -1280,10 +1315,14 @@ export interface ProjectileSimState {
   vz: number;
   life: number;
   hit: boolean;
+  // 'npc' for the snowball-NPC hazard (see THROWER_TRIGGER_DISTANCE),
+  // 'player' for Sky Mario combat throws - only affects which obstacle type
+  // damagePlayer/the death-kind ternary sees, not the physics.
+  kind: 'player' | 'npc';
 }
 
-export function createProjectile(id: string, ownerId: string, spawn: { x: number; y: number; z: number; vx: number; vy: number; vz: number }): ProjectileSimState {
-  return { id, ownerId, x: spawn.x, y: spawn.y, z: spawn.z, vx: spawn.vx, vy: spawn.vy, vz: spawn.vz, life: PROJECTILE_LIFETIME, hit: false };
+export function createProjectile(id: string, ownerId: string, spawn: { x: number; y: number; z: number; vx: number; vy: number; vz: number }, kind: 'player' | 'npc' = 'player'): ProjectileSimState {
+  return { id, ownerId, x: spawn.x, y: spawn.y, z: spawn.z, vx: spawn.vx, vy: spawn.vy, vz: spawn.vz, life: PROJECTILE_LIFETIME, hit: false, kind };
 }
 
 // Authoritative Sky Mario combat hit detection - advances every live
@@ -1317,7 +1356,7 @@ export function simulateProjectilesTick(projectiles: ProjectileSimState[], playe
       const dy = Math.abs((state.y + PROJECTILE_TARGET_Y_OFFSET) - p.y);
       if (dx < PROJECTILE_HIT_HALF_X && dz < PROJECTILE_HIT_HALF_Z && dy < PROJECTILE_HIT_HALF_Y) {
         p.hit = true;
-        damagePlayer(state, { id: p.id, type: 'sky_mario_projectile' }, PROJECTILE_SPEED, events);
+        damagePlayer(state, { id: p.id, type: p.kind === 'npc' ? 'npc_snowball' : 'sky_mario_projectile' }, PROJECTILE_SPEED, events);
         break;
       }
     }
@@ -1336,6 +1375,7 @@ export function simulatePlayerTick(
   forkSafeLaneSlow = false,
   seed = 0,
   gameMode: GameMode = 'classic',
+  snowballNpcs = false,
 ): SimEvent[] {
   const events: SimEvent[] = [];
   if (!state.alive) return events;
@@ -1428,6 +1468,11 @@ export function simulatePlayerTick(
       continue;
     }
 
+    // Non-solid - the snowball NPC hazard only ever hurts via its thrown
+    // projectile (see the trigger loop after movement is resolved below),
+    // never via direct contact.
+    if (obs.type === 'thrower') continue;
+
     if (obs.type === 'ramp') {
       if (!state.isAirborne) {
         if (triggerJump(state, getRampJumpVelocity(state.speed), 'ramp')) {
@@ -1505,6 +1550,39 @@ export function simulatePlayerTick(
 
   state.x = newX;
   state.z = newZ;
+
+  // Snowball NPC hazard: fires once per thrower, when the player crosses a
+  // trigger line THROWER_TRIGGER_DISTANCE ahead of it - same "obs.z crossing
+  // previousZ..state.z" one-shot idiom as the near-miss loop below, just
+  // offset ahead of the obstacle instead of centered on it, and unconditional
+  // (a hazard, not a skill-scoring bonus).
+  if (snowballNpcs) {
+    for (const obs of obstacles) {
+      if (obs.type !== 'thrower' || obs.hasThrown) continue;
+      const triggerZ = obs.z - THROWER_TRIGGER_DISTANCE;
+      if (!(triggerZ >= previousZ && triggerZ < state.z)) continue;
+      obs.hasThrown = true;
+      const dx = state.x - obs.x;
+      const dz = state.z - obs.z;
+      const aimAngle = Math.atan2(dx, dz);
+      const launchSpeed = PROJECTILE_SPEED;
+      const vx = Math.sin(aimAngle) * launchSpeed;
+      const vz = Math.cos(aimAngle) * launchSpeed;
+      events.push({
+        type: 'npc-throw',
+        playerId: state.playerId,
+        socketId: state.id,
+        throwerId: obs.id,
+        distance: state.distance,
+        x: obs.x + Math.sin(aimAngle) * 0.65,
+        y: 0.82,
+        z: obs.z + Math.cos(aimAngle) * 1.0,
+        vx,
+        vy: 1.2,
+        vz,
+      });
+    }
+  }
 
   if (skillScoring && !state.isAirborne) {
     for (const obs of obstacles) {

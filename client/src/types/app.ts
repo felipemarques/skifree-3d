@@ -12,12 +12,14 @@ export interface RoomSettings {
   obstacleVolume: number;
   difficultyRamp?: boolean;
   skillScoring?: boolean;
+  snowballNpcs?: boolean;
 }
 
 export interface GameSettings extends RoomSettings {
-  controlMode: 'keyboard' | 'mouse' | 'both';
+  controlMode: 'keyboard' | 'mouse' | 'both' | 'gyro';
   mouseSensitivity: number;
   invertMouseY: boolean;
+  invertGyroX: boolean;
   sfxVolume: number;
   graphicsQuality: GraphicsQuality;
   fogLevel: number;
@@ -130,15 +132,14 @@ export interface UiAdapter {
   showTitle(): void;
   showSettings(): void;
   showWaiting(roomId: string, players?: PlayerStatus[]): void;
-  showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }): void;
+  showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }, reset?: boolean): void;
   showPause(): void;
   showGameOver(distance: number, scores?: PlayerStatus[], meta?: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved' | 'dailyKey'>>): void;
-  showRanking(entries?: RankingEntry[]): void;
+  showRanking(entries?: RankingEntry[], loading?: boolean): void;
   showRankingDetail(player: RankingPlayerSummary | null): void;
   updateHUD(distance: number, speed: number, hp: number, state?: Partial<HudState>): void;
   updateHearts(hp: number): void;
   updateWaitingPlayers(players?: PlayerStatus[]): void;
-  updateControlsHint(gameMode?: GameMode | string, notice?: string): void;
   updateRoomCountdown(remaining?: number | null): void;
   updatePlayerList(players?: PlayerStatus[]): void;
   showYetiWarning(show: boolean): void;
@@ -159,6 +160,7 @@ export interface UiAdapter {
   setError(message: string): void;
   clearError(): void;
   setNotice(message: string): void;
+  clearNotice(): void;
   setReconnecting(reconnecting: boolean): void;
 }
 
@@ -178,6 +180,7 @@ export interface UiStoreState {
   room: RoomState;
   rankingEntries: RankingEntry[];
   rankingDetail: RankingPlayerSummary | null;
+  rankingLoading: boolean;
   gameOver: GameOverState;
   playerList: PlayerStatus[];
   yetiWarning: boolean;
@@ -206,4 +209,6 @@ export interface ControllerSnapshot {
   muted: boolean;
   muteVisible: boolean;
   playerColor: string;
+  /** True right after a real MP disconnect ended a run - see playAgain()'s comment. */
+  roomLostToDisconnect: boolean;
 }

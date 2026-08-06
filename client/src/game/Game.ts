@@ -12,6 +12,7 @@ import { SnowParticles } from './Snow';
 import { ForkWindEffect } from './ForkWind';
 import { AvalancheEffect } from './AvalancheEffect';
 import { Input } from './Input';
+import { GyroControl } from './GyroControl';
 import { SeededRandom } from '../utils/SeededRandom';
 import { AudioManager } from './AudioManager';
 import { SkiTrail } from './SkiTrail';
@@ -203,6 +204,7 @@ export class Game {
     this.dailyKey = this.options.dailyKey || null;
     this._gameOverSent = false;
     this._finalGameOverShown = false;
+    this._finalGameOverTimeoutId = null;
     this._gameOverDistance = 0;
     this._gameOverTime = 0;
     this._startTime = performance.now();
@@ -237,6 +239,9 @@ export class Game {
     this.skillScoring = this.options.multiplayer
       ? !!this.roomSettings.skillScoring
       : (this.options.skillScoring !== undefined ? !!this.options.skillScoring : !!settings.get('skillScoring'));
+    this.snowballNpcs = this.options.multiplayer
+      ? !!this.roomSettings.snowballNpcs
+      : !!settings.get('snowballNpcs');
     this.playerColor = sanitizePlayerColor(this.options.playerColor || DEFAULT_PLAYER_COLOR);
     this._useHighGraphics = this.graphicsQuality === 'high';
     this._authoritativeMultiplayer = !!this.options.multiplayer;
@@ -276,6 +281,7 @@ export class Game {
     this._devFps = 0;
     this._devPing = null;
     this._devPingTimer = 0;
+    this._fakeGyroHeld = false;
     this._boundDevModeKeydown = this._onDevModeKeydown.bind(this);
     window.addEventListener('keydown', this._boundDevModeKeydown);
 
@@ -325,6 +331,35 @@ export class Game {
       this.snowVolume = Number(values.snowVolume);
       this.snow.setVolume(this.snowVolume);
     }
+    if (values.controlMode !== undefined) {
+      // Unlike the other live settings above, gyro can't just be "read
+      // fresh next frame" - starting it is an imperative, async permission
+      // request. Settings' Save button click is itself a user gesture
+      // (same as Start Game), so it's safe to request from here too.
+      this._syncGyroControl();
+    }
+  }
+
+  /**
+   * Starts or stops the device-tilt listener to match controlMode, called
+   * once from start() (fresh run) and again from applySettingsLive() (mode
+   * switched mid-run via Settings). Both call sites run synchronously
+   * inside a click handler, which iOS requires for the permission prompt -
+   * see GyroControl.ts.
+   */
+  _syncGyroControl() {
+    const wantsGyro = settings.get('controlMode') === 'gyro';
+    if (wantsGyro && !this.gyro) {
+      const gyro = new GyroControl();
+      this.gyro = gyro;
+      gyro.start((x, y, active) => this.input.setGyroVector(x, y, active)).catch(() => {
+        if (this.gyro === gyro) this.gyro = null;
+        this.ui.setError('Gyroscope access unavailable - pick another Control Mode in Settings.');
+      });
+    } else if (!wantsGyro && this.gyro) {
+      this.gyro.stop();
+      this.gyro = null;
+    }
   }
 
   _onDevModeKeydown(e) {
@@ -343,6 +378,12 @@ export class Game {
     } else {
       this._destroyDevOverlay();
       this._destroyDevHitboxGroup();
+      // Toggling dev mode off mid-hold otherwise stops _updateFakeGyroDebug
+      // from ever running again to release I/J/K/L, latching a phantom tilt.
+      if (this._fakeGyroHeld) {
+        this.input.setGyroVector(0, 0, false);
+        this._fakeGyroHeld = false;
+      }
     }
   }
 
@@ -451,6 +492,7 @@ export class Game {
       `obstacles: ${this.obstacles.active.length}  remotes: ${this.remotePlayers.size}`,
       `skillScoring: ${this.skillScoring}  difficultyRamp: ${this.difficultyRamp}`,
       `chainCount: ${this._authoritativeMultiplayer ? this._authState?.chainCount : p.chainCount}  bonusDistance: ${(this._authoritativeMultiplayer ? this._authState?.bonusDistance : p.bonusDistance)?.toFixed(1)}`,
+      `gyro: ${this.input._gyroActive ? `x=${this.input._gyroX.toFixed(2)} y=${this.input._gyroY.toFixed(2)}` : 'inactive'}  (fake: hold I/K/J/L)`,
     ].join('\n');
   }
 
@@ -483,9 +525,35 @@ export class Game {
     }
 
     this._rebuildDevHitboxes();
+    this._updateFakeGyroDebug();
     this._renderDevOverlay();
   }
-  
+
+  /**
+   * Dev-mode-only keyboard stand-in for a real device's gyroscope, for
+   * testing Gyroscope control mode (GyroControl.ts) on a desktop that has
+   * no tilt sensor at all. I/K/J/L (not WASD/arrows - those are real
+   * steering input, and would conflict) simulate full-deflection tilt in
+   * each direction while held, feeding Input.ts's setGyroVector() exactly
+   * like a real deviceorientation reading would - lateralAxis/
+   * mouseSpeedFraction can't tell the difference. Guarded so it only ever
+   * calls setGyroVector while actually in use (or on the release frame, to
+   * zero back out) - otherwise this per-frame poll would stomp a real
+   * gyro's readings to neutral on every frame no debug key happens to be
+   * held, on a touch-enabled laptop testing genuine device tilt alongside
+   * dev mode.
+   */
+  _updateFakeGyroDebug() {
+    const left = this.input.isDown('KeyJ');
+    const right = this.input.isDown('KeyL');
+    const up = this.input.isDown('KeyI');
+    const down = this.input.isDown('KeyK');
+    const active = left || right || up || down;
+    if (!active && !this._fakeGyroHeld) return;
+    this.input.setGyroVector((right ? 1 : 0) - (left ? 1 : 0), (up ? 1 : 0) - (down ? 1 : 0), active);
+    this._fakeGyroHeld = active;
+  }
+
   _setup() {
     // Scene
     this.scene = new THREE.Scene();
@@ -562,6 +630,7 @@ export class Game {
       seed,
       authoritativeSeed: this._authoritativeMultiplayer ? seed : null,
       difficultyRamp: this.difficultyRamp,
+      snowballNpcs: this.snowballNpcs,
     });
     this.courseDecor = new CourseDecor(this.scene, seed, this.graphicsQuality);
     this.player = new Player(this.scene, colorToNumber(this.playerColor), this.options.playerName || 'Skier');
@@ -598,6 +667,9 @@ export class Game {
     this.player.onJumpChain = (bonus, chainCount) => {
       this.ui.showJumpChainFeedback(bonus, chainCount);
       this.audio.playJumpChain();
+    };
+    this.player.onSnowballThrow = data => {
+      this._spawnProjectile({ ...data, ownerId: 'npc:local-thrower', remote: false });
     };
     this.player.onTrick = (bonus, spinDeg) => {
       this.ui.showTrickFeedback(bonus, spinDeg);
@@ -646,6 +718,7 @@ export class Game {
     this.impactParticles = new ImpactParticles(this.scene);
     this._skiSprayCooldown = 0;
     this.input = new Input();
+    this.gyro = null;
     this.yeti = new YetiManager(this.scene, {
       difficulty: this.difficulty,
       startMode: this.yetiStartMode,
@@ -779,7 +852,8 @@ export class Game {
     this.audio.setVolume(settings.get('sfxVolume'));
     this._running = true;
     this._lastTime = performance.now();
-    this.ui.showGame({ gameMode: this.gameMode });
+    this.ui.showGame({ gameMode: this.gameMode }, true);
+    this._syncGyroControl();
     this._prewarmShaders();
     this._loop(this._lastTime);
   }
@@ -1381,7 +1455,7 @@ export class Game {
     this._updateForkZoneVisual(pz);
     const forkSafeLaneSlow = this.player.position.x < -FORK_LANE_GAP && getForkZoneAhead(this.seed, pz, 0) !== null;
     const windPush = getWindPushAtZ(this.seed, pz);
-    this.player.update(dt, this.input, nearby, this.skillScoring, weather, forkSafeLaneSlow, windPush);
+    this.player.update(dt, this.input, nearby, this.skillScoring, weather, forkSafeLaneSlow, windPush, this.snowballNpcs);
     if (this._ghostRecording) {
       this._ghostRecording.sampleTimer += dt;
       if (this._ghostRecording.sampleTimer >= GHOST_SAMPLE_INTERVAL_S) {
@@ -1961,25 +2035,50 @@ export class Game {
         });
         continue;
       }
+      if (event.type === 'npc-throw') {
+        // Snowball NPC hazard - same "this event is the spawn itself, not
+        // feedback" shape as combat-throw above, just owned by a synthetic
+        // thrower id (never a real socket id) so simulateProjectilesTick
+        // treats every player as a valid target.
+        this._spawnProjectile({
+          ownerId: `npc:${event.throwerId}`,
+          x: Number(event.x) || 0,
+          y: Number(event.y) || 0.8,
+          z: Number(event.z) || 0,
+          vx: Number(event.vx) || 0,
+          vy: Number(event.vy) || 0,
+          vz: Number(event.vz) || PROJECTILE_SPEED,
+          remote: true,
+        });
+        continue;
+      }
       if (event.socketId !== localId) {
         this._applyRemotePlayerEventFeedback(event);
         continue;
       }
       if (event.type === 'hit') {
         this.ui.showHitFeedback();
-        this.audio.playCollision(this._panForObstacleId(event.obstacleId));
-        this.audio.playHeartLost();
-        this.camera.shake(0.35, 0.28);
-        this.triggerHitstop(0.13);
-        this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.3, this.player.position.z, {
-          count: 16,
-          color: [0.42, 0.36, 0.32],
-          speed: 3.2,
-          spread: 1,
-          upBias: 1.6,
-          life: 0.5,
-          groundY: this.player.position.y,
-        });
+        // Sensory feedback only (audio/camera/hitstop/particles) skipped
+        // while paused - the pause overlay already covers the screen, so
+        // firing these behind it just means a death mid-pause plays its
+        // hit reaction invisibly and the player resumes already dead with
+        // no warning. HP/status (showHitFeedback above) stays unconditional
+        // so the pause screen and Hearts.tsx still reflect the truth.
+        if (!this.isPaused) {
+          this.audio.playCollision(this._panForObstacleId(event.obstacleId));
+          this.audio.playHeartLost();
+          this.camera.shake(0.35, 0.28);
+          this.triggerHitstop(0.13);
+          this.impactParticles.burst(this.player.position.x, this.player.position.y + 0.3, this.player.position.z, {
+            count: 16,
+            color: [0.42, 0.36, 0.32],
+            speed: 3.2,
+            spread: 1,
+            upBias: 1.6,
+            life: 0.5,
+            groundY: this.player.position.y,
+          });
+        }
       } else if (event.type === 'heal') {
         this.ui.showHealFeedback();
       } else if (event.type === 'jump') {
@@ -2107,6 +2206,10 @@ export class Game {
   _handleAuthoritativeLocalDeath(player) {
     if (this._authLocalDeathHandled) return;
     this._authLocalDeathHandled = true;
+    // Captured before _gameOverSent flips below - isPaused's own definition
+    // excludes the game-over state, so reading it after that mutation would
+    // always report "not paused" here regardless of whether it actually was.
+    const wasPaused = this.isPaused;
     this._gameOverSent = true;
     this._gameOverDistance = player.distance || 0;
     this.player.isAlive = false;
@@ -2126,8 +2229,10 @@ export class Game {
       local: true,
       time: Math.floor((performance.now() - this._startTime) / 1000),
     });
-    this.audio.stopAll();
-    this.audio.playGameOver();
+    if (!wasPaused) {
+      this.audio.stopAll();
+      this.audio.playGameOver();
+    }
     this.options.onRunComplete?.({
       distance: this._gameOverDistance,
       scores: this._getScoreList(),
@@ -2165,7 +2270,12 @@ export class Game {
     if (this._finalGameOverShown) return;
     this._finalGameOverShown = true;
     const distance = this._gameOverDistance || Math.max(0, this.player.position.z - this._startZ);
-    window.setTimeout(() => {
+    // Captured so destroy() can cancel it - leaving a run during this delay
+    // (e.g. an MP disconnect bounced the player back to the menu) otherwise
+    // let this fire later anyway and flip the menu back to the gameover
+    // screen out from under whatever's showing by then.
+    this._finalGameOverTimeoutId = window.setTimeout(() => {
+      this._finalGameOverTimeoutId = null;
       this.ui.showGameOver(distance, this._getScoreList(), {
         gameMode: this.gameMode,
         difficulty: this.difficulty,
@@ -2331,8 +2441,7 @@ export class Game {
   // _onGameSnapshot's event loop) - triggering locally here too would
   // double-spawn a projectile for the thrower's own throw.
   _updateSkyMarioCombat(dt, groundYAt = null) {
-    if (this.gameMode !== 'sky_mario') return;
-    if (!this.options.multiplayer) {
+    if (this.gameMode === 'sky_mario' && !this.options.multiplayer) {
       this._throwCooldown = Math.max(0, this._throwCooldown - dt);
       const firePressed = this.input.fire;
       if (firePressed && !this._fireHeld && this._throwCooldown <= 0) {
@@ -2341,6 +2450,9 @@ export class Game {
       }
       this._fireHeld = firePressed;
     }
+    // Always runs (not gated to sky_mario) - the snowball NPC hazard spawns
+    // projectiles via this same pool regardless of game mode, so they still
+    // need to fly/bounce/hit-test every frame.
     this._updateProjectiles(dt, groundYAt);
   }
 
@@ -2563,11 +2675,17 @@ export class Game {
   destroy() {
     this._running = false;
     if (this._animFrame) cancelAnimationFrame(this._animFrame);
+    if (this._finalGameOverTimeoutId) {
+      window.clearTimeout(this._finalGameOverTimeoutId);
+      this._finalGameOverTimeoutId = null;
+    }
     this._longTaskObserver?.disconnect();
     window.removeEventListener('keydown', this._boundDevModeKeydown);
     this._destroyDevOverlay();
     this._destroyDevHitboxGroup();
     this.input.destroy();
+    this.gyro?.stop();
+    this.gyro = null;
     this.terrain.dispose();
     this.obstacles.dispose();
     this.courseDecor.dispose();

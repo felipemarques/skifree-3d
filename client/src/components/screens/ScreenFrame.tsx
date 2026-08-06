@@ -51,11 +51,22 @@ export function ScreenFrame({ children, className, panelClassName }: ScreenFrame
   const compact = useCompactLandscape();
   const scale = useFitScale(panelRef, compact);
 
+  // Keyboard users otherwise land back at the top of <body> on every screen
+  // transition instead of somewhere inside the screen that just appeared.
+  // Focusing the panel itself (not a specific control) is the generic,
+  // works-for-every-screen default; screens that want a more specific
+  // target (e.g. HowToPlayScreen's close button) simply focus it themselves
+  // in their own effect, which runs after this one and so wins.
+  useEffect(() => {
+    panelRef.current?.focus({ preventScroll: true });
+  }, []);
+
   return (
     <div className={cn('screen-backdrop pointer-events-auto', className)}>
       <div
         ref={panelRef}
-        className={cn('glass-panel grid w-[min(430px,calc(100vw-36px))] gap-5 p-7 text-white', panelClassName)}
+        tabIndex={-1}
+        className={cn('glass-panel grid w-[min(430px,calc(100vw-36px))] gap-5 p-7 text-white outline-none', panelClassName)}
         style={compact ? { transform: `scale(${scale})`, transformOrigin: 'center' } : undefined}
       >
         {children}

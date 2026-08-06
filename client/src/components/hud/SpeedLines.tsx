@@ -10,7 +10,7 @@ export function SpeedLines({ speed }: { speed: number }) {
   if (t <= 0) return null;
   return (
     <div
-      className="speed-lines pointer-events-none fixed inset-0 z-[95]"
+      className="speed-lines pointer-events-none fixed inset-0 z-[var(--z-hud-speedlines)]"
       style={{ opacity: t * MAX_OPACITY }}
     />
   );

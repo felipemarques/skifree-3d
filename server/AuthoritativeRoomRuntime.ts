@@ -157,15 +157,18 @@ export class AuthoritativeRoomRuntime {
         this.consumedPickupIds,
         this.room.settings.difficultyRamp,
         this._chunkCache,
+        this.room.settings.snowballNpcs,
       );
       obstaclesByPlayer.set(socketId, obstacles);
       const weather = getWeatherAtZ(this.room.seed, state.z);
       const forkSafeLaneSlow = state.x < -FORK_LANE_GAP && getForkZoneAhead(this.room.seed, state.z, 0) !== null;
       const wasFinished = !!this.room.players.get(socketId)?.finished;
-      const tickEvents = simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather, forkSafeLaneSlow, this.room.seed, this.room.settings.gameMode);
+      const tickEvents = simulatePlayerTick(state, input, SIM_DT, obstacles, this.consumedPickupIds, this.roomTimeMs, this.room.settings.skillScoring, weather, forkSafeLaneSlow, this.room.seed, this.room.settings.gameMode, this.room.settings.snowballNpcs);
       for (const event of tickEvents) {
         if (event.type === 'combat-throw') {
           this.projectiles.push(createProjectile(`p${++this._projectileSeq}`, socketId, event));
+        } else if (event.type === 'npc-throw') {
+          this.projectiles.push(createProjectile(`n${++this._projectileSeq}`, `npc:${event.throwerId}`, event, 'npc'));
         }
       }
       this.events.push(...tickEvents);

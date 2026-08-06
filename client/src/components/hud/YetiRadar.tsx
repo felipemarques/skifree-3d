@@ -11,7 +11,7 @@ export function YetiRadar({ threats, touchActive = false }: { threats: YetiThrea
     : 'bottom-4 right-4 w-[132px] max-sm:bottom-2.5 max-sm:right-2.5 max-sm:w-[118px]';
 
   return (
-    <div className={`pointer-events-none fixed z-[60] text-red-50 ${positionClass}`}>
+    <div className={`hud-radar-wrapper pointer-events-none fixed z-[var(--z-hud-panel)] text-red-50 ${positionClass}`}>
       <div className="hud-glass grid gap-1.5 border-red-300/40 bg-red-950/50 p-2">
         <div className="flex justify-between text-[10px] font-black uppercase tracking-wide text-red-200">
           <span>Yeti</span>

@@ -20,7 +20,7 @@ export class AudioManager {
   constructor() {
     this._ctx       = null;
     this._ready     = false;
-    this._muted     = false;
+    this._muted     = !!settings.get('muted');
     this._stopped   = false;  // set to true on game over
     this._volume    = settings.get('sfxVolume');
 

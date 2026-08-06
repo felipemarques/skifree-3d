@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { GameController } from '@/app/gameController';
 
 const MAX_RADIUS = 52;
@@ -76,13 +76,21 @@ export function Joystick({ controller }: { controller: GameController | null }) 
 
   const active = touchId !== null;
 
+  // A screen change mid-drag (e.g. pause) unmounts this component without
+  // ever firing touchend/touchcancel - without this, the last reported
+  // vector stays latched in Input.ts, steering the skier by a phantom
+  // finger that's no longer there.
+  useEffect(() => {
+    return () => controller?.setJoystickVector(0, 0, false);
+  }, [controller]);
+
   return (
     <div
       // Starts below the top-left HUD stat panel (hearts/mute button row)
       // instead of the full viewport height - otherwise this touch-capture
       // zone sits on top of the mute button and swallows every tap meant
       // for it.
-      className="pointer-events-auto fixed left-0 top-20 bottom-0 z-[150] w-[58%]"
+      className="pointer-events-auto fixed left-0 top-20 bottom-0 z-[var(--z-touch-joystick)] w-[58%]"
       style={{ touchAction: 'none' }}
       onTouchStart={onTouchStart}
       onTouchMove={onTouchMove}

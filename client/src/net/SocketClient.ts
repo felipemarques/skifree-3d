@@ -33,12 +33,15 @@ export class SocketClient {
     if (this._client) return;
     // Empty string = same origin, matching the old socket.io default - but
     // in dev the page is served by Vite (:5173) while the game server runs
-    // on :3000, so colyseus.js needs to be pointed there directly (its own
+    // on :3002, so colyseus.js needs to be pointed there directly (its own
     // WS connection isn't a fixed-prefix path Vite's proxy can forward).
     // Plain REST calls (e.g. the room-code lookup) still go through Vite's
     // existing `/api` proxy via relative fetch(), so no proxy config changes
-    // were needed for those.
-    const endpoint = serverUrl || (import.meta.env?.DEV ? 'http://localhost:3000' : undefined);
+    // were needed for those. Pointed at the dev machine's LAN IP rather than
+    // localhost so a phone on the same network (e.g. for gyro testing) can
+    // reach it too - localhost on the phone would otherwise resolve to the
+    // phone itself.
+    const endpoint = serverUrl || (import.meta.env?.DEV ? 'http://192.168.0.103:3002' : undefined);
     this._client = endpoint ? new Client(endpoint) : new Client();
   }
 
@@ -134,11 +137,19 @@ export class SocketClient {
       console.warn(`[socket] room:onLeave code=${code} reason=${reason || ''} intentional=${this._leavingIntentionally}`);
       this._connected = false;
       if (this._room === room) this._room = null;
-      this._emit('disconnect', {});
       if (this._leavingIntentionally) {
+        // Self-initiated (leaveRoom()/disconnect()/_leaveCurrentRoomIfAny())
+        // - by the time this fires the caller has already driven whatever
+        // UI transition it wanted (or, for _leaveCurrentRoomIfAny, is about
+        // to bind a brand new room right after this resolves). Emitting
+        // 'disconnect' here too would let gameController's handler mistake
+        // an intentional rebind for a real drop and reset room state out
+        // from under the rejoin in flight - see _leaveCurrentRoomIfAny's
+        // comment on the "zombie player" bug this guards against.
         this._leavingIntentionally = false;
         return;
       }
+      this._emit('disconnect', {});
       this._attemptReconnect();
     });
 
@@ -218,8 +229,38 @@ export class SocketClient {
     }
   }
 
+  // Guards against the "zombie player" bug: gameController.playAgain()
+  // destroys the local Game and immediately calls joinRoom() again for a
+  // fresh run, without ever calling leaveRoom() on the room connection from
+  // the run that just ended - that old room object was otherwise left bound
+  // (and its WebSocket open) while a second, brand new session joined
+  // alongside it. The server had no signal the old session was abandoned,
+  // so it lingered as a duplicate seat and - since it was the *first*
+  // session, per onJoin's isCreator check - kept ownerId, silently demoting
+  // the real, still-playing client to a non-host duplicate of itself.
+  // Explicitly leaving any previously bound room first (and awaiting the
+  // clean, consented removal it triggers server-side) before joining/
+  // creating a new one closes that gap for every caller, not just playAgain.
+  async _leaveCurrentRoomIfAny() {
+    if (!this._room) return;
+    const staleRoom = this._room;
+    this._leavingIntentionally = true;
+    try {
+      await staleRoom.leave();
+    } catch {
+      // leave() itself failed (already gone/unreachable) rather than
+      // resolving via the room's own onLeave - that handler is what
+      // normally resets _leavingIntentionally, so reset it here too or a
+      // later, genuinely unexpected disconnect on the *next* room would
+      // silently get swallowed by this stale flag.
+      this._leavingIntentionally = false;
+    }
+    if (this._room === staleRoom) this._room = null;
+  }
+
   async createRoom(playerName, roomSettings = {}, playerId = '', playerColor = '', turnRate = 1.8) {
     this.connect();
+    await this._leaveCurrentRoomIfAny();
     try {
       const room = await this._client.create(ROOM_NAME, { playerName, playerId, playerColor, settings: roomSettings, turnRate }, SimStateSchema);
       this._bindRoom(room); // _lastRoomCode is set from the server's 'room:created' message
@@ -237,6 +278,8 @@ export class SocketClient {
     // 'connect' handler after a drop), a token resume is already underway
     // via _attemptReconnect() - nothing further to do.
     if (this._reconnecting && this._lastRoomCode === code) return;
+
+    await this._leaveCurrentRoomIfAny();
 
     try {
       const res = await fetch(`/api/rooms/${code}/lookup`);

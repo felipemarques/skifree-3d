@@ -21,6 +21,7 @@ const DEFAULT_ROOM_SETTINGS = {
   obstacleVolume: 1,
   difficultyRamp: false,
   skillScoring: false,
+  snowballNpcs: false,
 };
 const VALID_GAME_MODES = new Set(['classic', 'sky_mario']);
 const VALID_DIFFICULTIES = new Set(['easy', 'normal', 'hard', 'extreme']);
@@ -30,6 +31,10 @@ const MULTIPLAYER_START_COUNTDOWN_SECONDS = 10;
 // up for good - mirrors the old DISCONNECT_GRACE_MS, expressed in seconds
 // for Colyseus's allowReconnection(client, seconds) API.
 const DISCONNECT_GRACE_SECONDS = 15;
+// How long an empty room (0 players) is kept alive before self-disposing -
+// see onCreate's autoDispose comment. Comfortably longer than a "Play
+// Again" round trip (leave old room -> lookup -> joinById).
+const ROOM_EMPTY_DISPOSE_MS = 20000;
 const MAX_ROOM_PLAYERS = 8;
 
 // Rankings persistence is one shared SQLite-backed instance for the whole
@@ -58,6 +63,7 @@ function sanitizeRoomSettings(input = {}) {
     obstacleVolume: clamp(Number(input.obstacleVolume ?? DEFAULT_ROOM_SETTINGS.obstacleVolume) || 0, 0, 2),
     difficultyRamp: input.difficultyRamp === undefined ? DEFAULT_ROOM_SETTINGS.difficultyRamp : !!input.difficultyRamp,
     skillScoring: input.skillScoring === undefined ? DEFAULT_ROOM_SETTINGS.skillScoring : !!input.skillScoring,
+    snowballNpcs: input.snowballNpcs === undefined ? DEFAULT_ROOM_SETTINGS.snowballNpcs : !!input.snowballNpcs,
   };
 }
 
@@ -78,7 +84,19 @@ function getAvailablePlayerColor(players, requestedColor, exceptSessionId = null
 class SkiRoom extends Room {
   onCreate(options = {}) {
     this.maxClients = MAX_ROOM_PLAYERS;
-    this.autoDispose = true;
+    // Manual disposal instead of Colyseus's default "dispose as soon as the
+    // last client leaves" - "Play Again" (SocketClient.joinRoom) now leaves
+    // the old room connection before joining a fresh one for the new run,
+    // so a solo room (or the last player in one) briefly, legitimately hits
+    // 0 players between the old session leaving and the new one joining.
+    // Auto-dispose raced that gap: the room (and its matchmaker listing)
+    // could vanish before the rejoin's /api/rooms/:code/lookup + joinById
+    // completed, surfacing as "Room not found." _emptyDisposeTimer below
+    // gives it a grace window instead, the same idea as
+    // DISCONNECT_GRACE_SECONDS but for "everyone left" instead of "one
+    // client dropped".
+    this.autoDispose = false;
+    this._emptyDisposeTimer = null;
 
     // The sim-state schema (per-tick player positions/etc + consumedPickupIds)
     // is patched manually by AuthoritativeRoomRuntime at its own cadence
@@ -154,6 +172,11 @@ class SkiRoom extends Room {
       throw new Error('Room game already started.');
     }
 
+    if (this._emptyDisposeTimer) {
+      clearTimeout(this._emptyDisposeTimer);
+      this._emptyDisposeTimer = null;
+    }
+
     const { playerName, playerId, playerColor, turnRate } = options;
     const isCreator = this.players.size === 0;
     if (isCreator) this.ownerId = client.sessionId;
@@ -202,6 +225,10 @@ class SkiRoom extends Room {
 
   onDispose() {
     this.clearCountdown();
+    if (this._emptyDisposeTimer) {
+      clearTimeout(this._emptyDisposeTimer);
+      this._emptyDisposeTimer = null;
+    }
     if (this.runtime) {
       this.runtime.stop();
       this.runtime = null;
@@ -380,6 +407,13 @@ class SkiRoom extends Room {
         this.runtime.stop();
         this.runtime = null;
       }
+      // Give a rejoin (e.g. "Play Again") a grace window to claim this room
+      // back before it self-disposes - see onCreate's autoDispose comment.
+      if (this._emptyDisposeTimer) clearTimeout(this._emptyDisposeTimer);
+      this._emptyDisposeTimer = setTimeout(() => {
+        this._emptyDisposeTimer = null;
+        if (this.players.size === 0) this.disconnect();
+      }, ROOM_EMPTY_DISPOSE_MS);
       return;
     }
 

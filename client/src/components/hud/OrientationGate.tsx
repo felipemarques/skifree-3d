@@ -41,7 +41,7 @@ export function OrientationGate({ active, controller }: { active: boolean; contr
   if (!blocking) return null;
 
   return (
-    <div className="fixed inset-0 z-[300] flex flex-col items-center justify-center gap-3 bg-slate-950/95 px-6 text-center">
+    <div className="fixed inset-0 z-[var(--z-modal-flash)] flex flex-col items-center justify-center gap-3 bg-slate-950/95 px-6 text-center">
       <RotateCcw className="h-10 w-10 text-cyan-300" />
       <div className="text-lg font-black text-white">Rotate your device</div>
       <div className="text-sm text-[#c7d6ea]">This game plays best in landscape.</div>

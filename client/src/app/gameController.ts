@@ -74,6 +74,7 @@ function normalizeRoomSettings(nextSettings: Partial<RoomSettings> = {}): RoomSe
     obstacleVolume: Number(nextSettings.obstacleVolume ?? 1),
     difficultyRamp: !!nextSettings.difficultyRamp,
     skillScoring: !!nextSettings.skillScoring,
+    snowballNpcs: !!nextSettings.snowballNpcs,
   };
 }
 
@@ -93,6 +94,14 @@ export class GameController {
   private roomCountdown: number | null = null;
   private settingsReturnMode: 'title' | 'pause' = 'title';
   private currentRankingEntries: RankingEntry[] = [];
+  private _rankingRequestId = 0;
+  private _rankingDetailRequestId = 0;
+  // Create/Join Room timeout - see _armRoomConnectTimeout's comment.
+  private _roomConnectTimeoutId: number | null = null;
+  // Set when a real MP disconnect (not a normal "Play Again") ends a run on
+  // the gameover screen - see the 'disconnect' handler and playAgain()'s
+  // comment on why "Again" needs to know about this.
+  private roomLostToDisconnect = false;
   private listeners = new Set<SnapshotListener>();
   private isReconnecting = false;
   private reconnectGiveUpHandle: number | null = null;
@@ -146,14 +155,23 @@ export class GameController {
       isRoomHost: host,
       settingsReturnMode: this.settingsReturnMode,
       roomSettingsLocked: !host || countingDown,
-      roomStartLabel: countingDown
-        ? `Starting ${Math.max(0, Math.round(Number(this.roomCountdown) || 0))}`
-        : 'Start Game',
+      // The live countdown number is shown once, in LobbyScreen's badge -
+      // repeating it here too read as two different countdowns at a glance.
+      roomStartLabel: countingDown ? 'Starting…' : 'Start Game',
       roomStartDisabled: !host || countingDown,
       muted: !!this.currentGame?.audio?.muted,
       muteVisible: !!this.currentGame,
       playerColor: this.playerColor,
+      roomLostToDisconnect: this.roomLostToDisconnect,
     };
+  }
+
+  dismissError() {
+    this.ui.clearError();
+  }
+
+  dismissNotice() {
+    this.ui.clearNotice();
   }
 
   getSocketId() {
@@ -179,6 +197,7 @@ export class GameController {
       controlMode: settings.get('controlMode'),
       mouseSensitivity: Number(settings.get('mouseSensitivity')),
       invertMouseY: !!settings.get('invertMouseY'),
+      invertGyroX: !!settings.get('invertGyroX'),
       sfxVolume: Number(settings.get('sfxVolume')),
       graphicsQuality: settings.get('graphicsQuality'),
       fogLevel: Number(settings.get('fogLevel')),
@@ -189,6 +208,7 @@ export class GameController {
       yetiStartMode: settings.get('yetiStartMode'),
       difficultyRamp: !!settings.get('difficultyRamp'),
       skillScoring: !!settings.get('skillScoring'),
+      snowballNpcs: !!settings.get('snowballNpcs'),
       touchControls: settings.get('touchControls'),
     };
   }
@@ -262,8 +282,10 @@ export class GameController {
   createRoom(name: string, gameMode: GameMode) {
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
+    this.roomLostToDisconnect = false;
     this.roomSettings = this.getLocalRoomSettings(gameMode);
     this.socket.createRoom(this.playerName, this.roomSettings, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
+    this._armRoomConnectTimeout();
     this.emit();
   }
 
@@ -275,8 +297,30 @@ export class GameController {
     }
     this.playerName = this.persistPlayerName(name);
     this.isMultiplayer = true;
+    this.roomLostToDisconnect = false;
     this.socket.joinRoom(roomCode, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
+    this._armRoomConnectTimeout();
     this.emit();
+  }
+
+  // Create/Join Room are fire-and-forget socket emits (see TitleScreen.tsx's
+  // `pendingRoom` comment) - if the server never responds with
+  // room:created/room:joined/room:error at all (down, unreachable, dropped
+  // packet), "Connecting…" would otherwise stick on the button forever with
+  // no way out. Cleared by whichever of those three actually arrives first.
+  private _armRoomConnectTimeout() {
+    if (this._roomConnectTimeoutId) window.clearTimeout(this._roomConnectTimeoutId);
+    this._roomConnectTimeoutId = window.setTimeout(() => {
+      this._roomConnectTimeoutId = null;
+      this.ui.setError('Server not responding. Try again.');
+      this.emit();
+    }, 10000);
+  }
+
+  private _disarmRoomConnectTimeout() {
+    if (!this._roomConnectTimeoutId) return;
+    window.clearTimeout(this._roomConnectTimeoutId);
+    this._roomConnectTimeoutId = null;
   }
 
   updatePlayerColor(color: string) {
@@ -306,7 +350,18 @@ export class GameController {
     this.destroyCurrentGame();
     if (this.isMultiplayer && this.roomId) {
       this.socket.joinRoom(this.roomId, this.playerName, (rankingStore as any).playerId, this.playerColor, settings.get('keyTurnSpeed'));
+      this._armRoomConnectTimeout();
       return;
+    }
+    // A real MP disconnect (not a normal room departure) already zeroed
+    // isMultiplayer/roomId via resetRoomState() by the time "Again" is
+    // clicked here, so the branch above never triggers and this silently
+    // starts a *solo* run instead - previously with no indication beyond an
+    // easily-missed toast from moments earlier. Surface it again, explicitly,
+    // right at the point the substitution actually happens.
+    if (this.roomLostToDisconnect) {
+      this.roomLostToDisconnect = false;
+      this.ui.setNotice('Multiplayer connection was lost - starting a solo run instead.');
     }
     const gameOver = this.store.getSnapshot().gameOver;
     if (gameOver?.dailyKey) {
@@ -333,6 +388,7 @@ export class GameController {
     settings.set('controlMode', values.controlMode);
     settings.set('mouseSensitivity', Number(values.mouseSensitivity));
     settings.set('invertMouseY', !!values.invertMouseY);
+    settings.set('invertGyroX', !!values.invertGyroX);
     settings.set('sfxVolume', Number(values.sfxVolume));
     settings.set('graphicsQuality', values.graphicsQuality);
     settings.set('fogLevel', Number(values.fogLevel));
@@ -343,6 +399,7 @@ export class GameController {
     settings.set('yetiStartMode', values.yetiStartMode);
     settings.set('difficultyRamp', !!values.difficultyRamp);
     settings.set('skillScoring', !!values.skillScoring);
+    settings.set('snowballNpcs', !!values.snowballNpcs);
     settings.set('touchControls', values.touchControls);
     this.currentGame?.applySettingsLive(values);
     this.currentGame?.audio?.setVolume(settings.get('sfxVolume'));
@@ -364,8 +421,21 @@ export class GameController {
       this.destroyCurrentGame();
     }
     this.menuBackdrop.start();
-    this.currentRankingEntries = await rankingStore.syncFromServer(10);
-    this.ui.showRanking(this.currentRankingEntries);
+    // Navigate immediately with whatever's cached (possibly stale/empty)
+    // and a loading flag, instead of blocking navigation on the fetch -
+    // otherwise clicking Ranking then quickly clicking elsewhere can land
+    // back on Ranking once the earlier await finally resolves, and the
+    // button looks dead on a slow server in the meantime.
+    this.ui.showRanking(this.currentRankingEntries, true);
+    this.emit();
+    const requestId = ++this._rankingRequestId;
+    const freshEntries = await rankingStore.syncFromServer(10);
+    // Bail if the player already navigated elsewhere, or fired a newer
+    // ranking-screen request, while this fetch was in flight - otherwise
+    // this stale response yanks them back to Ranking once it finally lands.
+    if (requestId !== this._rankingRequestId || this.store.getSnapshot().screen !== 'ranking') return;
+    this.currentRankingEntries = freshEntries;
+    this.ui.showRanking(this.currentRankingEntries, false);
     this.emit();
   }
 
@@ -374,7 +444,12 @@ export class GameController {
   }
 
   async showRankingDetail(playerId: string) {
+    const requestId = ++this._rankingDetailRequestId;
     const player = await rankingStore.getPlayerSummary(playerId, 10);
+    // Same staleness guard as showRankingScreen - two rapid clicks on
+    // different players must not let the first (slower) response overwrite
+    // the second (faster) one once it lands out of order.
+    if (requestId !== this._rankingDetailRequestId) return;
     if (player) this.ui.showRankingDetail(player);
   }
 
@@ -398,7 +473,9 @@ export class GameController {
   toggleMute() {
     if (!this.currentGame) return;
     this.currentGame.audio.unlock();
-    this.currentGame.audio.setMuted(!this.currentGame.audio.muted);
+    const nextMuted = !this.currentGame.audio.muted;
+    this.currentGame.audio.setMuted(nextMuted);
+    settings.set('muted', nextMuted);
     this.emit();
   }
 
@@ -612,6 +689,7 @@ export class GameController {
       obstacleVolume: Number(settings.get('obstacleVolume')),
       difficultyRamp: false,
       skillScoring: false,
+      snowballNpcs: false,
     };
   }
 
@@ -650,6 +728,7 @@ export class GameController {
 
   private bindSocketEvents() {
     this.socket.on('room:created', ({ roomId, seed, players, ownerId, settings: serverSettings, countdown }: any) => {
+      this._disarmRoomConnectTimeout();
       this.roomId = roomId;
       this.roomSeed = seed;
       this.roomPlayers = players;
@@ -665,6 +744,7 @@ export class GameController {
     });
 
     this.socket.on('room:joined', ({ roomId, seed, players, ownerId, settings: serverSettings, countdown, resumed }: any) => {
+      this._disarmRoomConnectTimeout();
       this.roomId = roomId;
       this.roomSeed = seed;
       this.roomPlayers = players;
@@ -723,6 +803,7 @@ export class GameController {
     });
 
     this.socket.on('room:error', ({ message }: any) => {
+      this._disarmRoomConnectTimeout();
       this.clearReconnecting();
       if (this.currentGame) {
         // A room-level error mid-run (e.g. a rejoin attempt rejected after a
@@ -774,6 +855,10 @@ export class GameController {
         // ranked it. Clear the room so "Again" doesn't try a doomed rejoin,
         // and stay on the gameover screen with the results visible.
         this.resetRoomState();
+        // playAgain() reads this to tell a genuine drop apart from a normal
+        // room departure, since resetRoomState() above already erased the
+        // very state (isMultiplayer/roomId) it would otherwise use for that.
+        this.roomLostToDisconnect = true;
         this.ui.setError('Disconnected from server.');
         this.emit();
         return;
@@ -829,17 +914,35 @@ export class GameController {
   };
 
   private handleEscape = (event: KeyboardEvent) => {
-    if (event.key !== 'Escape' || !this.currentGame) return;
-    event.preventDefault();
-
+    if (event.key !== 'Escape') return;
     const screen = this.store.getSnapshot().screen;
-    if (this.currentGame._running) this.pauseCurrentGame();
-    else if (this.settingsReturnMode === 'pause' && screen === 'settings') this.ui.showPause();
-    else if (screen === 'pause') this.resumeCurrentGame();
-    // Otherwise the sim is frozen with no pause screen showing (e.g. the
-    // OrientationGate rotation overlay freezes via setSimulationPaused and
-    // leaves the screen on 'game'). Esc must not resume a game the player
-    // can't see behind an overlay (M8).
+
+    if (this.currentGame) {
+      event.preventDefault();
+      if (this.currentGame._running) this.pauseCurrentGame();
+      else if (this.settingsReturnMode === 'pause' && screen === 'settings') this.ui.showPause();
+      else if (screen === 'pause') this.resumeCurrentGame();
+      // Otherwise the sim is frozen with no pause screen showing (e.g. the
+      // OrientationGate rotation overlay freezes via setSimulationPaused and
+      // leaves the screen on 'game'). Esc must not resume a game the player
+      // can't see behind an overlay (M8).
+      return;
+    }
+
+    // No active game - Settings/Ranking reached directly from the title
+    // screen previously had no Esc path out at all (HowToPlay handles its
+    // own Esc locally, see HowToPlayScreen.tsx's dialog keydown handler).
+    if (screen === 'settings') {
+      event.preventDefault();
+      this.closeSettings();
+    } else if (screen === 'ranking') {
+      event.preventDefault();
+      // Mirrors the screen's own button hierarchy: back out of a player's
+      // run-history detail view one step at a time, same as its "Back to
+      // Ranking" button, rather than jumping straight past it to the title.
+      if (this.store.getSnapshot().rankingDetail) this.showRankingOverview();
+      else this.mainMenu();
+    }
   };
 
   private handleResize = () => {

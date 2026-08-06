@@ -2,21 +2,28 @@
 import { settings } from '../utils/Settings';
 
 /**
- * Input — reads keyboard, mouse, and a virtual joystick depending on
- * Settings.controlMode.
+ * Input — reads keyboard, mouse, a virtual joystick, and device tilt
+ * depending on Settings.controlMode.
  *
  * controlMode:
  *   'keyboard' — only WASD/arrow keys steer; mouse is ignored completely.
  *   'mouse'    — only mouse controls direction and speed; keyboard ignored.
  *   'both'     — both active; keyboard overrides mouse when keys are pressed.
+ *   'gyro'     — device tilt controls direction and speed (mobile only, see
+ *                GyroControl.ts); keyboard still works as a fallback.
  *
  * Touch is a floating joystick (Joystick.tsx) rather than an absolute
  * screen-position drag: it reports a normalized -1..1 vector relative to
  * wherever the player's thumb first touched down, like a real analog
- * stick, via setJoystickVector(). While the joystick is active it forces
- * mouse-equivalent routing regardless of controlMode, so touch works even
- * if the player's saved preference is 'keyboard' from a prior desktop
- * session.
+ * stick, via setJoystickVector(). Gyro mode reports the same shape of
+ * vector via setGyroVector() (see GyroControl.ts), calibrated relative to
+ * whatever angle the phone was held at when it started listening. Both are
+ * treated identically by _externalAxis() below - whichever is active
+ * forces mouse-equivalent routing regardless of controlMode, so either
+ * works even if the player's saved preference is 'keyboard' from a prior
+ * desktop session. Only one is ever active at a time in practice (the
+ * touch joystick only mounts when controlMode isn't 'gyro' and vice versa),
+ * but if both somehow report simultaneously the joystick wins.
  */
 export class Input {
   constructor() {
@@ -30,6 +37,9 @@ export class Input {
     this._joystickActive = false;
     this._joystickX = 0; // -1 (left) .. 1 (right)
     this._joystickY = 0; // -1 (pulled down/boost) .. 1 (pushed up/brake)
+    this._gyroActive = false;
+    this._gyroX = 0; // -1 (tilt left) .. 1 (tilt right)
+    this._gyroY = 0; // -1 (tilt back/brake) .. 1 (tilt forward/boost)
 
     this._onKeyDown = this._onKeyDown.bind(this);
     this._onKeyUp   = this._onKeyUp.bind(this);
@@ -74,6 +84,9 @@ export class Input {
     this._joystickActive = false;
     this._joystickX = 0;
     this._joystickY = 0;
+    this._gyroActive = false;
+    this._gyroX = 0;
+    this._gyroY = 0;
   }
 
   _onKeyDown(e) {
@@ -121,6 +134,33 @@ export class Input {
     this._joystickY = active ? y : 0;
   }
 
+  /**
+   * Called by GyroControl.ts on every device-tilt reading, once gyro mode
+   * has permission and is listening - same normalized -1..1 shape as
+   * setJoystickVector, already calibrated relative to wherever the phone
+   * was held when it started. active=false stops forcing the external-axis
+   * routing (e.g. controlMode switched away from 'gyro' mid-run).
+   */
+  setGyroVector(x, y, active = true) {
+    this._gyroActive = !!active;
+    this._gyroX = active ? x : 0;
+    this._gyroY = active ? y : 0;
+  }
+
+  /**
+   * Touch joystick and device tilt both report through this same analog
+   * axis - whichever is currently active takes over lateralAxis/
+   * mouseSpeedFraction below regardless of controlMode, exactly like the
+   * joystick already did before gyro support existed. The joystick wins if
+   * both are somehow active at once (shouldn't happen - see the class
+   * doc comment).
+   */
+  _externalAxis() {
+    if (this._joystickActive) return { x: this._joystickX, y: this._joystickY };
+    if (this._gyroActive) return { x: this._gyroX, y: this._gyroY };
+    return null;
+  }
+
   isDown(code) {
     return !!this.keys[code];
   }
@@ -147,18 +187,20 @@ export class Input {
    * Respects controlMode and mouseSensitivity.
    */
   get lateralAxis() {
-    if (this._joystickActive) {
+    const ext = this._externalAxis();
+    if (ext) {
       const sensitivity = settings.get('mouseSensitivity');
       // Response curve, not a raw linear pass-through: Player.ts multiplies
       // speed by cos(turn angle), floored at 0.28 - deliberately calibrated
       // so pinning a hard turn costs most of your speed (max turn angle's
-      // cosine is ~0.25). A joystick invites holding a diagonal position in
-      // a way keyboard taps/mouse micro-movements don't, so a raw pass-
-      // through drifts the ski toward max-turn (and that speed floor) far
-      // more readily than intended. Curving it means small/moderate pushes
-      // turn gently - full deflection still reaches the exact same max as
-      // before, so nothing about the actual turn range changes.
-      const x = this._joystickX;
+      // cosine is ~0.25). A joystick (or a gyro tilt held at an angle)
+      // invites holding a diagonal position in a way keyboard taps/mouse
+      // micro-movements don't, so a raw pass-through drifts the ski toward
+      // max-turn (and that speed floor) far more readily than intended.
+      // Curving it means small/moderate pushes turn gently - full
+      // deflection still reaches the exact same max as before, so nothing
+      // about the actual turn range changes.
+      const x = ext.x;
       const curved = Math.sign(x) * Math.pow(Math.abs(x), 1.6);
       return Math.max(-1, Math.min(1, curved * sensitivity));
     }
@@ -197,11 +239,12 @@ export class Input {
    * Only meaningful when mouse/joystick is active.
    */
   get mouseSpeedFraction() {
-    if (this._joystickActive) {
-      // Physical stick mapping only: +1 = pushed up (boost), -1 = pulled
-      // down (brake). invertMouseY is a mouse-only preference — applying it
-      // here flipped up=boost on touch (minor list: joystick invert leak).
-      const jy = this._joystickY;
+    const ext = this._externalAxis();
+    if (ext) {
+      // Physical stick/tilt mapping only: +1 = pushed up / tilted forward
+      // (boost), -1 = pulled down / tilted back (brake). invertMouseY is a
+      // mouse-only preference — applying it here flipped up=boost on touch.
+      const jy = ext.y;
       if (Math.abs(jy) <= 0.05) return null; // small deadzone around center
       return Math.max(0, Math.min(1, (1 + jy) / 2));
     }
@@ -213,8 +256,10 @@ export class Input {
 
     if (mode === 'keyboard') return null;
 
-    // In 'both' mode, mouse speed only applies when no keys held
-    if (mode === 'both' && keyboard.anyHeld) return null;
+    // In 'both'/'gyro' mode, mouse speed only applies when no keys held -
+    // gyro included so a keyboard plugged into a phone (or desktop testing
+    // with controlMode stuck on 'gyro') doesn't fight a stale mouse Y.
+    if ((mode === 'both' || mode === 'gyro') && keyboard.anyHeld) return null;
 
     let my = this.mouse.y; // +1 = top, -1 = bottom
     if (invertY) my = -my;

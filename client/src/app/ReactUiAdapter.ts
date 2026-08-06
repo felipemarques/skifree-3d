@@ -69,7 +69,14 @@ export class ReactUiAdapter implements UiAdapter {
     }));
   }
 
-  showGame(state: Partial<HudState> & { gameMode?: GameMode | string } = {}) {
+  // `reset` (only true for a genuinely new run - Game.ts's start(), not
+  // resume()) rebuilds hud from defaultHud instead of merging over
+  // current.hud, so the previous run's hearts/chips can't flash on screen
+  // during the new run's synchronous shader-prewarm window. resume() must
+  // NOT use this - it's unpausing the *same* run, so current.hud already
+  // holds that run's true, live values; resetting them there would instead
+  // flash hp:3/distance:0 for a frame until the next real update arrives.
+  showGame(state: Partial<HudState> & { gameMode?: GameMode | string } = {}, reset = false) {
     window.clearTimeout(this.controlsTimer);
     this.store.set(current => ({
       ...current,
@@ -78,9 +85,9 @@ export class ReactUiAdapter implements UiAdapter {
       error: '',
       gameMode: asGameMode(state.gameMode),
       hud: {
-        ...current.hud,
+        ...(reset ? defaultHud : current.hud),
         ...state,
-        spectatorTarget: state.spectatorTarget ?? current.hud.spectatorTarget ?? '',
+        spectatorTarget: state.spectatorTarget ?? (reset ? '' : current.hud.spectatorTarget) ?? '',
       },
       controlsNotice: '',
     }));
@@ -113,7 +120,7 @@ export class ReactUiAdapter implements UiAdapter {
     }));
   }
 
-  showRanking(entries: RankingEntry[] = []) {
+  showRanking(entries: RankingEntry[] = [], loading = false) {
     this.clearTransient();
     this.store.set(state => ({
       ...state,
@@ -122,6 +129,7 @@ export class ReactUiAdapter implements UiAdapter {
       error: '',
       rankingEntries: entries,
       rankingDetail: null,
+      rankingLoading: loading,
     }));
   }
 
@@ -150,10 +158,6 @@ export class ReactUiAdapter implements UiAdapter {
 
   updateWaitingPlayers(players: PlayerStatus[] = []) {
     this.store.set(current => ({ ...current, room: { ...current.room, players } }));
-  }
-
-  updateControlsHint(gameMode: GameMode | string = 'classic', notice = '') {
-    this.store.set(state => ({ ...state, gameMode: asGameMode(gameMode), controlsNotice: notice }));
   }
 
   updateRoomCountdown(remaining: number | null = null) {

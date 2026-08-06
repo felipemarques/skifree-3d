@@ -13,7 +13,7 @@ const TONE_CLASS: Record<BonusPopup['tone'], string> = {
 export function BonusPopups({ popups }: { popups: BonusPopup[] }) {
   if (!popups.length) return null;
   return (
-    <div className="pointer-events-none fixed left-1/2 top-[38%] z-[120]">
+    <div className="pointer-events-none fixed left-1/2 top-[38%] z-[var(--z-hud-alert)]">
       {popups.map(p => (
         <div
           key={p.id}

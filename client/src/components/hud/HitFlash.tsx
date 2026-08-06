@@ -12,7 +12,7 @@ export function HitFlash({ flashKey }: { flashKey: number }) {
 
   return (
     <div
-      className={`pointer-events-none fixed inset-0 z-[300] bg-red-500/25 opacity-0 transition-opacity duration-150 ${active ? 'hit-flash-active' : ''}`}
+      className={`pointer-events-none fixed inset-0 z-[var(--z-modal-flash)] bg-red-500/25 opacity-0 transition-opacity duration-150 ${active ? 'hit-flash-active' : ''}`}
     />
   );
 }

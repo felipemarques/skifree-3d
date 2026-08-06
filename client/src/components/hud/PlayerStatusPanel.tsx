@@ -8,9 +8,15 @@ export function PlayerStatusPanel({ players, touchActive = false }: { players: P
   // screens would otherwise land on top of the jump button/D-pad
   // (TouchControls.tsx).
   const positionClass = touchActive ? 'right-2.5 top-2.5' : 'right-4 top-4 max-sm:bottom-[150px] max-sm:right-2.5 max-sm:top-auto';
+  // Capped + non-scrolling truncation (this panel is pointer-events-none,
+  // so "overflow" content is just clipped, not interactively scrollable) -
+  // an 8-player roster can otherwise grow past 200px and reach up into
+  // ControlsPanel.tsx's legend band on narrow screens. Leading players sort
+  // first (see `sorted` above), so truncation drops the back of the pack.
+  const heightCapClass = touchActive ? '' : 'max-sm:max-h-[140px] max-sm:overflow-hidden';
 
   return (
-    <div className={`hud-glass pointer-events-none fixed z-[60] min-w-44 max-w-[min(280px,calc(100vw-40px))] p-3 text-right text-sm leading-normal text-[#dceeff] ${positionClass}`}>
+    <div className={`hud-status-wrapper hud-glass pointer-events-none fixed z-[var(--z-hud-panel)] min-w-44 max-w-[min(280px,calc(100vw-40px))] p-3 text-right text-sm leading-normal text-[var(--color-hud-text)] ${positionClass} ${heightCapClass}`}>
       {sorted.map((player, index) => {
         const alive = player.alive !== false;
         return (
@@ -20,7 +26,7 @@ export function PlayerStatusPanel({ players, touchActive = false }: { players: P
               <span className="truncate">{index + 1}. {player.name || 'Player'}</span>
             </div>
             <div className="text-right text-[11px] text-white/70">
-              <span className={`font-black uppercase ${alive ? 'text-[#7df7ba]' : 'text-[#ff8c98]'}`}>{alive ? 'Playing' : 'Dead'}</span>
+              <span className={`font-black uppercase ${alive ? 'text-[var(--color-hud-positive)]' : 'text-[var(--color-hud-negative)]'}`}>{alive ? 'Playing' : 'Dead'}</span>
               {' - '}
               {Math.round(player.distance || 0)} m
             </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { X } from 'lucide-react';
 import { GameShell } from './GameShell';
 import { createUiStore } from './uiStore';
 import type { ControllerSnapshot } from '@/types/app';
@@ -25,6 +26,7 @@ const defaultControllerSnapshot: ControllerSnapshot = {
   muted: false,
   muteVisible: false,
   playerColor: '#2979ff',
+  roomLostToDisconnect: false,
 };
 
 export function App() {
@@ -36,7 +38,6 @@ export function App() {
 
   useEffect(() => {
     if (state.screen !== 'title' || settings.get('hasSeenTutorial')) return;
-    settings.set('hasSeenTutorial', true);
     setShowHowToPlay(true);
   }, [state.screen]);
 
@@ -77,7 +78,7 @@ export function App() {
         />
       )}
       {controller && state.screen === 'settings' && (
-        <SettingsScreen controller={controller} returnMode={controllerSnapshot.settingsReturnMode} />
+        <SettingsScreen controller={controller} />
       )}
       {controller && state.screen === 'lobby' && (
         <LobbyScreen
@@ -94,6 +95,7 @@ export function App() {
           controller={controller}
           entries={state.rankingEntries}
           detail={state.rankingDetail}
+          loading={state.rankingLoading}
         />
       )}
       {controller && state.screen === 'pause' && (
@@ -103,19 +105,36 @@ export function App() {
         <GameOverScreen controller={controller} gameOver={state.gameOver} />
       )}
 
-      {state.error && (
-        <div className="fixed left-1/2 top-5 z-[250] -translate-x-1/2 rounded-lg border border-red-300/40 bg-red-950/70 px-4 py-2 text-sm font-bold text-red-100 shadow-2xl backdrop-blur">
-          {state.error}
-        </div>
-      )}
+      <div className="pointer-events-none fixed left-1/2 top-5 z-[var(--z-toast)] grid -translate-x-1/2 justify-items-center gap-2">
+        {state.error && (
+          <div role="alert" aria-live="assertive" className="pointer-events-auto flex items-center gap-2 rounded-lg border border-red-300/40 bg-red-950/70 py-2 pl-4 pr-2 text-sm font-bold text-red-100 shadow-2xl backdrop-blur">
+            {state.error}
+            <button type="button" onClick={() => controller?.dismissError()} aria-label="Dismiss" className="rounded-full p-1 text-red-200/80 hover:text-white">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+        {state.notice && (
+          <div role="status" aria-live="polite" className="pointer-events-auto flex items-center gap-2 rounded-lg border border-emerald-300/40 bg-emerald-950/70 py-2 pl-4 pr-2 text-sm font-bold text-emerald-100 shadow-2xl backdrop-blur">
+            {state.notice}
+            <button type="button" onClick={() => controller?.dismissNotice()} aria-label="Dismiss" className="rounded-full p-1 text-emerald-200/80 hover:text-white">
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
 
-      {state.notice && (
-        <div className="fixed left-1/2 top-5 z-[250] -translate-x-1/2 rounded-lg border border-emerald-300/40 bg-emerald-950/70 px-4 py-2 text-sm font-bold text-emerald-100 shadow-2xl backdrop-blur">
-          {state.notice}
-        </div>
+      {showHowToPlay && (
+        <HowToPlayScreen
+          onClose={() => {
+            // Marked seen on close, not open - previously this flipped the
+            // instant the dialog appeared, before the player had actually
+            // read anything.
+            settings.set('hasSeenTutorial', true);
+            setShowHowToPlay(false);
+          }}
+        />
       )}
-
-      {showHowToPlay && <HowToPlayScreen onClose={() => setShowHowToPlay(false)} />}
     </>
   );
 }

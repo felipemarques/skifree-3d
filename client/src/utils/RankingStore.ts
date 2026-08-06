@@ -148,15 +148,23 @@ export class RankingStore {
     return this.getTop();
   }
 
+  // Rejects on failure (network error, non-OK response, or an 8s timeout)
+  // instead of swallowing into [] - RankingScreen.tsx's error/Retry UI relies
+  // on this actually rejecting to ever show, and a hung request would
+  // otherwise spin its loading state forever with no way out.
   async getDaily(mode, dailyKey, limit = 10) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 8000);
     try {
-      const res = await fetch(`${API_URL}?mode=${encodeURIComponent(mode)}&dailyKey=${encodeURIComponent(dailyKey)}&limit=${encodeURIComponent(limit)}`);
+      const res = await fetch(`${API_URL}?mode=${encodeURIComponent(mode)}&dailyKey=${encodeURIComponent(dailyKey)}&limit=${encodeURIComponent(limit)}`, {
+        signal: controller.signal,
+      });
       if (!res.ok) throw new Error(`Ranking API failed with ${res.status}`);
       const payload = await res.json();
       const entries = Array.isArray(payload.entries) ? payload.entries : [];
       return entries.map(normalizeEntry);
-    } catch (e) {
-      return [];
+    } finally {
+      window.clearTimeout(timeoutId);
     }
   }
 

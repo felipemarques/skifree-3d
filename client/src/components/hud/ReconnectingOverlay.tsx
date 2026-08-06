@@ -9,7 +9,7 @@
 export function ReconnectingOverlay({ active }: { active: boolean }) {
   if (!active) return null;
   return (
-    <div className="fixed inset-0 z-[300] flex flex-col items-center justify-center gap-3 bg-slate-950/80 px-6 text-center">
+    <div className="fixed inset-0 z-[var(--z-modal-flash)] flex flex-col items-center justify-center gap-3 bg-slate-950/80 px-6 text-center">
       <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/25 border-t-cyan-300" />
       <div className="text-lg font-black text-white">Reconnecting…</div>
       <div className="text-sm text-[#c7d6ea]">Your run is on hold - it'll pick up right where it left off.</div>

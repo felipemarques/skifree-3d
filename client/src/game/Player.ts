@@ -48,6 +48,11 @@ const NEAR_MISS_MIN_BONUS = 0.5;
 const NEAR_MISS_MAX_BONUS = 3;
 const JUMP_CHAIN_WINDOW_MS = 4500;
 const JUMP_CHAIN_BONUS_DISTANCE = 4;
+// Snowball NPC hazard - mirrors shared/AuthoritativeSim.ts's
+// THROWER_TRIGGER_DISTANCE/PROJECTILE_SPEED so the solo throw fires at the
+// same distance and flies at the same speed as the multiplayer one.
+const THROWER_TRIGGER_DISTANCE = 14;
+const SNOWBALL_PROJECTILE_SPEED = 34;
 const MOMENTUM_BUILD_RATE = 0.6;
 const MOMENTUM_DECAY_RATE = 1.4;
 const MOMENTUM_BONUS_THRESHOLD = 0.5;
@@ -208,6 +213,10 @@ export class Player {
     this.onHeal = null;
     this.onNearMiss = null;
     this.onJumpChain = null;
+    // Snowball NPC hazard - see THROWER_TRIGGER_DISTANCE's comment. Called
+    // with {x,y,z,vx,vy,vz} when a nearby thrower fires; Game.ts wires this
+    // to _spawnProjectile with a synthetic ownerId.
+    this.onSnowballThrow = null;
     this.onTrick = null;
     this.onTrickFail = null;
     this.onAirBoost = null;
@@ -269,7 +278,7 @@ export class Player {
     if (this.onUnstuck) this.onUnstuck();
   }
 
-  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER, forkSafeLaneSlow = false, windPush = 0) {
+  update(dt, input, obstacles, skillScoring = false, weather = DEFAULT_WEATHER, forkSafeLaneSlow = false, windPush = 0, snowballNpcs = false) {
     if (!this.isAlive) {
       this.updateDeathAnimation(dt);
       return;
@@ -375,6 +384,9 @@ export class Player {
         continue;
       }
 
+      // Non-solid - see shared/AuthoritativeSim.ts's matching skip.
+      if (obs.type === 'thrower') continue;
+
       if (this.isAirborne && obs.type === 'tree' && !this._airborneFromRamp) {
         if (this._collidesAABB(newX, newZ, obs)) {
           const resolved = this._resolveCollision(newX, newZ, obs);
@@ -453,6 +465,33 @@ export class Player {
 
     this.position.x = newX;
     this.position.z = newZ;
+
+    // Snowball NPC hazard - mirrors shared/AuthoritativeSim.ts's matching
+    // trigger loop exactly (same THROWER_TRIGGER_DISTANCE, same one-shot
+    // crossing idiom), so solo and multiplayer throw at the same range.
+    if (snowballNpcs) {
+      for (const obs of obstacles) {
+        if (obs.dead || obs.type !== 'thrower' || obs.thrown) continue;
+        const triggerZ = obs.z - THROWER_TRIGGER_DISTANCE;
+        if (!(triggerZ >= previousZ && triggerZ < this.position.z)) continue;
+        obs.thrown = true;
+        const dx = this.position.x - obs.x;
+        const dz = this.position.z - obs.z;
+        const aimAngle = Math.atan2(dx, dz);
+        const vx = Math.sin(aimAngle) * SNOWBALL_PROJECTILE_SPEED;
+        const vz = Math.cos(aimAngle) * SNOWBALL_PROJECTILE_SPEED;
+        if (this.onSnowballThrow) {
+          this.onSnowballThrow({
+            x: obs.x + Math.sin(aimAngle) * 0.65,
+            y: 0.82,
+            z: obs.z + Math.cos(aimAngle) * 1.0,
+            vx,
+            vy: 1.2,
+            vz,
+          });
+        }
+      }
+    }
 
     if (skillScoring && !this.isAirborne) {
       for (const obs of obstacles) {
