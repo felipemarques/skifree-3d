@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { Terrain } from './Terrain';
 import { SnowTerrain } from './SnowTerrain';
-import { Player } from './Player';
+import { Player, LANDING_PRECISION_MAX_ANGLE_DEG, LANDING_PRECISION_MIN_AIRTIME } from './Player';
 import { RemotePlayer } from './RemotePlayer';
 import { GhostPlayer } from './GhostPlayer';
 import { Obstacles } from './Obstacles';
@@ -57,9 +57,24 @@ const YETI_GAME_OVER_SCREEN_DELAY_MS = 2250;
 const SKY_MARIO_THROW_COOLDOWN = 0.75;
 const PROJECTILE_LIFETIME = 2.4;
 const PROJECTILE_SPEED = 34;
+// Mirrors shared/AuthoritativeSim.ts's SNOWBALL_GRAZE_*/SNOWBALL_DODGE_BONUS -
+// a larger box than the 0.65/0.9 hit box above, checked only while airborne,
+// so jumping through a thrown snowball without getting hit pays out like a
+// near-miss instead of being purely a threat to avoid.
+const SNOWBALL_GRAZE_HALF_X = 1.3;
+const SNOWBALL_GRAZE_HALF_Z = 1.7;
+const SNOWBALL_DODGE_BONUS = 1.6;
 const MULTIPLAYER_SPAWN_INVINCIBILITY_SECONDS = 5;
 const HITSTOP_TIME_SCALE = 0.05;
 const YETI_PROXIMITY_BONUS_RATE = 3;
+// Mirrors shared/AuthoritativeSim.ts's yeti close-call constants - a one-
+// shot bonus for surviving a genuinely tight gap, on top of the continuous
+// per-tick danger bonus above. Purely additive - never touches the gap<=0
+// capture decision, which is deliberately a pure distance formula (see
+// _updateYetiDangerBonus's capture branch) rather than a hitbox/proximity
+// check, to avoid unfairly catching a cornered player.
+const YETI_CLOSE_CALL_GAP = 20;
+const YETI_CLOSE_CALL_BONUS = 5;
 // Mirrors shared/AuthoritativeSim.ts's avalanche constants exactly, same
 // "duplicated on purpose" relationship YETI_PROXIMITY_BONUS_RATE above has
 // with its shared counterpart.
@@ -190,6 +205,7 @@ export class Game {
     this._hitstopRemaining = 0;
     this._yetiDangerT = 0;
     this._yetiTriggerAtElapsedS = -1;
+    this._yetiCloseCallActive = false;
     this._avalancheDangerT = 0;
     this._avalancheTriggerAtElapsedS = -1;
     this._avalancheTriggerDistance = 0;
@@ -686,6 +702,10 @@ export class Game {
     };
     this.player.onAirBoost = () => {
       this.ui.showAirBoostFeedback();
+      this.audio.playJumpChain();
+    };
+    this.player.onChainSave = (bonus, chainCount) => {
+      this.ui.showChainSaveFeedback(bonus, chainCount);
       this.audio.playJumpChain();
     };
     this.player.onUnstuck = () => this.ui.showUnstuckFeedback();
@@ -1193,12 +1213,14 @@ export class Game {
     if (this.yetiStartMode === 'disabled' || !this.player.isAlive) {
       this._yetiDangerT = 0;
       this._yetiTriggerAtElapsedS = -1;
+      this._yetiCloseCallActive = false;
       return;
     }
     const config = getYetiConfig({ difficulty: this.difficulty, yetiStartMode: this.yetiStartMode });
     if (distance < config.triggerDistance) {
       this._yetiDangerT = 0;
       this._yetiTriggerAtElapsedS = -1;
+      this._yetiCloseCallActive = false;
       return;
     }
     if (this._yetiTriggerAtElapsedS < 0) {
@@ -1217,6 +1239,16 @@ export class Game {
     this._yetiDangerT = clamp(1 - gap / 100, 0, 1);
     if (this.skillScoring && this._yetiDangerT > 0) {
       this.player.bonusDistance += dt * this._yetiDangerT * YETI_PROXIMITY_BONUS_RATE;
+    }
+
+    if (gap < YETI_CLOSE_CALL_GAP) {
+      if (this.skillScoring && !this._yetiCloseCallActive) {
+        this._yetiCloseCallActive = true;
+        this.player.bonusDistance += YETI_CLOSE_CALL_BONUS;
+        this.ui.showYetiCloseCallFeedback(YETI_CLOSE_CALL_BONUS);
+      }
+    } else {
+      this._yetiCloseCallActive = false;
     }
   }
 
@@ -1550,6 +1582,7 @@ export class Game {
       graphicsQuality: this.graphicsQuality,
       spawnShieldSeconds: this._spawnProtectionRemaining,
       chainCount: this.player.chainCount || 0,
+      nearMissStreak: this.player.nearMissStreak || 0,
       chainRemainingT: this._chainRemainingT,
       momentum: this.player.momentum || 0,
       cleanStreakSeconds: this.player.cleanStreakSeconds || 0,
@@ -1559,6 +1592,9 @@ export class Game {
       blizzardT: weather.fogIntensity,
       pingMs: null,
       trickSpinDeg: this.player.isAirborne ? Math.abs(this.player._trickSpinRad || 0) * (180 / Math.PI) : 0,
+      landingPrecisionReady: this.player.isAirborne
+        && this.player.airTime >= LANDING_PRECISION_MIN_AIRTIME
+        && Math.abs(this.player.angle) * (180 / Math.PI) <= LANDING_PRECISION_MAX_ANGLE_DEG,
     });
 
     // Update remote players
@@ -1731,6 +1767,7 @@ export class Game {
       spawnShieldSeconds: focusState.invincibilityRemaining,
       spectatorTarget: focusState.alive ? '' : (spectator?.score?.name || ''),
       chainCount: focusState.chainCount || 0,
+      nearMissStreak: focusState.nearMissStreak || 0,
       chainRemainingT: this._chainRemainingT,
       momentum: focusState.momentum || 0,
       cleanStreakSeconds: focusState.cleanStreakSeconds || 0,
@@ -1739,6 +1776,9 @@ export class Game {
       iceGripT: 1 - weather.grip,
       blizzardT: weather.fogIntensity,
       trickSpinDeg: focusState.isAirborne ? Math.abs(focusState.trickSpinRad || 0) * (180 / Math.PI) : 0,
+      landingPrecisionReady: focusState.isAirborne
+        && (focusState.airTime || 0) >= LANDING_PRECISION_MIN_AIRTIME
+        && Math.abs(focusState.angle || 0) * (180 / Math.PI) <= LANDING_PRECISION_MAX_ANGLE_DEG,
       pingMs: this._devPing,
     });
     this.ui.updatePlayerList(this._getScoreList());
@@ -1881,10 +1921,12 @@ export class Game {
       airVelocityZ: player.airVelocityZ ?? this._authState?.airVelocityZ ?? 0,
       airTime: player.airTime ?? this._authState?.airTime ?? 0,
       airborneFromRamp: player.airborneFromRamp ?? this._authState?.airborneFromRamp ?? false,
+      doubleJumped: player.doubleJumped ?? this._authState?.doubleJumped ?? false,
       jumpHeld: this._authState?.jumpHeld ?? false,
       lastInputAtMs: this._authState?.lastInputAtMs ?? 0,
       bonusDistance: player.bonusDistance ?? this._authState?.bonusDistance ?? 0,
       chainCount: player.chainCount ?? this._authState?.chainCount ?? 0,
+      nearMissStreak: player.nearMissStreak ?? this._authState?.nearMissStreak ?? 0,
       momentum: player.momentum ?? this._authState?.momentum ?? 0,
       cleanStreakSeconds: player.cleanStreakSeconds ?? this._authState?.cleanStreakSeconds ?? 0,
       // Not sent in snapshots (see jumpHeld/lastInputAtMs above) - the skill
@@ -2116,6 +2158,8 @@ export class Game {
       } else if (event.type === 'yeti-capture') {
         this._authLastYetiWarning = performance.now();
         this.ui.showYetiWarning(true);
+      } else if (event.type === 'yeti-close-call') {
+        this.ui.showYetiCloseCallFeedback(event.bonus ?? 5);
       } else if (event.type === 'unstuck') {
         this.ui.showUnstuckFeedback();
       } else if (event.type === 'trick') {
@@ -2132,6 +2176,12 @@ export class Game {
       } else if (event.type === 'air-boost') {
         this.ui.showAirBoostFeedback();
         this.audio.playJumpChain();
+      } else if (event.type === 'chain-save') {
+        this.ui.showChainSaveFeedback(event.bonus ?? 3, event.chainCount ?? 0);
+        this.audio.playJumpChain();
+      } else if (event.type === 'snowball-dodge') {
+        this.ui.showSnowballDodgeFeedback(event.bonus ?? 1.6);
+        this.audio.playWindGust(0);
       } else if (event.type === 'avalanche-warning') {
         this.audio.playDistantRumble(0);
       } else if (event.type === 'avalanche-capture') {
@@ -2190,9 +2240,9 @@ export class Game {
         life: 0.4,
         groundY: pos.y,
       });
-    } else if (event.type === 'near-miss' || event.type === 'air-clear') {
+    } else if (event.type === 'near-miss' || event.type === 'air-clear' || event.type === 'snowball-dodge') {
       this.audio.playNearMiss(pan);
-    } else if (event.type === 'jump-chain' || event.type === 'trick' || event.type === 'avalanche-outrun' || event.type === 'fork-bold-line' || event.type === 'air-boost') {
+    } else if (event.type === 'jump-chain' || event.type === 'trick' || event.type === 'avalanche-outrun' || event.type === 'fork-bold-line' || event.type === 'air-boost' || event.type === 'chain-save' || event.type === 'yeti-close-call') {
       this.audio.playJumpChain();
     } else if (event.type === 'jump') {
       this.audio.playJump();
@@ -2334,6 +2384,7 @@ export class Game {
       spawnShieldSeconds: 0,
       spectatorTarget: target?.score?.name || '',
       chainCount: 0,
+      nearMissStreak: 0,
       chainRemainingT: 0,
       momentum: 0,
       cleanStreakSeconds: 0,
@@ -2342,6 +2393,7 @@ export class Game {
       iceGripT: 0,
       blizzardT: 0,
       trickSpinDeg: 0,
+      landingPrecisionReady: false,
       pingMs: this._devPing,
     });
     this.ui.updatePlayerList(this._getScoreList());
@@ -2556,6 +2608,21 @@ export class Game {
             impactSpeed: PROJECTILE_SPEED,
             projectileX: p.x,
           });
+        } else if (
+          this.skillScoring && this.player.isAirborne && !p.grazed
+          && typeof p.ownerId === 'string' && p.ownerId.startsWith('npc:')
+          && dx < SNOWBALL_GRAZE_HALF_X && dz < SNOWBALL_GRAZE_HALF_Z
+        ) {
+          // A near-miss on a thrown snowball, not just the static thrower
+          // obstacle - rewards jumping/timing through an incoming throw
+          // instead of only ever avoiding it. Sky Mario combat throws
+          // (ownerId is a socket id, not 'npc:...') are excluded - dodging
+          // another player's shot isn't this bonus's target.
+          p.grazed = true;
+          const bonus = SNOWBALL_DODGE_BONUS;
+          this.player.bonusDistance += bonus;
+          this.ui.showSnowballDodgeFeedback(bonus);
+          this.audio.playWindGust(this._panForDx(p.x - this.player.position.x));
         }
       }
 

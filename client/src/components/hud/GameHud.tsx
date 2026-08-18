@@ -86,13 +86,24 @@ export function GameHud({ state, controller }: { state: UiStoreState; controller
                 const clean = offFromClean <= 45;
                 return (
                   <div
-                    className={`rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide tabular-nums transition-colors ${
+                    className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide tabular-nums transition-colors ${
                       clean
                         ? 'border-emerald-300/60 bg-emerald-500/25 text-emerald-100 shadow-[0_0_14px_rgba(52,211,153,0.35)]'
                         : 'border-amber-300/50 bg-amber-500/15 text-amber-100'
                     }`}
                   >
                     ↻ {Math.round(spin)}°
+                    {/* Separate live cue for landing precision (state.angle
+                        tolerance) - a distinct bonus from the spin-clean
+                        check above, both gated on the same attempted-trick
+                        deadzone in the sim, so they share this chip's
+                        visibility rather than getting their own. */}
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full transition-colors ${
+                        state.hud.landingPrecisionReady ? 'bg-cyan-300 shadow-[0_0_6px_rgba(103,232,249,0.8)]' : 'bg-white/25'
+                      }`}
+                      aria-hidden="true"
+                    />
                   </div>
                 );
               })()}
@@ -108,6 +119,11 @@ export function GameHud({ state, controller }: { state: UiStoreState; controller
                     style={{ width: `${Math.max(0, Math.min(100, state.hud.chainRemainingT * 100))}%` }}
                   />
                   <span className="relative">Chain x{state.hud.chainCount}</span>
+                </div>
+              )}
+              {state.hud.nearMissStreak >= 3 && (
+                <div className="rounded-full border border-cyan-300/50 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-extrabold uppercase tracking-wide text-cyan-100 shadow-[0_0_14px_rgba(103,232,249,0.25)]">
+                  Slalom x{state.hud.nearMissStreak}
                 </div>
               )}
               {state.hud.cleanStreakSeconds >= 5 && (

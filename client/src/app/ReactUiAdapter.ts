@@ -20,6 +20,7 @@ const defaultHud: HudState = {
   spawnShieldSeconds: 0,
   spectatorTarget: '',
   chainCount: 0,
+  nearMissStreak: 0,
   chainRemainingT: 0,
   momentum: 0,
   cleanStreakSeconds: 0,
@@ -29,6 +30,7 @@ const defaultHud: HudState = {
   blizzardT: 0,
   pingMs: null,
   trickSpinDeg: 0,
+  landingPrecisionReady: false,
 };
 
 function asGameMode(value: string | undefined): GameMode {
@@ -226,6 +228,18 @@ export class ReactUiAdapter implements UiAdapter {
 
   showAirBoostFeedback() {
     this.flashControls('Air Boost!', 'jumpChainFlashKey', 700, 'positive');
+  }
+
+  showChainSaveFeedback(bonus = 3, chainCount = 0) {
+    this.flashControls(`Chain Save x${chainCount} +${bonus.toFixed(0)}m`, 'jumpChainFlashKey', 900, 'positive');
+  }
+
+  showSnowballDodgeFeedback(bonus = 0) {
+    this.flashControls(`Snowball Dodge +${bonus.toFixed(1)}m`, 'nearMissFlashKey', 700, 'positive');
+  }
+
+  showYetiCloseCallFeedback(bonus = 5) {
+    this.flashControls(`Too Close! +${bonus.toFixed(0)}m`, 'unstuckFlashKey', 900, 'positive');
   }
 
   showAvalancheOutrunFeedback() {

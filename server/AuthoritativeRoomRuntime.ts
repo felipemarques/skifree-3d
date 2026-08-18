@@ -222,7 +222,7 @@ export class AuthoritativeRoomRuntime {
     }
 
     if (this.projectiles.length) {
-      simulateProjectilesTick(this.projectiles, this.players.values(), SIM_DT, this.events);
+      simulateProjectilesTick(this.projectiles, this.players.values(), SIM_DT, this.events, this.room.settings.skillScoring);
       for (const state of states) {
         const wasFinished = !!this.room.players.get(state.id)?.finished;
         if (!state.alive && !wasFinished) {

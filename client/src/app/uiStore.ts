@@ -19,6 +19,7 @@ const initialState: UiStoreState = {
     spawnShieldSeconds: 0,
     spectatorTarget: '',
     chainCount: 0,
+    nearMissStreak: 0,
     chainRemainingT: 0,
     momentum: 0,
     cleanStreakSeconds: 0,
@@ -28,6 +29,7 @@ const initialState: UiStoreState = {
     blizzardT: 0,
     pingMs: null,
     trickSpinDeg: 0,
+    landingPrecisionReady: false,
   },
   gameMode: 'classic',
   room: {

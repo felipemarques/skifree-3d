@@ -15,7 +15,87 @@ import { settings } from '../utils/Settings';
  *   - boost whoosh : brief upward sweep on boost activation
  *   - jump         : quick upward blip
  *   - land         : soft thud
+ *   - music        : generative pad + bass + melody + drums, see the
+ *                     "Adaptive music" section below
  */
+
+// ── Shared music theory ────────────────────────────────────────────────
+// Every musical layer (pad, bass, melody) generates its notes from these
+// instead of each owning its own hardcoded frequencies - previously the
+// ambient pad cycled through 4 chords on its own timer while the bass/arp
+// stayed hardcoded to C major regardless, so most chord changes put the pad
+// and the "music" out of key with each other. Locking everything to one
+// progression fixes that at the source.
+const MAJOR_SCALE_INTERVALS = [0, 2, 4, 5, 7, 9, 11]; // semitones from C, one octave
+
+function degreeToMidi(degree, octave) {
+  const len = MAJOR_SCALE_INTERVALS.length;
+  const wrapped = ((degree % len) + len) % len;
+  const octaveShift = Math.floor(degree / len);
+  return 12 + MAJOR_SCALE_INTERVALS[wrapped] + (octave + octaveShift) * 12; // 12 = MIDI note C0
+}
+
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+// Octave-folds a note into [low, high] - without this, a motif's fixed
+// scale-degree offsets (e.g. root+7 for "an octave up") land in a
+// noticeably different, chord-dependent register depending on how close
+// that chord's own root sits to the top of the 7-note scale (e.g. root=A
+// wraps an extra octave sooner than root=C does), so the same motif shape
+// would sound a full octave brighter on some chords than others. Folding
+// keeps the melody's register consistent across every chord in the
+// progression.
+function foldToRange(midi, low, high) {
+  while (midi < low) midi += 12;
+  while (midi > high) midi -= 12;
+  return midi;
+}
+
+// I - vi - IV - V in C major (rootDegree = scale-degree index, 0-based:
+// C D E F G A B). padFreqs keep the original hand-voiced open-fifth
+// frequencies exactly (root/fifth/root-octave) - only the bass/melody below
+// are new, derived from rootDegree so they always agree with this pad.
+const PROGRESSION = [
+  { rootDegree: 0, padFreqs: [130.81, 196.0, 261.63] },  // C  (C3 G3 C4)
+  { rootDegree: 5, padFreqs: [110.0, 164.81, 220.0] },   // Am (A2 E3 A3)
+  { rootDegree: 3, padFreqs: [174.61, 261.63, 349.23] }, // F  (F3 C4 F4)
+  { rootDegree: 4, padFreqs: [98.0, 146.83, 196.0] },    // G  (G2 D3 G3)
+];
+
+// One short motif per progression chord, as scale-degree offsets from that
+// chord's root (0=root, 2=third, 4=fifth, 7=octave, -3=degree below root) -
+// transposes automatically via degreeToMidi, so it's always in key no
+// matter which chord is current. Position advances continuously across the
+// whole run rather than resetting at each phrase boundary, so it reads as
+// one unfolding tune rather than a loop that visibly restarts every phrase.
+const MELODY_MOTIFS = [
+  [0, 2, 4, 7, 4, 2, 0, -3],
+  [4, 2, 0, 2, 4, 7, 4, 0],
+  [0, 4, 7, 4, 2, 0, -3, 0],
+  [7, 4, 2, 0, 4, 7, 2, 0],
+];
+
+// Root-root-fifth-root - the same bass shape the original hardcoded
+// C2/C2/G2/C2 loop used, now parametrized by whichever chord is current.
+const BASS_DEGREE_OFFSETS = [0, 0, 4, 0];
+
+const BARS_PER_CHORD = 8; // phrase length (in bars) before the progression advances
+const STEPS_PER_BAR = 8;  // eighth notes per bar, 4/4 time
+
+// Per-section layer gain targets - "sections" are how this stops being just
+// "louder as energy rises" and starts changing texture: Calm has no
+// rhythm section at all, Cruise adds bass + light hats, Chase is the full
+// kit. Smoothly crossfaded (see updateMusic's setTargetAtTime calls) on top
+// of note-scheduling itself being gated by section, so a transition is both
+// inaudible-as-a-click and an actual arrangement change, not just a fade.
+const SECTION_TARGETS = {
+  calm:   { bass: 0, drums: 0,    melody: 0.55 },
+  cruise: { bass: 1, drums: 0.55, melody: 0.85 },
+  chase:  { bass: 1, drums: 1,    melody: 1 },
+};
+
 export class AudioManager {
   constructor() {
     this._ctx       = null;
@@ -87,7 +167,7 @@ export class AudioManager {
     // Band-pass filter to shape wind character
     const filter       = ctx.createBiquadFilter();
     filter.type        = 'bandpass';
-    filter.frequency.value = 300;
+    filter.frequency.value = 420; // matches updateContinuous's idle baseline below
     filter.Q.value     = 0.8;
 
     const gain       = ctx.createGain();
@@ -172,21 +252,18 @@ export class AudioManager {
   }
 
   // ── Ambient pad (continuous, very low, brightens slightly with speed) ────
+  // Voicings for the same I-vi-IV-V progression the bass/melody/drums below
+  // are locked to (see PROGRESSION above) - open-fifth voicings (no third,
+  // so each stays ambiguous major/minor - "calm-but-moody"), unchanged from
+  // before. What changed is *when* it moves to the next chord: previously
+  // its own independent wall-clock timer, now the shared beat grid driven
+  // from updateMusic() (_glidePadToChord), so it can never drift out of
+  // sync with what the bass/melody/drums are doing.
   _buildAmbientLoop() {
     const ctx = this._ctx;
-    // Slowly cycled open-fifth voicings (no third, so each stays ambiguous
-    // major/minor - "calm-but-moody") rather than one fixed chord held
-    // forever, which read as a flat, monotone hum with no sense of motion.
-    this._ambientChords = [
-      [130.81, 196.0, 261.63],  // C3 G3 C4
-      [110.0, 164.81, 220.0],   // A2 E3 A3
-      [174.61, 261.63, 349.23], // F3 C4 F4
-      [98.0, 146.83, 196.0],    // G2 D3 G3
-    ];
     this._ambientChordIndex = 0;
-    this._ambientChordTimer = 14 + Math.random() * 4;
 
-    this._ambientOscs = this._ambientChords[0].map((freq, i) => {
+    this._ambientOscs = PROGRESSION[0].padFreqs.map((freq, i) => {
       const osc = ctx.createOscillator();
       osc.type = i === 1 ? 'triangle' : 'sine';
       osc.frequency.value = freq;
@@ -201,30 +278,101 @@ export class AudioManager {
     const gain = ctx.createGain();
     gain.gain.value = 0;
 
+    // A perfectly static pitch and amplitude on a sustained sine/triangle
+    // chord is the textbook definition of a flat electronic hum, no matter
+    // which chord it's on or how "in key" it is - this is what a real
+    // sustained pad/string patch always has and this pad didn't: a slow,
+    // continuous vibrato (pitch) and tremolo (amplitude) so it breathes
+    // instead of sitting dead still. One shared LFO oscillator modulates
+    // both, connected as actual Web Audio param modulation (adds onto
+    // whatever updateContinuous's gain/detune automation is doing) rather
+    // than recomputed by hand every frame.
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.09; // ~11s cycle
+
+    const vibratoDepth = ctx.createGain();
+    vibratoDepth.gain.value = 4; // cents
+    lfo.connect(vibratoDepth);
+    for (const osc of this._ambientOscs) vibratoDepth.connect(osc.detune);
+
+    const tremoloDepth = ctx.createGain();
+    tremoloDepth.gain.value = 0.018;
+    lfo.connect(tremoloDepth);
+    tremoloDepth.connect(gain.gain);
+
+    lfo.start();
+    this._ambientLfo = lfo;
+    this._ambientTremoloDepth = tremoloDepth;
+
+    // This swell gain stage (see _glidePadToChord) was meant to give the
+    // pad a real amplitude arc instead of holding perfectly flat - but a
+    // periodic rise-and-fall in a sustained tone every ~15-19s turned out
+    // to just BE a cyclic engine-revving sound, not a fix for one. Every
+    // volume/timing tweak on this layer kept getting reported back as "the
+    // humming" - so instead of tuning it further, it's disconnected from
+    // the output entirely (not deleted - _glidePadToChord/PROGRESSION still
+    // drive it, and the bass/melody below still read chord identity from
+    // the same source, they just don't need this audible for that). The
+    // oscillators/LFO keep running so nothing else has to change, they're
+    // just not connected to anything that reaches speakers.
+    const swellGain = ctx.createGain();
+    swellGain.gain.value = 0.001;
+
     for (const osc of this._ambientOscs) {
       osc.connect(filt);
       osc.start();
     }
     filt.connect(gain);
-    gain.connect(this._masterGain || ctx.destination);
+    gain.connect(swellGain);
+    // Deliberately not connected to _masterGain/destination - see comment above.
 
     this._ambientFilter = filt;
     this._ambientGain = gain;
+    this._ambientSwellGain = swellGain;
   }
 
-  /** Glides the pad's oscillators to the next voicing every ~14-20s. */
-  _updateAmbientChord(dt, now) {
+  /** Glides the pad's oscillators to a new chord's voicing over ~5s, and
+   * re-triggers its swell-in/hold/taper-out amplitude envelope for the new
+   * phrase - called from updateMusic() when the shared beat grid advances
+   * to a new chord. */
+  _glidePadToChord(chordIndex, now) {
     if (!this._ambientOscs) return;
-    this._ambientChordTimer -= dt;
-    if (this._ambientChordTimer > 0) return;
-    this._ambientChordIndex = (this._ambientChordIndex + 1) % this._ambientChords.length;
-    const chord = this._ambientChords[this._ambientChordIndex];
+    this._ambientChordIndex = chordIndex;
+    const chord = PROGRESSION[chordIndex % PROGRESSION.length].padFreqs;
     this._ambientOscs.forEach((osc, i) => {
       osc.frequency.cancelScheduledValues(now);
       osc.frequency.setValueAtTime(osc.frequency.value, now);
       osc.frequency.linearRampToValueAtTime(chord[i], now + 5);
     });
-    this._ambientChordTimer = 14 + Math.random() * 6;
+
+    if (this._ambientSwellGain) {
+      const bpm = 100 + this._musicEnergy * 40;
+      const beatDur = 60 / bpm / 2;
+      const phraseDur = BARS_PER_CHORD * STEPS_PER_BAR * beatDur;
+      const swell = this._ambientSwellGain.gain;
+      // Confirmed (by ear) this pad's own swell/chord-glide cycle was still
+      // the source of a persistent hum even with movement added - a floor
+      // of 25% between phrases was still audibly "always on". This now
+      // actually goes quiet for a real stretch of each phrase (not just
+      // quieter) so there's a genuine gap instead of a continuous tone that
+      // merely varies in loudness: swell in (first ~15%), hold at peak
+      // (until ~30%), fade down to near-silence by 50%, then stay
+      // near-silent for the whole back half until the next chord's attack
+      // fires. Peak itself lowered too (was 1.0) - on top of the base gain
+      // cut in updateContinuous, so even the "on" phase is subtle rather
+      // than loud-then-quiet.
+      const attack = phraseDur * 0.15;
+      const holdEnd = phraseDur * 0.3;
+      const fadeEnd = phraseDur * 0.5;
+      const peak = 0.55;
+      swell.cancelScheduledValues(now);
+      swell.setValueAtTime(Math.max(0.0001, swell.value), now);
+      swell.linearRampToValueAtTime(peak, now + attack);
+      swell.setValueAtTime(peak, now + holdEnd);
+      swell.linearRampToValueAtTime(0.02, now + fadeEnd);
+      swell.setValueAtTime(0.02, now + phraseDur);
+    }
   }
 
   // ── Reverb send (canyon echo, cliffs biome only) ──────────────────────
@@ -251,32 +399,49 @@ export class AudioManager {
     this._reverbInput = convolver;
   }
 
-  // ── Adaptive music (rhythmic layers over the ambient pad + tension drone) ─
+  // ── Adaptive music (melody + bass + drums over the ambient pad + tension
+  // drone, all locked to one shared harmonic/rhythmic clock) ───────────────
   // A lookahead scheduler: notes are timestamped against the AudioContext's
   // own clock (not setTimeout firing time) so there's no drift, and it's
   // driven from the same per-frame updateContinuous/updateMusic call the
   // rest of continuous audio already uses rather than a separate timer.
   _buildMusicLayers() {
     const ctx = this._ctx;
+
+    // Bass/melody/drums all feed one compressed music bus rather than
+    // _masterGain directly, so the denser Chase section (bass + full kit +
+    // melody at once) doesn't clip or turn to mush.
+    this._musicBus = ctx.createDynamicsCompressor();
+    this._musicBus.threshold.value = -18;
+    this._musicBus.ratio.value = 3;
+    this._musicBus.connect(this._masterGain);
+
     this._bassGain = ctx.createGain();
     this._bassGain.gain.value = 1;
-    this._bassGain.connect(this._masterGain);
+    this._bassGain.connect(this._musicBus);
 
-    this._arpGain = ctx.createGain();
-    this._arpGain.gain.value = 1;
-    this._arpGain.connect(this._masterGain);
+    this._melodyGain = ctx.createGain();
+    this._melodyGain.gain.value = 1;
+    this._melodyGain.connect(this._musicBus);
+
+    this._drumGain = ctx.createGain();
+    this._drumGain.gain.value = 1;
+    this._drumGain.connect(this._musicBus);
 
     this._musicEnergy = 0;
     this._musicChainT = 0;
-    this._musicBeat = 0;
+    this._musicStep = 0;
     this._nextNoteTime = 0;
+    this._musicSection = 'calm';
+    this._currentChordIndex = -1; // forces the first _glidePadToChord call
   }
 
-  _playBassNote(time, beat, energy) {
-    const notes = [65.41, 65.41, 98.0, 65.41]; // C2 C2 G2 C2 - under the ambient pad's C3/G3/C4
+  _playBassNote(time, step, chordIndex, energy) {
+    const root = PROGRESSION[chordIndex % PROGRESSION.length].rootDegree;
+    const degree = root + BASS_DEGREE_OFFSETS[step % BASS_DEGREE_OFFSETS.length];
     const osc = this._ctx.createOscillator();
     osc.type = 'triangle';
-    osc.frequency.value = notes[beat % notes.length];
+    osc.frequency.value = midiToFreq(degreeToMidi(degree, 2));
 
     const g = this._ctx.createGain();
     const peak = 0.16 * energy;
@@ -290,22 +455,116 @@ export class AudioManager {
     osc.stop(time + 0.26);
   }
 
-  _playArpNote(time, beat, chainT) {
-    const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6 - bright, same key
+  _playMelodyNote(time, step, chordIndex, gainMult) {
+    const root = PROGRESSION[chordIndex % PROGRESSION.length].rootDegree;
+    const motif = MELODY_MOTIFS[chordIndex % MELODY_MOTIFS.length];
+    const offset = motif[step % motif.length];
+    const midi = foldToRange(degreeToMidi(root + offset, 5), 64, 86);
     const osc = this._ctx.createOscillator();
     osc.type = 'sine';
-    osc.frequency.value = notes[beat % notes.length];
+    osc.frequency.value = midiToFreq(midi);
+    // Slight per-note detune, same humanizing touch the ambient pad's
+    // oscillators already use, so the lead doesn't sound like a flat test tone.
+    osc.detune.value = (Math.random() - 0.5) * 8;
 
     const g = this._ctx.createGain();
-    const peak = 0.06 * chainT;
+    const peak = 0.07 * gainMult;
     g.gain.setValueAtTime(0.0001, time);
     g.gain.linearRampToValueAtTime(peak, time + 0.015);
     g.gain.exponentialRampToValueAtTime(0.0001, time + 0.2);
 
     osc.connect(g);
-    g.connect(this._arpGain);
+    g.connect(this._melodyGain);
     osc.start(time);
     osc.stop(time + 0.22);
+  }
+
+  _playKick(time, peak) {
+    const osc = this._ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(150, time);
+    osc.frequency.exponentialRampToValueAtTime(45, time + 0.09);
+
+    const g = this._ctx.createGain();
+    g.gain.setValueAtTime(peak, time);
+    g.gain.exponentialRampToValueAtTime(0.001, time + 0.15);
+
+    osc.connect(g);
+    g.connect(this._drumGain);
+    osc.start(time);
+    osc.stop(time + 0.17);
+  }
+
+  _playHat(time, peak) {
+    const ctx = this._ctx;
+    const duration = 0.045;
+    const bufLen = Math.ceil(ctx.sampleRate * duration);
+    const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'highpass';
+    filt.frequency.value = 6000;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(peak, time);
+    g.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+
+    src.connect(filt);
+    filt.connect(g);
+    g.connect(this._drumGain);
+    src.start(time);
+    src.stop(time + duration + 0.02);
+  }
+
+  _playSnare(time, peak) {
+    const ctx = this._ctx;
+    const duration = 0.12;
+    const bufLen = Math.ceil(ctx.sampleRate * duration);
+    const buf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filt = ctx.createBiquadFilter();
+    filt.type = 'bandpass';
+    filt.frequency.value = 1800;
+    filt.Q.value = 0.7;
+
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(peak, time);
+    g.gain.exponentialRampToValueAtTime(0.0001, time + duration);
+
+    src.connect(filt);
+    filt.connect(g);
+    g.connect(this._drumGain);
+    src.start(time);
+    src.stop(time + duration + 0.02);
+
+    // Body tone under the noise so it reads as a snare hit, not just hiss.
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.value = 190;
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(peak * 0.6, time);
+    og.gain.exponentialRampToValueAtTime(0.0001, time + 0.08);
+    osc.connect(og);
+    og.connect(this._drumGain);
+    osc.start(time);
+    osc.stop(time + 0.1);
+  }
+
+  /** Which arrangement is active for a given smoothed energy level - uses
+   * different thresholds to enter vs. leave each section (hysteresis) so it
+   * doesn't flicker back and forth near a boundary. */
+  _sectionForEnergy(energy, current) {
+    if (current === 'chase') return energy < 0.35 ? (energy < 0.12 ? 'calm' : 'cruise') : 'chase';
+    if (current === 'cruise') return energy >= 0.5 ? 'chase' : (energy < 0.1 ? 'calm' : 'cruise');
+    return energy >= 0.5 ? 'chase' : (energy >= 0.18 ? 'cruise' : 'calm'); // current === 'calm'
   }
 
   /**
@@ -319,22 +578,56 @@ export class AudioManager {
     const ctx = this._ctx;
     const now = ctx.currentTime;
 
-    this._updateAmbientChord(dt, now);
-
     const speedNorm = Math.min((speed || 0) / 28, 1);
     const targetEnergy = Math.max(0, Math.min(1, speedNorm * 0.45 + (dangerT || 0) * 0.75 + (chainT || 0) * 0.5));
     const lerpT = Math.min(1, dt * 2);
     this._musicEnergy += (targetEnergy - this._musicEnergy) * lerpT;
     this._musicChainT += ((chainT || 0) - this._musicChainT) * lerpT;
+    this._musicSection = this._sectionForEnergy(this._musicEnergy, this._musicSection);
+
+    const targets = SECTION_TARGETS[this._musicSection];
+    this._bassGain.gain.setTargetAtTime(targets.bass, now, 0.6);
+    this._drumGain.gain.setTargetAtTime(targets.drums, now, 0.6);
+    this._melodyGain.gain.setTargetAtTime(targets.melody, now, 0.6);
 
     if (this._nextNoteTime < now) this._nextNoteTime = now;
     const bpm = 100 + this._musicEnergy * 40;
-    const beatDur = 60 / bpm / 2; // 8th notes
+    const beatDur = 60 / bpm / 2; // eighth notes
 
     while (this._nextNoteTime < now + 0.12) {
-      if (this._musicEnergy > 0.04) this._playBassNote(this._nextNoteTime, this._musicBeat, this._musicEnergy);
-      if (this._musicChainT > 0.04) this._playArpNote(this._nextNoteTime, this._musicBeat, this._musicChainT);
-      this._musicBeat++;
+      const step = this._musicStep;
+      const bar = Math.floor(step / STEPS_PER_BAR);
+      const chordIndex = Math.floor(bar / BARS_PER_CHORD) % PROGRESSION.length;
+      if (chordIndex !== this._currentChordIndex) this._glidePadToChord(chordIndex, this._nextNoteTime);
+
+      const section = this._musicSection;
+      const quarterStep = Math.floor(step / 2);
+      const onQuarter = step % 2 === 0;
+
+      if (section !== 'calm') {
+        this._playBassNote(this._nextNoteTime, step, chordIndex, this._musicEnergy);
+      }
+
+      // Melody: sparse (every other step, i.e. quarter notes) at rest, full
+      // eighth-note density once moving, brighter still during a jump-chain
+      // window (the old chainT-gated arp's role).
+      if (section !== 'calm' || onQuarter) {
+        const chainBoost = this._musicChainT > 0.04 ? 1 + this._musicChainT * 1.4 : 1;
+        this._playMelodyNote(this._nextNoteTime, step, chordIndex, (0.35 + this._musicEnergy * 0.65) * chainBoost);
+      }
+
+      if (section === 'chase' && onQuarter) {
+        const beatInBar = quarterStep % 4;
+        if (beatInBar === 0 || beatInBar === 2) this._playKick(this._nextNoteTime, 0.26);
+        else this._playSnare(this._nextNoteTime, 0.16);
+      }
+      if (section === 'chase') {
+        this._playHat(this._nextNoteTime, onQuarter ? 0.05 : 0.035);
+      } else if (section === 'cruise' && onQuarter) {
+        this._playHat(this._nextNoteTime, 0.02);
+      }
+
+      this._musicStep++;
       this._nextNoteTime += beatDur;
     }
   }
@@ -350,25 +643,32 @@ export class AudioManager {
     const ctx = this._ctx;
     const now = ctx.currentTime;
 
-    // Wind: volume 0.02 at rest → 0.28 at boost speed
+    // Wind: volume 0.02 at rest → 0.28 at boost speed. Band-pass noise held
+    // at a rock-steady ~180Hz (the old idle frequency) is exactly how a low
+    // engine-idle rumble gets synthesized - raised into a higher, airier
+    // register so idle wind reads as a soft hiss instead of a drone, and
+    // the turbulence LFO below (added to the filter's cutoff, not a
+    // separately-tracked value) keeps it from ever holding perfectly still,
+    // which is the other half of what made it sound mechanical.
     const speedNorm  = Math.min(speed / 28, 1);
-    const windVol    = 0.02 + speedNorm * 0.26;
-    const windFreq   = 180 + speedNorm * 600;
+    const windVol    = 0.006 + speedNorm * 0.08; // was 0.012 + speedNorm*0.16 - halved again, still too present
+    const windFreq   = 420 + speedNorm * 700;
+    const turbulence = Math.sin(now * 0.6) * 35 + Math.sin(now * 1.7) * 18;
     this._windGain.gain.setTargetAtTime(isAirborne ? windVol * 1.4 : windVol, now, 0.15);
-    this._windFilter.frequency.setTargetAtTime(windFreq, now, 0.1);
+    this._windFilter.frequency.setTargetAtTime(windFreq + turbulence, now, 0.1);
 
     // Slide: audible only when turning and on ground
     const turnNorm   = Math.min(Math.abs(turnAngle) / 1.32, 1); // 0..1
-    const slideVol   = isAirborne ? 0 : turnNorm * turnNorm * 0.18 * speedNorm;
+    const slideVol   = isAirborne ? 0 : turnNorm * turnNorm * 0.012 * speedNorm; // was 0.18, 0.09, 0.05, 0.025 - halved again
     this._slideGain.gain.setTargetAtTime(slideVol, now, 0.04);
 
     // Ambient pad: always faintly present, brightens a little with speed.
     // A slow filter LFO ("breathing") adds gentle motion on top of the
-    // slow chord cycling in _updateAmbientChord, so it never sits dead
+    // slow chord cycling in _glidePadToChord, so it never sits dead
     // static even mid-chord.
     if (this._ambientGain) {
       const breathe = Math.sin(now * 0.15) * 90;
-      this._ambientGain.gain.setTargetAtTime(0.05 + speedNorm * 0.03, now, 1.2);
+      this._ambientGain.gain.setTargetAtTime(0.016 + speedNorm * 0.01, now, 1.2); // was 0.035 + speedNorm*0.02 - halved again
       this._ambientFilter.frequency.setTargetAtTime(400 + speedNorm * 900 + breathe, now, 0.8);
     }
   }
@@ -811,8 +1111,14 @@ export class AudioManager {
     if (this._slideGain) this._slideGain.gain.setTargetAtTime(0, now, 0.04);
     if (this._tensionGain) this._tensionGain.gain.setTargetAtTime(0, now, 0.3);
     if (this._ambientGain) this._ambientGain.gain.setTargetAtTime(0, now, 0.3);
+    // The tremolo LFO connects additively onto _ambientGain.gain (real Web
+    // Audio param modulation, not a value we set directly) - ramping the
+    // base to 0 above doesn't silence it, it'd keep wobbling audibly around
+    // 0 forever. Ramp its depth down too.
+    if (this._ambientTremoloDepth) this._ambientTremoloDepth.gain.setTargetAtTime(0, now, 0.3);
     if (this._bassGain) this._bassGain.gain.setTargetAtTime(0, now, 0.2);
-    if (this._arpGain) this._arpGain.gain.setTargetAtTime(0, now, 0.2);
+    if (this._melodyGain) this._melodyGain.gain.setTargetAtTime(0, now, 0.2);
+    if (this._drumGain) this._drumGain.gain.setTargetAtTime(0, now, 0.2);
     this._musicEnergy = 0;
     this._musicChainT = 0;
   }
@@ -830,10 +1136,16 @@ export class AudioManager {
     if (this._slideGain) this._slideGain.gain.setTargetAtTime(0, now, 0.02);
     if (this._tensionGain) this._tensionGain.gain.setTargetAtTime(0, now, 0.04);
     if (this._ambientGain) this._ambientGain.gain.setTargetAtTime(0, now, 0.15);
-    // Cuts the gain bus immediately, so any bass/arp notes already scheduled
-    // within updateMusic's ~120ms lookahead window don't bleed into silence.
+    // Same reasoning as silenceContinuous - the tremolo LFO modulates
+    // _ambientGain.gain additively, so it needs its own ramp-to-0 or the
+    // pad keeps faintly wobbling under the game-over chord.
+    if (this._ambientTremoloDepth) this._ambientTremoloDepth.gain.setTargetAtTime(0, now, 0.15);
+    // Cuts the gain buses immediately, so any bass/melody/drum notes already
+    // scheduled within updateMusic's ~120ms lookahead window don't bleed
+    // into silence.
     if (this._bassGain) this._bassGain.gain.setTargetAtTime(0, now, 0.03);
-    if (this._arpGain) this._arpGain.gain.setTargetAtTime(0, now, 0.03);
+    if (this._melodyGain) this._melodyGain.gain.setTargetAtTime(0, now, 0.03);
+    if (this._drumGain) this._drumGain.gain.setTargetAtTime(0, now, 0.03);
     this._musicEnergy = 0;
     this._musicChainT = 0;
 
@@ -849,6 +1161,7 @@ export class AudioManager {
       this._tensionOsc1?.stop();
       this._tensionOsc2?.stop();
       this._ambientOscs?.forEach(osc => osc.stop());
+      this._ambientLfo?.stop();
       this._ctx?.close();
     } catch (_) {}
     this._ready = false;

@@ -36,6 +36,15 @@ const PROJECTILE_HIT_HALF_X = 0.65;
 const PROJECTILE_HIT_HALF_Z = 0.9;
 const PROJECTILE_HIT_HALF_Y = 1.0;
 const PROJECTILE_TARGET_Y_OFFSET = 0.65;
+// A larger box than the hit box above, checked only while airborne and only
+// against 'npc' (snowball-thrower) projectiles - not Sky Mario combat
+// throws, since dodging another player's shot isn't this bonus's target.
+// Mirrors AIR_CLEAR_*'s "reward a direct mid-air interaction, not just
+// avoidance" idea, applied to a moving projectile instead of a static
+// obstacle's z-crossing.
+const SNOWBALL_GRAZE_HALF_X = 1.3;
+const SNOWBALL_GRAZE_HALF_Z = 1.7;
+const SNOWBALL_DODGE_BONUS = 1.6;
 // Anti-softlock: "stuck" means actual forward progress is far below what
 // the player's own current speed/heading implies (i.e. something is
 // physically blocking them - wedged against obstacles), not just moving
@@ -116,6 +125,15 @@ export const THROWER_TRIGGER_DISTANCE = 14;
 export const THROWER_TELEGRAPH_LEAD = 24;
 const NEAR_MISS_MIN_BONUS = 0.5;
 const NEAR_MISS_MAX_BONUS = 3;
+// "Slalom" streak: consecutive near-misses without a hit escalate the bonus,
+// rewarding deliberately threading a dense cluster rather than just staying
+// generically careful (contrast with cleanStreakSeconds, which only rewards
+// TIME without a hit). Resets on any hit (same reset points as
+// cleanStreakSeconds) and also on a NEAR_MISS_STREAK_TIMEOUT_MS gap between
+// near-misses, so one early graze can't coast a bonus for the rest of a run.
+const NEAR_MISS_STREAK_TIMEOUT_MS = 3000;
+const NEAR_MISS_STREAK_BONUS_RATE = 0.15;
+const NEAR_MISS_STREAK_MAX_STACKS = 5; // caps the multiplier at 1 + 0.15*5 = 1.75x
 const JUMP_CHAIN_WINDOW_MS = 4500;
 const JUMP_CHAIN_BONUS_DISTANCE = 4;
 // Momentum: builds while sustaining speed, decays (faster than it builds)
@@ -137,6 +155,15 @@ const CLEAN_STREAK_MAX_BONUS_RATE = 0.4;
 // computes exactly how close a player is to being caught for the real
 // capture decision, reused here as a continuous bonus signal.
 const YETI_PROXIMITY_BONUS_RATE = 3;
+// One-shot bonus for surviving a genuinely tight gap, on top of the
+// continuous per-tick danger bonus above. Purely additive - never touches
+// the gap<=0 capture decision itself, which is deliberately kept as a pure
+// distance formula (not a hitbox/proximity check) specifically to avoid
+// unfairly catching a cornered player. Re-arms (see yetiCloseCallActive)
+// once the gap grows back past this threshold, so a second close call later
+// in the same chase can pay out again.
+const YETI_CLOSE_CALL_GAP = 20;
+const YETI_CLOSE_CALL_BONUS = 5;
 const MULTIPLAYER_SPAWN_LIMIT = 34;
 // Mid-air tricks: lateralAxis is otherwise discarded while airborne (see
 // simulatePlayerTick's steer branch), repurposed here to spin the skier.
@@ -319,6 +346,7 @@ export interface PlayerSimState {
   finished: boolean;
   isAirborne: boolean;
   airborneFromRamp: boolean;
+  doubleJumped: boolean;
   jumpVelocityY: number;
   airVelocityX: number;
   airVelocityZ: number;
@@ -332,11 +360,14 @@ export interface PlayerSimState {
   bonusDistance: number;
   lastRampJumpAtMs: number;
   chainCount: number;
+  nearMissStreak: number;
+  lastNearMissAtMs: number;
   momentum: number;
   cleanStreakSeconds: number;
   lastProcessedInputSeq: number;
   lastInputAtMs: number;
   yetiTriggerAtMs: number;
+  yetiCloseCallActive: boolean;
   avalancheTriggerAtMs: number;
   avalancheTriggerDistance: number;
   // Dwell tracking for the fork "Bold Line" bonus - see maybeApplyForkBonus.
@@ -369,7 +400,8 @@ export interface PlayerSimState {
 export interface SimEvent {
   type: 'hit' | 'heal' | 'death' | 'jump' | 'landing' | 'yeti-warning' | 'yeti-capture' | 'near-miss' | 'jump-chain' | 'unstuck'
     | 'avalanche-warning' | 'avalanche-capture' | 'avalanche-outrun' | 'trick' | 'trick-fail' | 'fork-bold-line'
-    | 'landing-precision' | 'air-clear' | 'air-boost' | 'combat-throw' | 'npc-throw';
+    | 'landing-precision' | 'air-clear' | 'air-boost' | 'combat-throw' | 'npc-throw'
+    | 'chain-save' | 'snowball-dodge' | 'yeti-close-call';
   playerId: string;
   socketId: string;
   obstacleId?: string;
@@ -414,10 +446,12 @@ export interface RoomSnapshotPlayer {
   distance: number;
   bonusDistance?: number;
   chainCount?: number;
+  nearMissStreak?: number;
   momentum?: number;
   cleanStreakSeconds?: number;
   isAirborne: boolean;
   airborneFromRamp?: boolean;
+  doubleJumped?: boolean;
   jumpVelocityY?: number;
   airVelocityX?: number;
   airVelocityZ?: number;
@@ -1159,6 +1193,7 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     finished: false,
     isAirborne: false,
     airborneFromRamp: false,
+    doubleJumped: false,
     jumpVelocityY: 0,
     airVelocityX: 0,
     airVelocityZ: 0,
@@ -1171,11 +1206,14 @@ export function createInitialPlayerState(id: string, name: string, playerId = id
     bonusDistance: 0,
     lastRampJumpAtMs: -Infinity,
     chainCount: 0,
+    nearMissStreak: 0,
+    lastNearMissAtMs: -Infinity,
     momentum: 0,
     cleanStreakSeconds: 0,
     lastProcessedInputSeq: 0,
     lastInputAtMs: 0,
     yetiTriggerAtMs: -1,
+    yetiCloseCallActive: false,
     avalancheTriggerAtMs: -1,
     avalancheTriggerDistance: 0,
     forkZoneRiskyTicks: 0,
@@ -1205,6 +1243,7 @@ function triggerJump(state: PlayerSimState, force = MANUAL_JUMP_VELOCITY, source
   if (state.isAirborne) return false;
   state.isAirborne = true;
   state.airborneFromRamp = source === 'ramp';
+  state.doubleJumped = false;
   state.jumpVelocityY = force;
   state.airTime = 0;
   state.trickSpinRad = 0;
@@ -1234,6 +1273,21 @@ function getRampJumpVelocity(speed: number) {
 // players a limited, deliberate way to extend/save a jump instead of it
 // being purely a function of takeoff speed.
 const AIR_BOOST_VELOCITY_Y = 4.5;
+// Momentum is otherwise frozen while airborne (see the isAirborne branch of
+// the momentum-build code below) - a double jump/air-boost instantly docks
+// a chunk of it as a real cost, since it's a tree-clearing escape hatch AND
+// a free height/distance kick, not just a cosmetic flourish. Also doubles as
+// the minimum momentum required to double-jump at all (see the jumpPressed
+// branch below) - can't go into debt, and since momentum can't rebuild
+// mid-air, running it out means no more double jumps until you land and
+// speed rebuilds it. Rebuilds at MOMENTUM_BUILD_RATE once grounded, same as
+// any other momentum loss.
+const DOUBLE_JUMP_MOMENTUM_COST = 0.35;
+// Rewards deliberately spending a double jump to save/extend an active ramp-
+// jump chain (rather than just as a tree-clearing escape hatch) - ties two
+// otherwise-unconnected systems together into a real combo. See the
+// chain-window check in the jumpPressed branch below.
+const CHAIN_SAVE_BONUS_DISTANCE = 3;
 
 // Airborne obstacle interaction: obstacles that are otherwise entirely
 // ignored while airborne (see the isAirborne-continue branch further down)
@@ -1263,6 +1317,7 @@ function damagePlayer(state: PlayerSimState, obstacle: { id: string; type: strin
   if (state.invincibilityRemaining > 0 || !state.alive) return;
   state.hp = Math.max(0, state.hp - 1);
   state.chainCount = 0;
+  state.nearMissStreak = 0;
   state.momentum = 0;
   state.cleanStreakSeconds = 0;
   const baseEvent = {
@@ -1319,10 +1374,14 @@ export interface ProjectileSimState {
   // 'player' for Sky Mario combat throws - only affects which obstacle type
   // damagePlayer/the death-kind ternary sees, not the physics.
   kind: 'player' | 'npc';
+  // One-shot dedupe for the graze/dodge bonus below - a projectile stays
+  // alive/in-flight for multiple ticks, so without this the same near-miss
+  // could pay out every tick it stays within the graze box.
+  grazed?: boolean;
 }
 
 export function createProjectile(id: string, ownerId: string, spawn: { x: number; y: number; z: number; vx: number; vy: number; vz: number }, kind: 'player' | 'npc' = 'player'): ProjectileSimState {
-  return { id, ownerId, x: spawn.x, y: spawn.y, z: spawn.z, vx: spawn.vx, vy: spawn.vy, vz: spawn.vz, life: PROJECTILE_LIFETIME, hit: false, kind };
+  return { id, ownerId, x: spawn.x, y: spawn.y, z: spawn.z, vx: spawn.vx, vy: spawn.vy, vz: spawn.vz, life: PROJECTILE_LIFETIME, hit: false, kind, grazed: false };
 }
 
 // Authoritative Sky Mario combat hit detection - advances every live
@@ -1333,7 +1392,7 @@ export function createProjectile(id: string, ownerId: string, spawn: { x: number
 // physics not modeling terrain height), so no groundYAt lookup is needed
 // here, unlike the client's cosmetic copy which samples visual terrain
 // height for its bounce.
-export function simulateProjectilesTick(projectiles: ProjectileSimState[], playerStates: Iterable<PlayerSimState>, dt: number, events: SimEvent[]): void {
+export function simulateProjectilesTick(projectiles: ProjectileSimState[], playerStates: Iterable<PlayerSimState>, dt: number, events: SimEvent[], skillScoring = false): void {
   for (const p of projectiles) {
     if (p.hit) continue;
     p.life -= dt;
@@ -1358,6 +1417,14 @@ export function simulateProjectilesTick(projectiles: ProjectileSimState[], playe
         p.hit = true;
         damagePlayer(state, { id: p.id, type: p.kind === 'npc' ? 'npc_snowball' : 'sky_mario_projectile' }, PROJECTILE_SPEED, events);
         break;
+      }
+      if (
+        skillScoring && state.isAirborne && !p.grazed && p.kind === 'npc'
+        && dx < SNOWBALL_GRAZE_HALF_X && dz < SNOWBALL_GRAZE_HALF_Z
+      ) {
+        p.grazed = true;
+        state.bonusDistance += SNOWBALL_DODGE_BONUS;
+        events.push({ type: 'snowball-dodge', playerId: state.playerId, socketId: state.id, distance: state.distance, bonus: SNOWBALL_DODGE_BONUS });
       }
     }
   }
@@ -1410,10 +1477,23 @@ export function simulatePlayerTick(
   if (cleanInput.jumpPressed && !state.jumpHeld) {
     if (triggerJump(state, getManualJumpVelocity(state.speed), 'manual')) {
       events.push({ type: 'jump', playerId: state.playerId, socketId: state.id, distance: state.distance });
-    } else if (state.isAirborne && state.airBoostAvailable) {
+    } else if (state.isAirborne && state.airBoostAvailable && state.momentum >= DOUBLE_JUMP_MOMENTUM_COST) {
       state.airBoostAvailable = false;
       state.jumpVelocityY = Math.max(state.jumpVelocityY, 0) + AIR_BOOST_VELOCITY_Y;
+      // Same tree pass-through a ramp launch already gets (see the
+      // isAirborne/tree collision branch below) - spending the air-boost
+      // charge is this game's "double jump", so it earns the same reward.
+      state.doubleJumped = true;
+      state.momentum = Math.max(0, state.momentum - DOUBLE_JUMP_MOMENTUM_COST);
       events.push({ type: 'air-boost', playerId: state.playerId, socketId: state.id, distance: state.distance });
+      // Combo: this jump is still within an active ramp-jump chain window
+      // (already pruned if stale, see the chainCount reset at the top of
+      // this function) - reward spending the double jump to keep it alive
+      // instead of just treating it as an isolated escape hatch.
+      if (skillScoring && state.chainCount > 0) {
+        state.bonusDistance += CHAIN_SAVE_BONUS_DISTANCE;
+        events.push({ type: 'chain-save', playerId: state.playerId, socketId: state.id, distance: state.distance, chainCount: state.chainCount, bonus: CHAIN_SAVE_BONUS_DISTANCE });
+      }
     }
   }
   state.jumpHeld = cleanInput.jumpPressed;
@@ -1491,7 +1571,7 @@ export function simulatePlayerTick(
       continue;
     }
 
-    if (state.isAirborne && obs.type === 'tree' && !state.airborneFromRamp) {
+    if (state.isAirborne && obs.type === 'tree' && !state.airborneFromRamp && !state.doubleJumped) {
       const resolved = resolveCollision(newX, newZ, obs);
       newX = resolved.x;
       newZ = resolved.z;
@@ -1537,6 +1617,7 @@ export function simulatePlayerTick(
       state.speed = BASE_SPEED;
       state.isAirborne = false;
       state.airborneFromRamp = false;
+      state.doubleJumped = false;
       state.jumpVelocityY = 0;
       state.airVelocityX = 0;
       state.airVelocityZ = 0;
@@ -1598,7 +1679,11 @@ export function simulatePlayerTick(
       // near-miss margin - the closer the cut, the bigger the reward.
       const closenessT = 1 - lateralGap / NEAR_MISS_MARGIN;
       const speed01 = clamp(state.speed / BOOST_SPEED, 0, 1);
-      const bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+      let bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+      if (nowMs - state.lastNearMissAtMs > NEAR_MISS_STREAK_TIMEOUT_MS) state.nearMissStreak = 0;
+      state.nearMissStreak += 1;
+      state.lastNearMissAtMs = nowMs;
+      bonus *= 1 + NEAR_MISS_STREAK_BONUS_RATE * Math.min(state.nearMissStreak - 1, NEAR_MISS_STREAK_MAX_STACKS);
       state.bonusDistance += bonus;
       events.push({ type: 'near-miss', playerId: state.playerId, socketId: state.id, obstacleId: obs.id, obstacleType: obs.type, distance: state.distance, bonus });
     }
@@ -1653,6 +1738,7 @@ export function simulatePlayerTick(
       state.y = 0;
       state.isAirborne = false;
       state.airborneFromRamp = false;
+      state.doubleJumped = false;
       state.airVelocityX = 0;
       state.airVelocityZ = 0;
       state.jumpVelocityY = 0;
@@ -1749,6 +1835,7 @@ export function applyPlayerCollision(
     if (state.invincibilityRemaining > 0) continue;
     state.hp = Math.max(0, state.hp - 1);
     state.chainCount = 0;
+    state.nearMissStreak = 0;
     state.momentum = 0;
     state.cleanStreakSeconds = 0;
     if (state.hp <= 0) {
@@ -1805,6 +1892,7 @@ export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSetti
   const config = getYetiConfig(settings);
   if (state.distance < config.triggerDistance) {
     state.yetiTriggerAtMs = -1;
+    state.yetiCloseCallActive = false;
     return;
   }
   if (state.yetiTriggerAtMs < 0) state.yetiTriggerAtMs = roomTimeMs;
@@ -1840,6 +1928,16 @@ export function maybeApplyYetiCapture(state: PlayerSimState, settings: RoomSetti
     if (dangerT > 0) {
       state.bonusDistance += dt * dangerT * YETI_PROXIMITY_BONUS_RATE;
     }
+  }
+
+  if (gap < YETI_CLOSE_CALL_GAP) {
+    if (skillScoring && !state.yetiCloseCallActive) {
+      state.yetiCloseCallActive = true;
+      state.bonusDistance += YETI_CLOSE_CALL_BONUS;
+      events.push({ type: 'yeti-close-call', playerId: state.playerId, socketId: state.id, distance: state.distance, bonus: YETI_CLOSE_CALL_BONUS });
+    }
+  } else {
+    state.yetiCloseCallActive = false;
   }
 }
 
@@ -1928,10 +2026,12 @@ export function toSnapshotPlayer(state: PlayerSimState): RoomSnapshotPlayer {
     distance: state.distance,
     bonusDistance: state.bonusDistance,
     chainCount: state.chainCount,
+    nearMissStreak: state.nearMissStreak,
     momentum: state.momentum,
     cleanStreakSeconds: state.cleanStreakSeconds,
     isAirborne: state.isAirborne,
     airborneFromRamp: state.airborneFromRamp,
+    doubleJumped: state.doubleJumped,
     jumpVelocityY: state.jumpVelocityY,
     airVelocityX: state.airVelocityX,
     airVelocityZ: state.airVelocityZ,

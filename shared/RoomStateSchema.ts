@@ -29,10 +29,12 @@ export class PlayerStateSchema extends Schema {
     this.distance = 0;
     this.bonusDistance = 0;
     this.chainCount = 0;
+    this.nearMissStreak = 0;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
     this.isAirborne = false;
     this.airborneFromRamp = false;
+    this.doubleJumped = false;
     this.jumpVelocityY = 0;
     this.airVelocityX = 0;
     this.airVelocityZ = 0;
@@ -62,10 +64,12 @@ defineTypes(PlayerStateSchema, {
   distance: 'number',
   bonusDistance: 'number',
   chainCount: 'number',
+  nearMissStreak: 'number',
   momentum: 'number',
   cleanStreakSeconds: 'number',
   isAirborne: 'boolean',
   airborneFromRamp: 'boolean',
+  doubleJumped: 'boolean',
   jumpVelocityY: 'number',
   airVelocityX: 'number',
   airVelocityZ: 'number',

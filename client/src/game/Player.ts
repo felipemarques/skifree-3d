@@ -16,12 +16,16 @@ const GRAVITY = 18;
 // Mirrors shared/AuthoritativeSim.ts's AIR_BOOST_VELOCITY_Y/AIR_CLEAR_*/
 // LANDING_PRECISION_* - see their comments there.
 const AIR_BOOST_VELOCITY_Y = 4.5;
+const DOUBLE_JUMP_MOMENTUM_COST = 0.35;
+const CHAIN_SAVE_BONUS_DISTANCE = 3;
 const AIR_CLEAR_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree']);
 const AIR_CLEAR_MIN_BONUS = 0.8;
 const AIR_CLEAR_MAX_BONUS = 2.6;
 const AIR_CLEAR_HEIGHT_FOR_MAX = 1.6;
-const LANDING_PRECISION_MAX_ANGLE_DEG = 26;
-const LANDING_PRECISION_MIN_AIRTIME = 0.18;
+// Exported so Game.ts's HUD snapshot can preview live whether the current
+// landing angle would score precision, without duplicating the constant.
+export const LANDING_PRECISION_MAX_ANGLE_DEG = 26;
+export const LANDING_PRECISION_MIN_AIRTIME = 0.18;
 const LANDING_PRECISION_MAX_BONUS = 2.2;
 const LANDING_PRECISION_AIRTIME_FOR_MAX = 0.9;
 const INVINCIBILITY_TIME = 1.8;
@@ -46,6 +50,11 @@ const NEAR_MISS_TYPES = new Set(['tree', 'rock', 'stump', 'fallen_tree', 'npc', 
 const NEAR_MISS_MARGIN = 0.4;
 const NEAR_MISS_MIN_BONUS = 0.5;
 const NEAR_MISS_MAX_BONUS = 3;
+// Mirrors shared/AuthoritativeSim.ts's near-miss streak constants - see
+// their comments there.
+const NEAR_MISS_STREAK_TIMEOUT_MS = 3000;
+const NEAR_MISS_STREAK_BONUS_RATE = 0.15;
+const NEAR_MISS_STREAK_MAX_STACKS = 5;
 const JUMP_CHAIN_WINDOW_MS = 4500;
 const JUMP_CHAIN_BONUS_DISTANCE = 4;
 // Snowball NPC hazard - mirrors shared/AuthoritativeSim.ts's
@@ -157,6 +166,7 @@ export class Player {
     this._airVelocityZ = 0;
     this._airAngle = 0;
     this._airborneFromRamp = false;
+    this._doubleJumped = false;
 
     this.halfW = 0.35;
     this.halfD = 0.55;
@@ -185,6 +195,8 @@ export class Player {
     this.bonusDistance = 0;
     this._lastRampJumpAtMs = -Infinity;
     this.chainCount = 0;
+    this.nearMissStreak = 0;
+    this._lastNearMissAtMs = -Infinity;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
     // Accumulated mid-air spin (radians, signed) - see the steer branch and
@@ -220,6 +232,7 @@ export class Player {
     this.onTrick = null;
     this.onTrickFail = null;
     this.onAirBoost = null;
+    this.onChainSave = null;
     this.onAirClear = null;
     this.onLandingPrecision = null;
   }
@@ -266,6 +279,7 @@ export class Player {
     this._airVelocityZ = 0;
     this._airAngle = 0;
     this._airborneFromRamp = false;
+    this._doubleJumped = false;
     this.airTime = 0;
     this._holeFallTimer = 0;
     this._stuckTimer = 0;
@@ -336,10 +350,20 @@ export class Player {
     if (jumpPressed && !this._jumpHeld) {
       if (!this.isAirborne) {
         this._triggerJump(this._getManualJumpVelocity());
-      } else if (this._airBoostAvailable) {
+      } else if (this._airBoostAvailable && this.momentum >= DOUBLE_JUMP_MOMENTUM_COST) {
         this._airBoostAvailable = false;
         this.jumpVelocityY = Math.max(this.jumpVelocityY, 0) + AIR_BOOST_VELOCITY_Y;
+        // Same tree pass-through a ramp launch already gets - see
+        // shared/AuthoritativeSim.ts's mirrored comment on this branch.
+        this._doubleJumped = true;
+        this.momentum = Math.max(0, this.momentum - DOUBLE_JUMP_MOMENTUM_COST);
         if (this.onAirBoost) this.onAirBoost();
+        // Combo: still within an active ramp-jump chain window - see
+        // shared/AuthoritativeSim.ts's mirrored comment on this branch.
+        if (skillScoring && this.chainCount > 0) {
+          this.bonusDistance += CHAIN_SAVE_BONUS_DISTANCE;
+          if (this.onChainSave) this.onChainSave(CHAIN_SAVE_BONUS_DISTANCE, this.chainCount);
+        }
       }
     }
     this._jumpHeld = jumpPressed;
@@ -387,7 +411,7 @@ export class Player {
       // Non-solid - see shared/AuthoritativeSim.ts's matching skip.
       if (obs.type === 'thrower') continue;
 
-      if (this.isAirborne && obs.type === 'tree' && !this._airborneFromRamp) {
+      if (this.isAirborne && obs.type === 'tree' && !this._airborneFromRamp && !this._doubleJumped) {
         if (this._collidesAABB(newX, newZ, obs)) {
           const resolved = this._resolveCollision(newX, newZ, obs);
           newX = resolved.x;
@@ -446,6 +470,7 @@ export class Player {
     if (hitSomething && !this._isInvincible) {
       this.hp = Math.max(0, this.hp - 1);
       this.chainCount = 0;
+      this.nearMissStreak = 0;
       this.momentum = 0;
       this.cleanStreakSeconds = 0;
 
@@ -509,7 +534,12 @@ export class Player {
         // near-miss margin - the closer the cut, the bigger the reward.
         const closenessT = 1 - lateralGap / NEAR_MISS_MARGIN;
         const speed01 = THREE.MathUtils.clamp(this.speed / BOOST_SPEED, 0, 1);
-        const bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+        let bonus = NEAR_MISS_MIN_BONUS + closenessT * (NEAR_MISS_MAX_BONUS - NEAR_MISS_MIN_BONUS) * (0.6 + 0.4 * speed01);
+        const nowMs = performance.now();
+        if (nowMs - this._lastNearMissAtMs > NEAR_MISS_STREAK_TIMEOUT_MS) this.nearMissStreak = 0;
+        this.nearMissStreak += 1;
+        this._lastNearMissAtMs = nowMs;
+        bonus *= 1 + NEAR_MISS_STREAK_BONUS_RATE * Math.min(this.nearMissStreak - 1, NEAR_MISS_STREAK_MAX_STACKS);
         this.bonusDistance += bonus;
         if (this.onNearMiss) this.onNearMiss(bonus, this._panFrom(obs.x));
       }
@@ -571,6 +601,7 @@ export class Player {
         this._airVelocityX = 0;
         this._airVelocityZ = 0;
         this._airborneFromRamp = false;
+        this._doubleJumped = false;
         if (this.onJumpLand) this.onJumpLand(landed);
 
         // Mid-air trick scoring - mirrors shared/AuthoritativeSim.ts's
@@ -964,6 +995,7 @@ export class Player {
     this._pullOutOfHazards(obstacles);
     this.hp = Math.max(0, this.hp - 1);
     this.chainCount = 0;
+    this.nearMissStreak = 0;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
 
@@ -991,6 +1023,7 @@ export class Player {
     this.speed *= 0.58;
     this.hp = Math.max(0, this.hp - 1);
     this.chainCount = 0;
+    this.nearMissStreak = 0;
     this.momentum = 0;
     this.cleanStreakSeconds = 0;
 
@@ -1014,6 +1047,7 @@ export class Player {
 
     this.isAirborne = true;
     this._airborneFromRamp = source === 'ramp';
+    this._doubleJumped = false;
     this.jumpVelocityY = force;
     this.airTime = 0;
     this._trickSpinRad = 0;

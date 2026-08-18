@@ -67,6 +67,8 @@ export interface HudState {
   spawnShieldSeconds: number;
   spectatorTarget: string;
   chainCount: number;
+  /** Consecutive near-misses without a hit - see nearMissStreak's comment in shared/AuthoritativeSim.ts. */
+  nearMissStreak: number;
   chainRemainingT: number;
   momentum: number;
   cleanStreakSeconds: number;
@@ -77,6 +79,10 @@ export interface HudState {
   pingMs: number | null;
   /** Live in-air trick spin, degrees (0 when grounded or no spin attempted). */
   trickSpinDeg: number;
+  /** True while airborne with enough airtime and a shallow enough landing
+   * angle that landing right now would score a landing-precision bonus -
+   * see LANDING_PRECISION_* in Player.ts/shared/AuthoritativeSim.ts. */
+  landingPrecisionReady: boolean;
 }
 
 export interface YetiThreat {
@@ -155,6 +161,9 @@ export interface UiAdapter {
   showLandingPrecisionFeedback(bonus?: number): void;
   showAirClearFeedback(bonus?: number): void;
   showAirBoostFeedback(): void;
+  showChainSaveFeedback(bonus?: number, chainCount?: number): void;
+  showSnowballDodgeFeedback(bonus?: number): void;
+  showYetiCloseCallFeedback(bonus?: number): void;
   showAvalancheOutrunFeedback(): void;
   showForkBoldLineFeedback(): void;
   setError(message: string): void;
