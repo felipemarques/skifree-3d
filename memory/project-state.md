@@ -5,7 +5,7 @@ Last updated: 2026-07-23
 ## Current Game
 
 - SkiFree 3D is a browser game built with TypeScript, Vite, Three.js, Express, and Socket.io.
-- The client runs on `localhost:5173`; the server runs on `localhost:3000`.
+- The client runs on `localhost:5173`; the server runs on `localhost:3002`.
 - Do not run `npm run dev` from automation because the developer runs it manually.
 
 ## Recent Fixes

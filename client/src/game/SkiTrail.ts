@@ -81,7 +81,7 @@ export class SkiTrail {
     this._lastGroovePos = new THREE.Vector3(0, 0, -9999);
 
     const grooveMat = new THREE.MeshBasicMaterial({
-      color:       0xc0d8f0,
+      color:       0xc1d1ff,
       transparent: true,
       opacity:     0.55,
       depthWrite:  false,

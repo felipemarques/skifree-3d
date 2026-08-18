@@ -46,7 +46,7 @@
 - Test dog, bear, and Yeti jumps over low obstacles at high obstacle volume, confirming they still dodge standing trees and ramps without FPS drops.
 - Browser-check the upgraded horizon mountains in gameplay and menu screens to tune opacity, height, and fog blending if the background gets too busy.
 - Test ranking API from the browser: save a solo run, open Ranking, reload the page, and confirm the same entries come back from SQLite.
-- Check Swagger UI at `http://localhost:3000/docs` while the server is running.
+- Check Swagger UI at `http://localhost:3002/docs` while the server is running.
 - Browser-test fatal deaths against standing trees, rocks, fallen trees, holes, NPC skiers, and remote players to tune animation timing before the game-over screen.
 - Confirm Yeti radar orientation in immediate-start mode: first Yeti spawning behind should appear below the player marker.
 - Browser-test all three Yeti capture variants to ensure each is readable before the game-over screen and does not look too noisy.

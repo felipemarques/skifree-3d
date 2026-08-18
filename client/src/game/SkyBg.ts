@@ -44,9 +44,9 @@ export class SkyBg {
     const geo = new THREE.SphereGeometry(155, 36, 18);
     this.mat = new THREE.ShaderMaterial({
       uniforms: {
-        uTop: { value: SKY_TOP },
-        uHorizon: { value: SKY_HORIZON },
-        uGround: { value: SKY_GROUND },
+        uTop: { value: SKY_TOP.clone() },
+        uHorizon: { value: SKY_HORIZON.clone() },
+        uGround: { value: SKY_GROUND.clone() },
       },
       vertexShader: SKY_VERT,
       fragmentShader: SKY_FRAG,
@@ -62,6 +62,12 @@ export class SkyBg {
 
   update(cameraPos) {
     this.mesh.position.copy(cameraPos);
+  }
+
+  setColors(top, horizon, ground) {
+    this.mat.uniforms.uTop.value.copy(top);
+    this.mat.uniforms.uHorizon.value.copy(horizon);
+    this.mat.uniforms.uGround.value.copy(ground);
   }
 
   dispose() {

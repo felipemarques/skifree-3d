@@ -23,6 +23,27 @@
   --input: 204 100% 92% / 0.22;
   --ring: 190 100% 74%;
   --radius: 0.5rem;
+
+  /* HUD z-index scale, low to high - centralized so new HUD elements pick a
+     tier instead of inventing another arbitrary number. Screen-level chrome
+     (menus, toasts, overlays) uses plain integers already in this file
+     (.screen-backdrop's z-index: 100, etc.) and isn't part of this scale. */
+  --z-hud-panel: 60; /* ControlsPanel legend, PlayerStatusPanel, YetiRadar */
+  --z-hud-vignette: 65; /* LowHealthVignette */
+  --z-hud-speedlines: 95;
+  --z-hud-stat: 110; /* top-left hearts/speed/ping stat panel */
+  --z-hud-alert: 120; /* yeti warning banner, transient notices, bonus popups - above the stat panel */
+  --z-touch-joystick: 150;
+  --z-touch-jump: 200;
+  --z-toast: 250; /* App.tsx error/notice */
+  --z-modal-flash: 300; /* HitFlash, OrientationGate, ReconnectingOverlay */
+
+  /* Common HUD text colors, deduped from repeated hex literals across
+     GameHud/ControlsPanel/PlayerStatusPanel/screens. */
+  --color-hud-text: #dceeff;
+  --color-hud-muted: #aab9cf;
+  --color-hud-positive: #7df7ba;
+  --color-hud-negative: #ff8c98;
 }
 
 html,
@@ -38,6 +59,12 @@ body,
 
 body {
   margin: 0;
+  /* Touch drags steer the ski (see Input.ts/gameController.ts's canvas
+     touch-action: none) - without this, mobile browsers still intercept
+     drags as pull-to-refresh or rubber-band scroll. */
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 canvas {
@@ -78,8 +105,17 @@ select {
   inset: 0;
   z-index: 100;
   display: flex;
-  align-items: center;
+  /* `safe center`: centers the panel when it fits, but falls back to
+     start-alignment (scrollable from the top) instead of clipping equally
+     off both edges when it doesn't - a panel taller than the viewport (a
+     short/unmaximized desktop window, not just a phone) is otherwise
+     centered past both the top AND bottom of the screen with no way to
+     reach the clipped parts, since a plain `center` doesn't yield to
+     overflow. Paired with overflow-y: auto below, every screen becomes
+     reachable by scrolling on any viewport size, not just <640px width. */
+  align-items: safe center;
   justify-content: center;
+  overflow-y: auto;
   padding: 28px;
   background:
     linear-gradient(180deg, rgba(5, 13, 25, 0.44), rgba(5, 13, 25, 0.08) 46%, rgba(5, 13, 25, 0.5)),
@@ -113,6 +149,16 @@ select {
   animation: heart-pop 0.38s ease;
 }
 
+.low-hp-vignette-pulse {
+  background: radial-gradient(ellipse at center, rgba(200, 20, 20, 0) 55%, rgba(200, 20, 20, 0.28) 100%);
+  animation: low-hp-breathe 2.6s ease-in-out infinite;
+}
+
+@keyframes low-hp-breathe {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+
 @keyframes warning-pulse {
   from { opacity: 0.72; }
   to { opacity: 1; transform: translateX(-50%) scale(1.04); }
@@ -129,10 +175,72 @@ select {
   70% { transform: scale(0.92); }
 }
 
+.bonus-popup {
+  animation: bonus-popup-float 1.15s ease-out forwards;
+}
+
+.speed-lines {
+  background: repeating-conic-gradient(from 0deg, rgba(255, 255, 255, 0.75) 0deg 0.35deg, transparent 0.35deg 8deg);
+  -webkit-mask-image: radial-gradient(circle at 50% 55%, transparent 38%, black 88%);
+  mask-image: radial-gradient(circle at 50% 55%, transparent 38%, black 88%);
+  mix-blend-mode: screen;
+  transition: opacity 0.15s ease-out;
+}
+
+@keyframes bonus-popup-float {
+  0% { opacity: 0; transform: translate(-50%, 0) scale(0.85); }
+  12% { opacity: 1; transform: translate(-50%, -6px) scale(1.08); }
+  25% { transform: translate(-50%, -14px) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -78px) scale(1); }
+}
+
 @media (max-width: 640px) {
   .screen-backdrop {
-    align-items: flex-start;
-    overflow-y: auto;
     padding: 18px;
   }
+}
+
+/* Landscape phones are short, not narrow - Tailwind's width-only max-sm:
+   breakpoints throughout the HUD (see GameHud.tsx etc.) don't fire on a
+   phone turned sideways, since landscape width is often well over 640px.
+   .is-compact-landscape is toggled by App.tsx from a height-based media
+   query; scaling the stat panel down (rather than rewriting every utility
+   class involved) is enough to stop it from overflowing/crowding a
+   350-430px-tall viewport. transform-origin keeps it anchored to its
+   normal top-left corner instead of shrinking toward the center. */
+.is-compact-landscape .hud-stat-wrapper {
+  transform: scale(0.78);
+  transform-origin: top left;
+}
+
+/* Same idea as .hud-stat-wrapper above, extended to the other HUD panels
+   that still used full desktop sizing on a short landscape phone (each
+   scaled from its own visual anchor corner). The virtual joystick
+   (Joystick.tsx) is deliberately NOT included here - its ring/knob positions
+   are computed in raw touch-event pixel coordinates, not this stylesheet, so
+   a CSS transform:scale would shrink what's drawn without moving where the
+   game actually thinks the touch is, desyncing the visible stick from the
+   finger. Scaling it correctly needs its constants (MAX_RADIUS/KNOB_SIZE)
+   adjusted in JS instead, which is out of scope here. */
+.is-compact-landscape .hud-radar-wrapper {
+  transform: scale(0.78);
+  transform-origin: bottom right;
+}
+.is-compact-landscape .hud-status-wrapper {
+  transform: scale(0.78);
+  transform-origin: top right;
+}
+.is-compact-landscape .hud-jump-button-wrapper {
+  transform: scale(0.78);
+  transform-origin: bottom right;
+}
+
+/* Every menu screen (Title, Settings, Lobby, GameOver, ...) renders through
+   ScreenFrame.tsx, which measures its own content and scales the panel
+   down to actually fit a short landscape viewport (no scrollbar - see
+   useFitScale there). overflow:hidden here is just a safety net for the
+   brief moment before that JS measurement runs on mount. */
+.is-compact-landscape .screen-backdrop {
+  padding: 12px;
+  overflow: hidden;
 }

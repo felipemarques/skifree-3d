@@ -14,11 +14,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/socket.io': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:3002',
         ws: true,
       },
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'http://localhost:3002',
       },
     },
   },

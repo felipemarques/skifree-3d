@@ -1,8 +1,10 @@
 // @ts-nocheck
 // Settings - persisted to localStorage
-// controlMode: 'keyboard' | 'mouse' | 'both'
+// controlMode: 'keyboard' | 'mouse' | 'both' | 'gyro'
 // mouseSensitivity: 0.5 - 2.0
 // invertMouseY: bool
+// invertGyroX: bool (flips left/right tilt steering, for whichever way the
+//   phone was rotated into landscape - see GyroControl.ts)
 // sfxVolume: 0 - 1
 // graphicsQuality: 'low' | 'high'
 // fogLevel: 0 - 2
@@ -12,6 +14,11 @@
 // difficulty: 'easy' | 'normal' | 'hard' | 'extreme'
 // yetiStartMode: 'distance' | 'immediate' | 'disabled'
 // showFPS: bool
+// difficultyRamp: bool
+// skillScoring: bool
+// snowballNpcs: bool
+// muted: bool
+// touchControls: 'auto' | 'on' | 'off'
 
 const KEY = 'skifree3d_settings';
 
@@ -19,6 +26,7 @@ const DEFAULTS = {
   controlMode: 'both',
   mouseSensitivity: 1.0,
   invertMouseY: false,
+  invertGyroX: false,
   mouseDeadzone: 0.08,
   keyTurnSpeed: 1.8,
   graphicsQuality: 'high',
@@ -30,6 +38,12 @@ const DEFAULTS = {
   yetiStartMode: 'distance',
   showFPS: false,
   sfxVolume: 0.6,
+  difficultyRamp: false,
+  skillScoring: false,
+  snowballNpcs: false,
+  muted: false,
+  hasSeenTutorial: false,
+  touchControls: 'auto',
 };
 
 export class Settings {

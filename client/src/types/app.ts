@@ -10,16 +10,21 @@ export interface RoomSettings {
   difficulty: Difficulty;
   yetiStartMode: YetiStartMode;
   obstacleVolume: number;
+  difficultyRamp?: boolean;
+  skillScoring?: boolean;
+  snowballNpcs?: boolean;
 }
 
 export interface GameSettings extends RoomSettings {
-  controlMode: 'keyboard' | 'mouse' | 'both';
+  controlMode: 'keyboard' | 'mouse' | 'both' | 'gyro';
   mouseSensitivity: number;
   invertMouseY: boolean;
+  invertGyroX: boolean;
   sfxVolume: number;
   graphicsQuality: GraphicsQuality;
   fogLevel: number;
   snowVolume: number;
+  touchControls: 'auto' | 'on' | 'off';
 }
 
 export interface PlayerStatus {
@@ -27,6 +32,7 @@ export interface PlayerStatus {
   name?: string;
   color?: string;
   distance?: number;
+  bonusDistance?: number;
   hp?: number;
   alive?: boolean;
   local?: boolean;
@@ -60,6 +66,23 @@ export interface HudState {
   graphicsQuality: GraphicsQuality | string;
   spawnShieldSeconds: number;
   spectatorTarget: string;
+  chainCount: number;
+  /** Consecutive near-misses without a hit - see nearMissStreak's comment in shared/AuthoritativeSim.ts. */
+  nearMissStreak: number;
+  chainRemainingT: number;
+  momentum: number;
+  cleanStreakSeconds: number;
+  yetiDangerT: number;
+  avalancheDangerT: number;
+  iceGripT: number;
+  blizzardT: number;
+  pingMs: number | null;
+  /** Live in-air trick spin, degrees (0 when grounded or no spin attempted). */
+  trickSpinDeg: number;
+  /** True while airborne with enough airtime and a shallow enough landing
+   * angle that landing right now would score a landing-precision bonus -
+   * see LANDING_PRECISION_* in Player.ts/shared/AuthoritativeSim.ts. */
+  landingPrecisionReady: boolean;
 }
 
 export interface YetiThreat {
@@ -80,21 +103,49 @@ export interface RoomState {
 export interface GameOverState {
   distance: number;
   scores: PlayerStatus[];
+  gameMode: GameMode;
+  difficulty: Difficulty;
+  multiplayer: boolean;
+  ghostSaved: boolean;
+  dailyKey: string | null;
+}
+
+export interface GhostKeyframe {
+  t: number;
+  x: number;
+  y: number;
+  z: number;
+  angle: number;
+  airborne: boolean;
+  speed: number;
+}
+
+export interface GhostRunRecord {
+  version: 1;
+  mode: GameMode;
+  difficulty: Difficulty;
+  seed: number;
+  obstacleVolume: number;
+  difficultyRamp: boolean;
+  skillScoring: boolean;
+  color: string;
+  distance: number;
+  recordedAt: number;
+  keyframes: GhostKeyframe[];
 }
 
 export interface UiAdapter {
   showTitle(): void;
   showSettings(): void;
   showWaiting(roomId: string, players?: PlayerStatus[]): void;
-  showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }): void;
+  showGame(state?: Partial<HudState> & { gameMode?: GameMode | string }, reset?: boolean): void;
   showPause(): void;
-  showGameOver(distance: number, scores?: PlayerStatus[]): void;
-  showRanking(entries?: RankingEntry[]): void;
+  showGameOver(distance: number, scores?: PlayerStatus[], meta?: Partial<Pick<GameOverState, 'gameMode' | 'difficulty' | 'multiplayer' | 'ghostSaved' | 'dailyKey'>>): void;
+  showRanking(entries?: RankingEntry[], loading?: boolean): void;
   showRankingDetail(player: RankingPlayerSummary | null): void;
   updateHUD(distance: number, speed: number, hp: number, state?: Partial<HudState>): void;
   updateHearts(hp: number): void;
   updateWaitingPlayers(players?: PlayerStatus[]): void;
-  updateControlsHint(gameMode?: GameMode | string, notice?: string): void;
   updateRoomCountdown(remaining?: number | null): void;
   updatePlayerList(players?: PlayerStatus[]): void;
   showYetiWarning(show: boolean): void;
@@ -102,8 +153,32 @@ export interface UiAdapter {
   showHitFeedback(): void;
   showLandingFeedback(): void;
   showHealFeedback(): void;
+  showNearMissFeedback(bonus?: number): void;
+  showJumpChainFeedback(bonus?: number, chainCount?: number): void;
+  showUnstuckFeedback(): void;
+  showTrickFeedback(bonus?: number, spinDeg?: number): void;
+  showTrickFailFeedback(spinDeg?: number): void;
+  showLandingPrecisionFeedback(bonus?: number): void;
+  showAirClearFeedback(bonus?: number): void;
+  showAirBoostFeedback(): void;
+  showChainSaveFeedback(bonus?: number, chainCount?: number): void;
+  showSnowballDodgeFeedback(bonus?: number): void;
+  showYetiCloseCallFeedback(bonus?: number): void;
+  showAvalancheOutrunFeedback(): void;
+  showForkBoldLineFeedback(): void;
   setError(message: string): void;
   clearError(): void;
+  setNotice(message: string): void;
+  clearNotice(): void;
+  setReconnecting(reconnecting: boolean): void;
+}
+
+export interface BonusPopup {
+  id: number;
+  text: string;
+  tone: 'positive' | 'negative' | 'neutral';
+  x: number;
+  y: number;
 }
 
 export interface UiStoreState {
@@ -114,15 +189,22 @@ export interface UiStoreState {
   room: RoomState;
   rankingEntries: RankingEntry[];
   rankingDetail: RankingPlayerSummary | null;
+  rankingLoading: boolean;
   gameOver: GameOverState;
   playerList: PlayerStatus[];
   yetiWarning: boolean;
   yetiThreats: YetiThreat[];
   controlsNotice: string;
   error: string;
+  notice: string;
+  reconnecting: boolean;
   hitFlashKey: number;
   healFlashKey: number;
   landingFlashKey: number;
+  nearMissFlashKey: number;
+  jumpChainFlashKey: number;
+  unstuckFlashKey: number;
+  popups: BonusPopup[];
 }
 
 export interface ControllerSnapshot {
@@ -136,4 +218,6 @@ export interface ControllerSnapshot {
   muted: boolean;
   muteVisible: boolean;
   playerColor: string;
+  /** True right after a real MP disconnect ended a run - see playAgain()'s comment. */
+  roomLostToDisconnect: boolean;
 }

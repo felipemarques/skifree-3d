@@ -23,13 +23,14 @@ function makeLayer(scene, config) {
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
   const mat = new THREE.PointsMaterial({
-    color: 0xffffff,
+    color: 0xcccccc,
     size: config.size,
     transparent: true,
     opacity: config.opacity,
     depthWrite: false,
     blending: THREE.NormalBlending,
     sizeAttenuation: true,
+    fog: true,
   });
 
   const points = new THREE.Points(geo, mat);
@@ -53,7 +54,11 @@ export class SnowParticles {
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
     this._windPhase = Math.random() * Math.PI * 2;
     this.layers = [];
+    this._buildLayers();
+  }
 
+  _buildLayers() {
+    const scene = this.scene;
     if (this.quality === 'high') {
       this.layers.push(makeLayer(scene, {
         count: 1180 * this.volume,
@@ -78,6 +83,24 @@ export class SnowParticles {
         size: 0.24,
         opacity: 0.22,
         forwardPush: 1.6,
+      }));
+      // Near-field "enveloping" shell - nearly invisible in clear weather
+      // (opacity stays tiny), but setIntensity ramps it in hard during a
+      // blizzard so snow reads as a thick medium right around the camera
+      // rather than only ever a distant curtain, which is what actually
+      // sells "volumetric" over just tightening scene fog.
+      this.layers.push(makeLayer(scene, {
+        count: 320 * this.volume,
+        rangeX: 34,
+        rangeZ: 34,
+        height: 10,
+        minSpeed: 1.4,
+        maxSpeed: 3.6,
+        drift: 1.8,
+        size: 0.22,
+        opacity: 0.03,
+        forwardPush: 2.0,
+        nearField: true,
       }));
     } else {
       this.layers.push(makeLayer(scene, {
@@ -104,6 +127,41 @@ export class SnowParticles {
         opacity: 0.18,
         forwardPush: 1.2,
       }));
+      this.layers.push(makeLayer(scene, {
+        count: 90 * this.volume,
+        rangeX: 30,
+        rangeZ: 30,
+        height: 8,
+        minSpeed: 1.3,
+        maxSpeed: 3.0,
+        drift: 1.4,
+        size: 0.2,
+        opacity: 0.02,
+        forwardPush: 1.6,
+        nearField: true,
+      }));
+    }
+  }
+
+  setVolume(volume) {
+    const next = clamp(Number(volume ?? 1), 0, 2);
+    if (next === this.volume) return;
+    this.volume = next;
+    this.dispose();
+    this._buildLayers();
+  }
+
+  setIntensity(t) {
+    const clamped = clamp(t, 0, 1);
+    const boost = 1 + clamped * 2.5;
+    // Quadratic so the near-field shell stays essentially invisible until
+    // deep in a blizzard, then floods in - a linear ramp would make it
+    // faintly visible even in light snow, which isn't the point of it.
+    const nearBoost = 1 + clamped * clamped * 22;
+    for (const layer of this.layers) {
+      const cap = layer.nearField ? 0.85 : 1;
+      const mult = layer.nearField ? nearBoost : boost;
+      layer.points.material.opacity = Math.min(cap, layer.opacity * mult);
     }
   }
 

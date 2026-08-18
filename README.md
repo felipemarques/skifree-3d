@@ -11,7 +11,7 @@ A 3D browser reimagining of the classic 1991 SkiFree game, built with TypeScript
 - **Multiplayer** - up to 8 players per room, server-authoritative Classic mode, real-time snapshots, shared procedural mountain seed.
 - **Room lobby** - socket connection is opened only when creating or joining a multiplayer room.
 - **Ranking** - best-run screen persisted by the server in SQLite, grouped by player identity, with recent-run history per player and browser cache fallback.
-- **Server API docs** - Swagger UI is available at `http://localhost:3000/docs` when the server is running.
+- **Server API docs** - Swagger UI is available at `http://localhost:3002/docs` when the server is running.
 - **Graphics quality** - `high` uses shader terrain, layered snow, mountains, and bloom; `low` keeps the lighter terrain path.
 - **React UI** - menus, lobby, settings, ranking, pause, game over, HUD, and overlays are organized as React components with a Shadcn/Tailwind-style arcade glass theme.
 
@@ -46,9 +46,9 @@ npm run dev
 ```
 
 - Client: http://localhost:5173
-- Server: http://localhost:3000
-- API docs: http://localhost:3000/docs
-- OpenAPI JSON: http://localhost:3000/openapi.json
+- Server: http://localhost:3002
+- API docs: http://localhost:3002/docs
+- OpenAPI JSON: http://localhost:3002/openapi.json
 
 ### Production
 

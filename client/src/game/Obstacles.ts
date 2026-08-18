@@ -1,11 +1,16 @@
 // @ts-nocheck
 import * as THREE from 'three';
 import { buildSkierMesh, updateSkierAnimation } from './SkierModel';
-import { generateGameplayChunk } from '../../../shared/AuthoritativeSim';
+import { generateGameplayChunk, getBiomeKindAtZ, getRampedHazardVolume, getRampedRampVolume, SNOWBALL_THROWER_ROLL_CHANCE, THROWER_TELEGRAPH_LEAD } from '../../../shared/AuthoritativeSim';
+import { getBiomeHueShiftAtZ } from './Biome';
 
 const CHUNK_SIZE = 80;
 const CHUNK_WIDTH = 120;
 const TRACK_LIMIT = CHUNK_WIDTH / 2 - 8;
+// Mirrors shared/AuthoritativeSim.ts's RAMP_LANES: ramps rotate through
+// lanes by chunk + spawn index instead of pure uniform-random x, so chaining
+// requires actually crossing the track rather than holding a line.
+const RAMP_LANES = [[-34, -14], [-9, 9], [14, 34]];
 const OBSTACLES_PER_CHUNK = 18;
 const NPC_SKIERS_PER_CHUNK = 2;
 const NPC_DOGS_PER_CHUNK = 1;
@@ -15,10 +20,88 @@ const HEARTS_PER_CHUNK = 1;
 const HEART_MIN_DISTANCE = 70;
 const BEAR_CHANCE_PER_CHUNK = 0.38;
 const SOLID_OBSTACLE_TYPES = new Set(['tree', 'fallen_tree', 'rock', 'stump', 'ramp', 'hole']);
+// Mirrors shared/AuthoritativeSim.ts's BIOME_OBSTACLE_MIX/isBiomeSetPieceZone
+// exactly (same "duplicated on purpose" relationship RAMP_LANES/TRACK_LIMIT
+// above already have with their shared counterparts) - getBiomeKindAtZ
+// itself is imported rather than duplicated, since its thresholds are the
+// one piece worth keeping single-sourced.
+const BIOME_OBSTACLE_MIX = {
+  forest: { tree: 0.44, fallen_tree: 0.18, rock: 0.18, stump: 0.20 },
+  alpine: { tree: 0.12, fallen_tree: 0.10, rock: 0.50, stump: 0.28 },
+  cliffs: { tree: 0.18, fallen_tree: 0.12, rock: 0.45, stump: 0.25 },
+  glacier: { tree: 0.03, fallen_tree: 0.05, rock: 0.58, stump: 0.34 },
+  windswept: { tree: 0.08, fallen_tree: 0.12, rock: 0.46, stump: 0.34 },
+  deadwood: { tree: 0.28, fallen_tree: 0.44, rock: 0.10, stump: 0.18 },
+};
+const BIOME_SETPIECE_ZONE_LENGTH = 240;
+const BIOME_SETPIECE_ROLL_CHANCE = 0.3;
+const BIOME_SETPIECE_EDGE_BAND = 22;
+// Mirrors shared/AuthoritativeSim.ts's fork zone constants/forkZoneDescriptor.
+const FORK_ZONE_LENGTH = 240;
+const FORK_ZONE_ROLL_CHANCE = 0.26;
+const FORK_LANE_GAP = 6;
+// Rockfall telegraph timing: shadow starts fading in this far ahead of the
+// rock, then the rock itself drops in over the last stretch before impact.
+// Collision is unaffected by any of this - the rock is a solid obstacle at
+// its generated x/z the entire time, this is purely the visual cue.
+const ROCKFALL_WARN_DISTANCE = 42;
+const ROCKFALL_DROP_START_DISTANCE = 8;
+const ROCKFALL_DROP_DURATION = 0.45;
+const ROCKFALL_DROP_HEIGHT = 9;
+
+function pickBiomeObstacleType(mix, roll) {
+  let acc = mix.tree;
+  if (roll < acc) return 'tree';
+  acc += mix.fallen_tree;
+  if (roll < acc) return 'fallen_tree';
+  acc += mix.rock;
+  if (roll < acc) return 'rock';
+  return 'stump';
+}
+
+// Same one-shot LCG shared/AuthoritativeSim.ts's SimRandom applies on
+// construction+first next() - not imported since it's a private class
+// there, but the formula is stable/simple enough to inline.
+function seededRoll(seed, salt) {
+  let s = (seed + salt) >>> 0;
+  s = (s * 1664525 + 1013904223) >>> 0;
+  return s / 4294967296;
+}
+
+function isBiomeSetPieceZone(seed, chunkIndex) {
+  const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / BIOME_SETPIECE_ZONE_LENGTH);
+  if (zoneIndex <= 0) return false;
+  return seededRoll(seed, zoneIndex * 621547) < BIOME_SETPIECE_ROLL_CHANCE;
+}
+
+// Glacier's own extra, independent (per-chunk) low chance of a rockfall
+// cluster - mirrors shared/AuthoritativeSim.ts's isGlacierRockfallChunk.
+const GLACIER_ROCKFALL_ROLL_CHANCE = 0.15;
+
+function isGlacierRockfallChunk(seed, chunkIndex) {
+  return seededRoll(seed, chunkIndex * 88651) < GLACIER_ROCKFALL_ROLL_CHANCE;
+}
+
+function isForkZoneIndex(seed, zoneIndex) {
+  if (zoneIndex <= 0) return false;
+  if (seededRoll(seed, zoneIndex * 275604) >= FORK_ZONE_ROLL_CHANCE) return false;
+  // Never two fork zones back to back.
+  if (isForkZoneIndex(seed, zoneIndex - 1)) return false;
+  return true;
+}
+
+function isForkZone(seed, chunkIndex) {
+  const zoneIndex = Math.floor((chunkIndex * CHUNK_SIZE) / FORK_ZONE_LENGTH);
+  return isForkZoneIndex(seed, zoneIndex);
+}
 const NPC_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock', 'bear', 'dog']);
 const ANIMAL_JUMPABLE_TYPES = new Set(['hole', 'fallen_tree', 'stump', 'rock']);
 const NPC_KNOCKDOWN_DURATION = 2.2;
 const SPAWN_PADDING = 0.75;
+// In a full blizzard, obstacles beyond this z-distance are hidden entirely
+// (not just fogged) so nothing pops through via a shadow, specular hit, or
+// any other fog-blend edge case - matches the fog's own z-distance framing.
+const BLIZZARD_VISIBILITY_RADIUS = 35;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -218,7 +301,7 @@ function resetAnimalPart(obj) {
   obj.rotation.copy(obj.userData.restRotation);
 }
 
-function makeTree(rng) {
+export function makeTree(rng, hueShift = 0, scale = null) {
   const group = new THREE.Group();
 
   const trunkH = rng.range(0.55, 1.25);
@@ -232,8 +315,16 @@ function makeTree(rng) {
   group.add(trunk);
 
   const layers = rng.int(2, 4);
-  const baseScale = rng.range(0.78, 1.45);
-  const greenHue = 0.32 + rng.range(-0.035, 0.025);
+  // Authoritative-multiplayer override: scale comes from the sim record so
+  // the rendered tree is exactly as big as its hitbox (M2). Solo passes
+  // null and draws its own scale as before.
+  const baseScale = scale ?? rng.range(0.78, 1.45);
+  // Most trees get a noticeably wider spread of green (from mossy/olive
+  // through to a bluer spruce) than the old near-uniform ±0.035 band gave -
+  // a rare few (autumn stragglers) swap to an orange hue instead.
+  const isAutumn = rng.next() < 0.06;
+  const foliageHue = (((isAutumn ? rng.range(0.06, 0.10) : rng.range(0.26, 0.40)) + hueShift) % 1 + 1) % 1;
+  const foliageSat = isAutumn ? rng.range(0.55, 0.72) : rng.range(0.4, 0.66);
   const snowMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.56, 0.32, rng.range(0.86, 0.94)),
     roughness: 0.82,
@@ -244,7 +335,7 @@ function makeTree(rng) {
     const h = r * rng.range(1.38, 1.68);
     const coneGeo = new THREE.ConeGeometry(r, h, 6);
     const coneMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color().setHSL(greenHue, rng.range(0.48, 0.62), 0.2 + l * 0.045),
+      color: new THREE.Color().setHSL(foliageHue, foliageSat, 0.2 + l * 0.045),
       roughness: 0.86,
     });
     const cone = new THREE.Mesh(coneGeo, coneMat);
@@ -266,13 +357,14 @@ function makeTree(rng) {
   return markShadows(group);
 }
 
-function makeRock(rng) {
+export function makeRock(rng, hueShift = 0, radiusOverride = null) {
   const group = new THREE.Group();
-  const radius = rng.range(0.34, 0.82);
+  const radius = radiusOverride ?? rng.range(0.34, 0.82);
   const geo = new THREE.IcosahedronGeometry(radius, 0);
   geo.scale(1.15, rng.range(0.48, 0.75), 0.9);
+  const rockHue = (((0.6 + hueShift * 0.4) % 1) + 1) % 1;
   const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color().setHSL(0.6, 0.06, rng.range(0.34, 0.5)),
+    color: new THREE.Color().setHSL(rockHue, 0.06, rng.range(0.34, 0.5)),
     roughness: 0.84,
     metalness: 0.02,
   });
@@ -294,6 +386,53 @@ function makeRock(rng) {
   group.userData.halfD = radius * 0.85;
   group.userData.type = 'rock';
   return markShadows(group);
+}
+
+// Lazily-built shared texture for the rockfall telegraph decal - a soft dark
+// radial gradient painted flat on the ground, same "canvas -> CanvasTexture"
+// technique AvalancheEffect.ts's puff texture uses.
+let _rockfallShadowTexture = null;
+function getRockfallShadowTexture() {
+  if (_rockfallShadowTexture) return _rockfallShadowTexture;
+  const canvas = document.createElement('canvas');
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gradient.addColorStop(0, 'rgba(8, 10, 14, 0.65)');
+  gradient.addColorStop(1, 'rgba(8, 10, 14, 0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 64, 64);
+  _rockfallShadowTexture = new THREE.CanvasTexture(canvas);
+  return _rockfallShadowTexture;
+}
+
+// Cliffs "rockfall" set-piece variant of makeRock: the rock itself starts
+// hidden and a ground shadow decal starts transparent - Obstacles.update()
+// fades the shadow in as the player approaches, then reveals/drops the rock
+// in over a short window. Collision (halfW/halfD) is identical to a normal
+// rock and solid from the moment it's generated - only the visual is delayed.
+function makeRockfallRock(rng, hueShift = 0, radiusOverride = null) {
+  const group = makeRock(rng, hueShift, radiusOverride);
+  const radius = group.userData.halfW / 0.95;
+  for (const child of group.children) child.visible = false;
+
+  const shadow = new THREE.Mesh(
+    new THREE.PlaneGeometry(radius * 2.6, radius * 2.6),
+    new THREE.MeshBasicMaterial({
+      map: getRockfallShadowTexture(),
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    }),
+  );
+  shadow.rotation.x = -Math.PI / 2;
+  shadow.position.y = 0.03;
+  group.add(shadow);
+  group.userData.rockfallShadow = shadow;
+  group.userData.rockfallParts = group.children.filter(child => child !== shadow);
+
+  return group;
 }
 
 function makeStump(rng) {
@@ -319,11 +458,15 @@ function makeStump(rng) {
   return markShadows(group);
 }
 
-function makeFallenTree(rng) {
+function makeFallenTree(rng, visual = null) {
   const group = new THREE.Group();
 
-  const length = rng.range(2.2, 4.2);
-  const radius = rng.range(0.16, 0.28);
+  // Authoritative-multiplayer override: the sim record carries the exact
+  // length/radius/angle that produced its hitbox (ObstacleRecord.visual), so
+  // the rendered trunk and its collision box match bit-for-bit (M2). Solo
+  // passes null and draws its own values as before.
+  const length = visual?.length ?? rng.range(2.2, 4.2);
+  const radius = visual?.radius ?? rng.range(0.16, 0.28);
   const barkMat = new THREE.MeshStandardMaterial({
     color: new THREE.Color().setHSL(0.08, 0.48, rng.range(0.2, 0.32)),
     roughness: 0.92,
@@ -381,7 +524,7 @@ function makeFallenTree(rng) {
     group.add(branch);
   }
 
-  const angle = rng.range(0, Math.PI);
+  const angle = visual?.angle ?? rng.range(0, Math.PI);
   const trunkHalf = length * 0.52;
   const thickHalf = Math.max(0.42, radius * 2.2);
   group.rotation.y = angle;
@@ -539,7 +682,7 @@ function getRotatedExtents(points, angle) {
   return { halfW, halfD };
 }
 
-function makeHole(rng) {
+function makeHole(rng, fit = null) {
   const group = new THREE.Group();
 
   const variant = rng.next();
@@ -613,8 +756,23 @@ function makeHole(rng) {
     group.add(crack);
   }
 
-  const rotation = rng.range(0, Math.PI);
-  const extents = getRotatedExtents(outer, rotation);
+  // Authoritative-multiplayer override: the sim collides with an unrotated
+  // box sized from its own width/depth draws (record halfW/halfD), while the
+  // visual used to rotate freely — a player could straddle a rotated visual
+  // hole and not fall in (M2). When fitting a record, drop the rotation and
+  // non-uniformly scale the shape so its axis-aligned footprint is exactly
+  // the hitbox. Solo passes null and keeps the rotated, generously-sized
+  // visual whose own extents are used for solo collision (self-consistent).
+  let rotation = rng.range(0, Math.PI);
+  let extents = getRotatedExtents(outer, rotation);
+  if (fit) {
+    const unrotated = getRotatedExtents(outer, 0);
+    const sx = unrotated.halfW > 0 ? fit.halfW / unrotated.halfW : 1;
+    const sz = unrotated.halfD > 0 ? fit.halfD / unrotated.halfD : 1;
+    group.scale.set(sx, 1, sz);
+    rotation = 0;
+    extents = { halfW: fit.halfW, halfD: fit.halfD };
+  }
   group.rotation.y = rotation;
   group.userData.halfW = extents.halfW;
   group.userData.halfD = extents.halfD;
@@ -693,6 +851,36 @@ function makeNPCSkier(rng) {
   group.userData.zigzagInterval = rng.range(4.5, 8.5);
   group.userData.zigzagDuration = rng.range(1.0, 1.8);
   group.userData.zigzagAmp = rng.range(2.2, 4.8);
+  return group;
+}
+
+// Snowball NPC hazard - a stationary trailside figure that winds up (its
+// held snowball glows/grows) as the player approaches, then throws. The
+// actual throw trigger/physics live in Player.ts (solo) and
+// shared/AuthoritativeSim.ts (multiplayer) - this mesh only plays the
+// telegraph, driven locally off distance-to-player in update() below, so it
+// stays in sync with the real trigger without needing any network state.
+function makeSnowballThrower(rng) {
+  const jacket = new THREE.Color().setHSL(0.0, 0.55, 0.32);
+  const group = buildSkierMesh(jacket, {
+    helmetColor: new THREE.Color().setHSL(0.0, 0.4, 0.22),
+    scarfColor: new THREE.Color().setHSL(0.02, 0.6, 0.4),
+    scale: 0.92,
+  });
+
+  const snowball = new THREE.Mesh(
+    new THREE.SphereGeometry(0.14, 8, 6),
+    new THREE.MeshStandardMaterial({ color: 0xf5fbff, emissive: 0x8ed8ff, emissiveIntensity: 0.1, roughness: 0.55 }),
+  );
+  snowball.position.set(0.32, 0.8, 0.18);
+  snowball.scale.setScalar(0.001);
+  group.add(snowball);
+  group.userData.snowball = snowball;
+  group.userData.windState = 'idle';
+
+  group.userData.halfW = 0.4;
+  group.userData.halfD = 0.4;
+  group.userData.type = 'thrower';
   return group;
 }
 
@@ -940,6 +1128,13 @@ export class Obstacles {
     this.scene = scene;
     this.volume = clamp(Number(options.volume ?? 1), 0, 2);
     this.authoritativeSeed = options.authoritativeSeed ?? null;
+    // Only used by the solo path below for the biome set-piece zone roll,
+    // which needs a stable per-run seed independent of any single chunk's
+    // own rng stream (consuming from that would perturb the existing
+    // obstacle placement sequence outside set-piece zones).
+    this.seed = Number(options.seed) || 0;
+    this.difficultyRamp = !!options.difficultyRamp;
+    this.snowballNpcs = !!options.snowballNpcs;
     this.chunks = new Map();
     this.active = [];
   }
@@ -952,19 +1147,45 @@ export class Obstacles {
     }
 
     const zBase = chunkIndex * CHUNK_SIZE;
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.seed, zBase);
     const group = new THREE.Group();
     const chunkObstacles = [];
+    // Only the hazard categories that also exist in the shared authoritative
+    // sim ramp with distance, so the "difficulty ramp" feature means the
+    // same thing in solo as it does in a multiplayer lobby; NPC/dog/bear are
+    // solo-exclusive extras and stay on the base volume.
+    const hazardVolume = getRampedHazardVolume(this.volume, chunkIndex, this.difficultyRamp);
+    const rampVolume = getRampedRampVolume(this.volume, chunkIndex, this.difficultyRamp);
+    // Mirrors shared/AuthoritativeSim.ts's generateGameplayChunk biome logic
+    // exactly (see BIOME_OBSTACLE_MIX's comment above).
+    const biome = getBiomeKindAtZ(this.seed, zBase);
+    const obstacleMix = BIOME_OBSTACLE_MIX[biome];
+    const setPiece = isBiomeSetPieceZone(this.seed, chunkIndex);
+    const isCrevasseField = setPiece && biome === 'glacier';
+    // Cliffs'/alpine's "rockfall" set-piece (plus glacier's independent
+    // extra roll) - mirrors shared/AuthoritativeSim.ts's matching block.
+    const isRockfallField = setPiece && (biome === 'cliffs' || biome === 'alpine');
+    const isGlacierRockfall = !isCrevasseField && biome === 'glacier' && isGlacierRockfallChunk(this.seed, chunkIndex);
+    // Forest's (and any other non-rockfall/non-glacier) set-piece flavor -
+    // mirrors shared/AuthoritativeSim.ts's matching isChokepoint const.
+    const isChokepoint = setPiece && !isRockfallField && biome !== 'glacier';
+    const setPieceHazardVolume = setPiece
+      ? (isRockfallField ? hazardVolume * 0.25 : biome === 'glacier' ? hazardVolume * 0.7 : hazardVolume * 1.6)
+      : hazardVolume;
+    // Fork zones take precedence over the biome set-piece edge-banding when
+    // both land on the same chunk - mirrors shared/AuthoritativeSim.ts.
+    const isFork = isForkZone(this.seed, chunkIndex);
     const counts = {
-      static: scaledCount(OBSTACLES_PER_CHUNK, this.volume),
-      ramps: scaledCount(RAMPS_PER_CHUNK, this.volume, 1),
-      holes: scaledCount(HOLES_PER_CHUNK, this.volume),
+      static: scaledCount(OBSTACLES_PER_CHUNK, setPieceHazardVolume),
+      ramps: scaledCount(RAMPS_PER_CHUNK, rampVolume, 1),
+      holes: scaledCount(HOLES_PER_CHUNK, hazardVolume),
       hearts: scaledCount(HEARTS_PER_CHUNK, Math.max(this.volume, 0.5), 1),
       npcSkiers: scaledCount(NPC_SKIERS_PER_CHUNK, this.volume),
       dogs: scaledCount(NPC_DOGS_PER_CHUNK, this.volume),
       bearChance: clamp(BEAR_CHANCE_PER_CHUNK * this.volume, 0, 0.85),
     };
 
-    const spawnObs = (mesh, x, z) => {
+    const spawnObs = (mesh, x, z, subtype) => {
       mesh.position.set(x, 0, z);
       group.add(mesh);
       chunkObstacles.push({
@@ -973,6 +1194,9 @@ export class Obstacles {
         halfW: mesh.userData.halfW,
         halfD: mesh.userData.halfD,
         type: mesh.userData.type,
+        subtype,
+        fallState: subtype === 'rockfall' ? 'pending' : undefined,
+        fallTimer: 0,
         mesh,
         dead: false,
         speed: mesh.userData.speed || 0,
@@ -1018,6 +1242,7 @@ export class Obstacles {
         requireClear = true,
         minDistanceFromType = null,
         minDistance = 0,
+        subtype = undefined,
       } = options;
 
       for (let attempt = 0; attempt < attempts; attempt++) {
@@ -1034,7 +1259,7 @@ export class Obstacles {
             !isTooCloseToType(x, z, minDistanceFromType, minDistance, [chunkObstacles, this.active])
           )
         ) {
-          spawnObs(mesh, x, z);
+          spawnObs(mesh, x, z, subtype);
           return true;
         }
         disposeGroup(mesh);
@@ -1043,35 +1268,125 @@ export class Obstacles {
       return false;
     };
 
-    for (let i = 0; i < counts.static; i++) {
-      const r = rng.next();
-      if (r < 0.44) spawnPlaced(() => makeTree(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else if (r < 0.62) spawnPlaced(() => makeFallenTree(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else if (r < 0.8) spawnPlaced(() => makeRock(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-      else spawnPlaced(() => makeStump(rng), [-TRACK_LIMIT, TRACK_LIMIT], [8, CHUNK_SIZE - 8]);
-    }
+    const spawnHazardType = (type, xRange) => {
+      if (type === 'tree') spawnPlaced(() => makeTree(rng, treeHueShift), xRange, [8, CHUNK_SIZE - 8]);
+      else if (type === 'fallen_tree') spawnPlaced(() => makeFallenTree(rng), xRange, [8, CHUNK_SIZE - 8]);
+      else if (type === 'rock') spawnPlaced(() => makeRock(rng, rockHueShift), xRange, [8, CHUNK_SIZE - 8]);
+      else spawnPlaced(() => makeStump(rng), xRange, [8, CHUNK_SIZE - 8]);
+    };
 
-    for (let i = 0; i < counts.ramps; i++) {
-      spawnPlaced(() => makeRamp(rng), [-36, 36], [12, CHUNK_SIZE - 12], {
-        attempts: 18,
-        padding: 1.1,
-      });
-    }
+    if (isFork) {
+      // Safe lane: reduced density, a guaranteed heart. Risky lane:
+      // increased density and more ramps - mirrors
+      // shared/AuthoritativeSim.ts's generateGameplayChunk fork branch.
+      const safeLane = [-TRACK_LIMIT, -FORK_LANE_GAP];
+      const riskyLane = [FORK_LANE_GAP, TRACK_LIMIT];
+      for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 0.4); i++) {
+        spawnHazardType(pickBiomeObstacleType(obstacleMix, rng.next()), safeLane);
+      }
+      for (let i = 0; i < scaledCount(OBSTACLES_PER_CHUNK, hazardVolume * 1.5); i++) {
+        spawnHazardType(pickBiomeObstacleType(obstacleMix, rng.next()), riskyLane);
+      }
+      for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.6, 1); i++) {
+        spawnPlaced(() => makeRamp(rng), [riskyLane[0] + 4, riskyLane[1] - 2], [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+      }
+      // Holes are a hazard, not a safety feature - belongs in the risky
+      // lane's extra density, not guaranteed into the "safe" one.
+      for (let i = 0; i < counts.holes; i++) {
+        spawnPlaced(() => makeHole(rng), [FORK_LANE_GAP, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+      }
+      const heartCount = Math.max(1, counts.hearts);
+      for (let i = 0; i < heartCount; i++) {
+        spawnPlaced(() => makeHeartPickup(rng), safeLane, [18, CHUNK_SIZE - 12], {
+          attempts: 24, padding: 0.35, minDistanceFromType: 'heart', minDistance: HEART_MIN_DISTANCE,
+        });
+      }
+    } else {
+      for (let i = 0; i < counts.static; i++) {
+        const type = pickBiomeObstacleType(obstacleMix, rng.next());
+        // Forest tunnel / alpine canyon squeeze set-piece: obstacles
+        // concentrated toward both edges instead of spread across the full
+        // width - see shared/AuthoritativeSim.ts's matching comment.
+        const xRange = isChokepoint
+          ? (i % 2 === 0 ? [-TRACK_LIMIT, -BIOME_SETPIECE_EDGE_BAND] : [BIOME_SETPIECE_EDGE_BAND, TRACK_LIMIT])
+          : [-TRACK_LIMIT, TRACK_LIMIT];
+        spawnHazardType(type, xRange);
+      }
 
-    for (let i = 0; i < counts.holes; i++) {
-      spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], {
-        attempts: 14,
-        padding: 0.9,
-      });
-    }
+      for (let i = 0; i < counts.ramps; i++) {
+        const lane = RAMP_LANES[((chunkIndex + i) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+        spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], {
+          attempts: 18,
+          padding: 1.1,
+        });
+      }
+      // Glacier's "crevasse field" set-piece - mirrors
+      // shared/AuthoritativeSim.ts's matching isCrevasseField block.
+      if (isCrevasseField) {
+        for (let i = 0; i < scaledCount(HOLES_PER_CHUNK, hazardVolume * 1.8, 1); i++) {
+          spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], { attempts: 14, padding: 0.9 });
+        }
+        for (let i = 0; i < scaledCount(RAMPS_PER_CHUNK, rampVolume * 1.5, 1); i++) {
+          const lane = RAMP_LANES[((chunkIndex + i + 1) % RAMP_LANES.length + RAMP_LANES.length) % RAMP_LANES.length];
+          spawnPlaced(() => makeRamp(rng), lane, [12, CHUNK_SIZE - 12], { attempts: 18, padding: 1.1 });
+        }
+      }
+      // Cliffs'/alpine's "rockfall" set-piece (plus glacier's independent
+      // extra roll): tight clusters of extra rocks tagged 'rockfall' for the
+      // shadow/drop telegraph in update() - mirrors shared/AuthoritativeSim.ts's
+      // matching block.
+      if (isRockfallField || isGlacierRockfall) {
+        const clusterCount = 2 + (rng.next() < 0.5 ? 1 : 0);
+        for (let c = 0; c < clusterCount; c++) {
+          const clusterX = rng.range(-TRACK_LIMIT + 6, TRACK_LIMIT - 6);
+          const clusterZ = rng.range(16, CHUNK_SIZE - 16);
+          const rocksInCluster = rng.next() < 0.5 ? 1 : 2;
+          for (let r = 0; r < rocksInCluster; r++) {
+            spawnPlaced(() => makeRockfallRock(rng, rockHueShift), [clusterX - 3, clusterX + 3], [clusterZ - 3, clusterZ + 3], {
+              attempts: 10, padding: 0.6, subtype: 'rockfall',
+            });
+          }
+        }
+      }
 
-    for (let i = 0; i < counts.hearts; i++) {
-      spawnPlaced(() => makeHeartPickup(rng), [-34, 34], [18, CHUNK_SIZE - 12], {
-        attempts: 24,
-        padding: 0.35,
-        minDistanceFromType: 'heart',
-        minDistance: HEART_MIN_DISTANCE,
-      });
+      // Chokepoint gate: two gap-marker rocks plus a short run of funnel
+      // posts per side, stepping the safe x-band in toward the gap at
+      // gateZ - mirrors shared/AuthoritativeSim.ts's matching block.
+      if (isChokepoint) {
+        const gateZ = rng.range(CHUNK_SIZE * 0.45, CHUNK_SIZE * 0.62);
+        const gapHalf = 8;
+        const funnelPosts = 3;
+        for (const side of [-1, 1]) {
+          spawnPlaced(() => makeRock(rng, rockHueShift), [side * gapHalf - 1, side * gapHalf + 1], [gateZ - 1, gateZ + 1], {
+            attempts: 14, padding: 0.5, subtype: 'chokepoint',
+          });
+          for (let p = 1; p <= funnelPosts; p++) {
+            const t = p / (funnelPosts + 1);
+            const fx = side * (TRACK_LIMIT - 6 - t * (TRACK_LIMIT - 6 - gapHalf));
+            const fz = gateZ - 5 - p * 5;
+            if (fz < 6) continue;
+            spawnPlaced(() => makeStump(rng), [fx - 1.2, fx + 1.2], [fz - 1.2, fz + 1.2], {
+              attempts: 10, padding: 0.5, subtype: 'chokepoint',
+            });
+          }
+        }
+      }
+
+      for (let i = 0; i < counts.holes; i++) {
+        spawnPlaced(() => makeHole(rng), [-42, 42], [14, CHUNK_SIZE - 10], {
+          attempts: 14,
+          padding: 0.9,
+        });
+      }
+
+      for (let i = 0; i < counts.hearts; i++) {
+        spawnPlaced(() => makeHeartPickup(rng), [-34, 34], [18, CHUNK_SIZE - 12], {
+          attempts: 24,
+          padding: 0.35,
+          minDistanceFromType: 'heart',
+          minDistance: HEART_MIN_DISTANCE,
+        });
+      }
     }
 
     if (chunkIndex > 1 && rng.next() < counts.bearChance) {
@@ -1095,6 +1410,16 @@ export class Obstacles {
       });
     }
 
+    // Snowball NPC hazard - mirrors shared/AuthoritativeSim.ts's matching
+    // roll in generateGameplayChunk, independent of biome/set-piece.
+    if (this.snowballNpcs && rng.next() < SNOWBALL_THROWER_ROLL_CHANCE) {
+      const side = rng.next() < 0.5 ? -1 : 1;
+      spawnPlaced(() => makeSnowballThrower(rng), [side * (TRACK_LIMIT - 8), side * (TRACK_LIMIT - 2)], [16, CHUNK_SIZE - 16], {
+        attempts: 10,
+        padding: 1.5,
+      });
+    }
+
     this.scene.add(group);
     this.chunks.set(chunkIndex, { group, obstacles: chunkObstacles });
     this.active.push(...chunkObstacles);
@@ -1105,21 +1430,35 @@ export class Obstacles {
 
     const group = new THREE.Group();
     const chunkObstacles = [];
-    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set());
+    const records = generateGameplayChunk(this.authoritativeSeed, chunkIndex, this.volume, new Set(), this.difficultyRamp, this.snowballNpcs);
+    const { treeHueShift, rockHueShift } = getBiomeHueShiftAtZ(this.authoritativeSeed, chunkIndex * CHUNK_SIZE);
 
-    const makeMesh = (type) => {
-      if (type === 'tree') return makeTree(rng);
-      if (type === 'fallen_tree') return makeFallenTree(rng);
-      if (type === 'rock') return makeRock(rng);
+    // Meshes are built from the authoritative records' own extents so the
+    // rendered obstacle is exactly as big as its collision box (M2): tree
+    // scale and rock radius recover directly from halfW, fallen trees carry
+    // their raw length/radius/angle on the record (sim emits them since the
+    // rotated AABB can't be inverted), holes drop their random rotation and
+    // scale to the record box. Solo never passes a record, so its visuals
+    // and hitboxes stay self-consistent as before.
+    const makeMesh = (record) => {
+      const type = record.type;
+      if (type === 'tree') return makeTree(rng, treeHueShift, record.halfW / 0.72);
+      if (type === 'fallen_tree') return makeFallenTree(rng, record.visual || null);
+      if (type === 'rock') {
+        return record.subtype === 'rockfall'
+          ? makeRockfallRock(rng, rockHueShift, record.halfW / 0.95)
+          : makeRock(rng, rockHueShift, record.halfW / 0.95);
+      }
       if (type === 'stump') return makeStump(rng);
       if (type === 'ramp') return makeRamp(rng);
-      if (type === 'hole') return makeHole(rng);
+      if (type === 'hole') return makeHole(rng, { halfW: record.halfW, halfD: record.halfD });
       if (type === 'heart') return makeHeartPickup(rng);
-      return makeRock(rng);
+      if (type === 'thrower') return makeSnowballThrower(rng);
+      return makeRock(rng, rockHueShift);
     };
 
     for (const record of records) {
-      const mesh = makeMesh(record.type);
+      const mesh = makeMesh(record);
       mesh.position.set(record.x, 0, record.z);
       group.add(mesh);
       chunkObstacles.push({
@@ -1129,6 +1468,9 @@ export class Obstacles {
         halfW: record.halfW,
         halfD: record.halfD,
         type: record.type,
+        subtype: record.subtype,
+        fallState: record.subtype === 'rockfall' ? 'pending' : undefined,
+        fallTimer: 0,
         mesh,
         dead: false,
         speed: 0,
@@ -1172,10 +1514,11 @@ export class Obstacles {
     this.active.push(...chunkObstacles);
   }
 
-  update(dt, playerZ, groundYAt = null) {
+  update(dt, playerZ, groundYAt = null, blizzardT = 0, playerSpeed = 0) {
     const currentChunk = Math.floor(playerZ / CHUNK_SIZE);
     const now = performance.now() * 0.004;
     const blockers = this.getAvoidanceBlockers(playerZ, CHUNK_SIZE * 2.2);
+    const cullRadius = THREE.MathUtils.lerp(9999, BLIZZARD_VISIBILITY_RADIUS, THREE.MathUtils.clamp(blizzardT, 0, 1));
 
     for (const obs of this.active) {
       if (obs.dead) continue;
@@ -1309,6 +1652,61 @@ export class Obstacles {
       } else if (obs.type === 'heart') {
         obs.animTime += dt;
         obs.mesh.rotation.y += dt * 1.8;
+      } else if (obs.type === 'thrower') {
+        // Purely cosmetic wind-up telegraph, driven locally off distance to
+        // the player - see makeSnowballThrower's comment on why this doesn't
+        // need to read any network/server state to stay in sync with the
+        // real (server- or Player.ts-triggered) throw.
+        const snowball = obs.mesh.userData.snowball;
+        if (snowball && obs.windState !== 'thrown') {
+          const distToImpact = obs.z - playerZ;
+          if (distToImpact < 0) {
+            obs.windState = 'thrown';
+            snowball.scale.setScalar(0.001);
+          } else if (distToImpact <= THROWER_TELEGRAPH_LEAD) {
+            const t = 1 - distToImpact / THROWER_TELEGRAPH_LEAD;
+            snowball.scale.setScalar(THREE.MathUtils.lerp(0.15, 1, t));
+            snowball.material.emissiveIntensity = THREE.MathUtils.lerp(0.1, 0.6, t) * (0.75 + 0.25 * Math.sin(now * 6));
+          } else {
+            snowball.scale.setScalar(0.001);
+          }
+        }
+      }
+
+      let rockfallDrop = 0;
+      if (obs.subtype === 'rockfall' && obs.fallState !== 'landed') {
+        const distToImpact = obs.z - playerZ;
+        // At boost speeds the player can cover ROCKFALL_DROP_START_DISTANCE
+        // faster than the drop animation finishes, so the rock is still
+        // mid-air (looks like it never actually reaches/hits the player)
+        // by the time they arrive. Scale both trigger distances up with
+        // current speed (how far the player travels during the drop, plus
+        // a margin) so the rock always finishes landing before the player
+        // gets there, same relative warning/fall timing as at low speed.
+        const dropStartDistance = Math.max(ROCKFALL_DROP_START_DISTANCE, playerSpeed * ROCKFALL_DROP_DURATION * 1.2);
+        const warnDistance = Math.max(ROCKFALL_WARN_DISTANCE, dropStartDistance * (ROCKFALL_WARN_DISTANCE / ROCKFALL_DROP_START_DISTANCE));
+        if (obs.fallState === 'pending' && distToImpact <= warnDistance) {
+          obs.fallState = 'warning';
+        }
+        if (obs.fallState === 'warning' && distToImpact <= dropStartDistance) {
+          obs.fallState = 'falling';
+          obs.fallTimer = 0;
+          for (const part of obs.mesh.userData.rockfallParts || []) part.visible = true;
+        }
+        const shadow = obs.mesh.userData.rockfallShadow;
+        if (obs.fallState === 'warning') {
+          const warnT = THREE.MathUtils.clamp(1 - distToImpact / warnDistance, 0, 1);
+          if (shadow) shadow.material.opacity = THREE.MathUtils.lerp(0, 0.5, warnT);
+        } else if (obs.fallState === 'falling') {
+          obs.fallTimer += dt;
+          const t = Math.min(1, obs.fallTimer / ROCKFALL_DROP_DURATION);
+          rockfallDrop = (1 - t) * ROCKFALL_DROP_HEIGHT;
+          if (shadow) shadow.material.opacity = THREE.MathUtils.lerp(0.5, 0.3, t);
+          if (t >= 1) {
+            obs.fallState = 'landed';
+            if (shadow) shadow.material.opacity = 0.22;
+          }
+        }
       }
 
       const groundY = groundYAt ? groundYAt(obs.x, obs.z) : 0;
@@ -1316,7 +1714,8 @@ export class Obstacles {
       const jumpLift = (obs.type === 'npc' || obs.type === 'dog' || obs.type === 'bear') && obs.jumpTimer > 0
         ? Math.sin((1 - obs.jumpTimer / Math.max(obs.jumpDuration, 0.001)) * Math.PI) * obs.jumpHeight
         : 0;
-      obs.mesh.position.set(obs.x, groundY + obs.visualYOffset + bob + jumpLift, obs.z);
+      obs.mesh.position.set(obs.x, groundY + obs.visualYOffset + bob + jumpLift + rockfallDrop, obs.z);
+      obs.mesh.visible = Math.abs(obs.z - playerZ) <= cullRadius;
     }
 
     for (const [idx, chunk] of this.chunks.entries()) {

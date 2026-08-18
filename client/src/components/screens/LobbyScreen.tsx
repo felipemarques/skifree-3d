@@ -1,5 +1,7 @@
-import { ArrowLeft, Play, Users } from 'lucide-react';
+import { useState } from 'react';
+import { ArrowLeft, Check, Copy, Crown, Play, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Select } from '@/components/ui/select';
 import { Slider } from '@/components/ui/slider';
 import type { GameController } from '@/app/gameController';
@@ -17,6 +19,33 @@ interface LobbyScreenProps {
 }
 
 export function LobbyScreen({ controller, room, isHost, locked, startLabel, startDisabled }: LobbyScreenProps) {
+  const [copied, setCopied] = useState(false);
+  const copyRoomCode = async () => {
+    const code = room.roomId || '';
+    if (!code) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(code);
+      } else {
+        // Fallback for non-secure contexts / older browsers where the
+        // Clipboard API isn't available - body's `user-select: none`
+        // (index.css) means a manual select-and-copy isn't an option either.
+        const textarea = document.createElement('textarea');
+        textarea.value = code;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Clipboard access denied/unavailable - the code is still visible to
+      // read and retype, just not one-tap copyable.
+    }
+  };
   const localPlayerId = controller.getSocketId();
   const localPlayer = room.players.find(player => player.id === localPlayerId);
   const selectedColor = localPlayer?.color || controller.getPlayerColor();
@@ -35,10 +64,17 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
       <div className="grid items-center gap-3 text-left md:grid-cols-[1fr_auto]">
         <div className="grid gap-1">
           <div className="text-[11px] font-black uppercase tracking-[0.18em] text-cyan-300">Room Lobby</div>
-          <div className="text-[clamp(34px,7vw,54px)] font-black leading-none tracking-[0.18em] text-cyan-200 drop-shadow-[0_12px_36px_rgba(121,231,255,0.28)]">
-            {room.roomId || '------'}
+          <div className="flex items-center gap-2">
+            <div className="select-text text-[clamp(34px,7vw,54px)] font-black leading-none tracking-[0.18em] text-cyan-200 drop-shadow-[0_12px_36px_rgba(121,231,255,0.28)]">
+              {room.roomId || '------'}
+            </div>
+            {room.roomId && (
+              <Button variant="secondary" type="button" size="icon" className="h-9 w-9 shrink-0" aria-label="Copy room code" onClick={copyRoomCode}>
+                {copied ? <Check className="h-4 w-4 text-emerald-300" /> : <Copy className="h-4 w-4" />}
+              </Button>
+            )}
           </div>
-          <div className="text-sm text-[#aab9cf]">Share this code with friends</div>
+          <div className="text-sm text-[#aab9cf]">{copied ? 'Copied!' : 'Share this code with friends'}</div>
         </div>
 
         <div className="grid gap-2 text-right max-md:text-left">
@@ -57,14 +93,15 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
       <div className="grid gap-4 md:grid-cols-[minmax(230px,0.85fr)_minmax(0,1.35fr)]">
         <div className="grid content-start gap-3 rounded-lg border border-white/15 bg-white/[0.045] p-3 text-left">
           <div className="flex items-center justify-between gap-3 text-xs font-black uppercase tracking-[0.08em] text-cyan-300">
-            <span>Players</span>
-            <span className="text-[#aab9cf]">{names || 'waiting'}</span>
+            <span className="shrink-0">Players</span>
+            <span className="min-w-0 truncate text-[#aab9cf]" title={names}>{names || 'waiting'}</span>
           </div>
           <div className="grid max-h-[210px] gap-2 overflow-y-auto pr-1">
             {room.players.map(player => (
               <div key={player.id || player.name} className="flex items-center justify-between gap-3 rounded-md bg-white/[0.045] px-3 py-2 text-sm font-bold text-[#dbeaff]">
                 <span className="flex min-w-0 items-center gap-2">
                   <span className="h-3 w-3 shrink-0 rounded-full border border-white/40" style={{ backgroundColor: player.color || '#2979ff' }} />
+                  {player.id === room.ownerId && <Crown className="h-3.5 w-3.5 shrink-0 text-amber-300" aria-label="Host" />}
                   <span className="truncate">{player.name || 'Player'}</span>
                 </span>
                 {player.id === localPlayerId && <span className="text-[10px] font-black uppercase tracking-[0.08em] text-cyan-300">You</span>}
@@ -123,6 +160,27 @@ export function LobbyScreen({ controller, room, isHost, locked, startLabel, star
               </span>
               <Slider disabled={locked} min={0} max={2} step={0.1} value={settings.obstacleVolume} onChange={event => update('obstacleVolume', Number(event.target.value))} />
             </label>
+            <div className="grid gap-1">
+              <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+                Difficulty Ramp
+                <Checkbox disabled={locked} checked={!!settings.difficultyRamp} onChange={event => update('difficultyRamp', event.target.checked)} />
+              </label>
+              <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Obstacle and ramp density gradually increase the further you ski.</p>
+            </div>
+            <div className="grid gap-1">
+              <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+                Skill Scoring
+                <Checkbox disabled={locked} checked={!!settings.skillScoring} onChange={event => update('skillScoring', event.target.checked)} />
+              </label>
+              <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Rewards risky play - ramp chains, clean runs, near misses, and yeti danger all add bonus distance.</p>
+            </div>
+            <div className="grid gap-1">
+              <label className="flex items-center justify-between gap-3 text-sm font-bold text-[#dbeaff]">
+                Snowball NPCs
+                <Checkbox disabled={locked} checked={!!settings.snowballNpcs} onChange={event => update('snowballNpcs', event.target.checked)} />
+              </label>
+              <p className="text-left text-[11px] leading-snug text-[#7d92ab]">Hostile skiers along the trail throw snowballs as you pass - a hit costs a heart.</p>
+            </div>
           </div>
         </div>
       </div>
